@@ -1,7 +1,6 @@
 ---
 paths:
   - "tests/**/*.py"
-  - "conftest.py"
 ---
 
 # Testing conventions
@@ -21,7 +20,8 @@ paths:
 - `pytest-mock` (`mocker`) for patching; hand-written fakes for behavioral doubles (e.g. a fake embedder returning deterministic arrays). No faker/polyfactory — inputs here are numpy arrays, not business entities; seeded `np.random.default_rng` factories are the right tool.
 
 **Isolation — the default suite runs anywhere.**
-- Must pass on a light install: no torch, no optional extras. Anything importing torch is either marked `model` or guarded with `pytest.importorskip("torch")`; optional backends (`pot`, `leidenalg`, `pacmap`, `shap`) likewise.
+- Must pass on a light install: no torch, no optional extras. Anything importing torch is either marked `model` or guarded with `pytest.importorskip("torch")`; optional backends likewise, each guarded by its **import** name — `ot` (the `[ot]` extra
+ships the `pot` distribution, but it imports as `ot`), `leidenalg`, `pacmap`, `shap`.
 - Deterministic: seed everything through `Config.seed` or explicit `rng`; no reliance on dict ordering, wall clock, or network.
 
 **Economy.** `@pytest.mark.parametrize` over copy-pasted variants. Keep unit tests fast (<1 s each); anything slower gets a marker and a reason.

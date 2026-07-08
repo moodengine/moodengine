@@ -43,7 +43,7 @@ models = [
 ot = [
     "pot>=0.9",
 ]
-# Leiden community detection (moodengine.cluster.cluster_leiden, spec 19). Opt-in — kmeans/hdbscan/
+# Leiden community detection (moodengine.cluster.cluster_leiden). Opt-in — kmeans/hdbscan/
 # spherical work without it; cluster_leiden raises a clear error when absent. Wheels cross-OS cp311+.
 #   pip install "moodengine[cluster-graph]"
 cluster-graph = [

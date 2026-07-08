@@ -1,21 +1,31 @@
 ---
 name: quality-gate
-description: Run the full local quality gate (format, lint, types, tests, dependency hygiene) and report a pass/fail table with fixes. Use before committing, tagging a release, or when asked whether the repo is green.
+description: Runs moodengine's full local quality gate — format, lint, types, the torch-free test suite, public-API contract, dependency hygiene, and lockfile — and reports a pass/fail table with concrete fixes. Use before committing, before tagging a release, or whenever asked whether the repo is green.
 disable-model-invocation: false
+allowed-tools: Bash(uv run ruff *) Bash(uv run mypy *) Bash(uv run pytest *) Bash(uv run deptry *) Bash(uv lock *) Bash(uv run python *)
 ---
 
-Run every gate below **even if an early one fails** — the report must show the whole picture. For each gate record: pass/fail, the exact failing output (trimmed), and the concrete fix.
+Run **every** gate below, even if an early one fails — the report must show the whole
+picture, not stop at the first red. For each gate record: pass/fail, the exact failing
+output (trimmed to the relevant lines), and the concrete fix.
 
 ## Gates
 
-1. **Format** — `uv run ruff format --check .` (ruff is in the PEP 735 `dev` group).
-2. **Lint** — `uv run ruff check .`.
-3. **Types** — `uv run mypy` (configured in pyproject `[tool.mypy]`, default mode; the package must stay at zero errors).
-4. **Tests (light install contract)** — `uv run pytest -q`. This suite must pass without torch; if a test fails with `ModuleNotFoundError` on an optional dep, that's a missing `importorskip` guard — a real defect, report it as such.
-5. **Public API contract** — verify `python -c "import moodengine; assert all(hasattr(moodengine, s) for s in moodengine.__all__)"` succeeds (every `__all__` symbol importable).
-6. **Dependency hygiene** — `uv run deptry .` (configured in pyproject `[tool.deptry]`; per-rule ignores are documented there — extend them only with a comment stating why).
-7. **Lockfile** — `uv lock --check` (lockfile up to date with pyproject), if `uv.lock` exists.
+1. **Format** — `uv run ruff format --check .`
+2. **Lint** — `uv run ruff check .`
+3. **Types** — `uv run mypy` (config in `[tool.mypy]`; the package must stay at zero errors).
+4. **Tests (light-install contract)** — `uv run pytest -q`. This suite must pass with no
+   torch and no optional extras. A failure with `ModuleNotFoundError` on an optional
+   backend is a **missing `pytest.importorskip` guard** — a real defect; report it as one,
+   don't wave it away.
+5. **Public-API contract** — `uv run python -c "import moodengine; assert all(hasattr(moodengine, s) for s in moodengine.__all__)"` must succeed (every `__all__` symbol is importable).
+6. **Dependency hygiene** — `uv run deptry .` (config in `[tool.deptry]`; per-rule ignores
+   are documented there — extend them only with a comment stating why).
+7. **Lockfile** — `uv lock --check` (lockfile in sync with `pyproject.toml`).
 
 ## Report
 
-A single table: gate | status | one-line detail. Below it, the prioritized fix list (worst first, `file:line`). End with a one-line verdict: **green / green-with-warnings / red**. Never soften a red: if a gate fails, the verdict is red and the first fix is the blocker.
+One table: `gate | status | one-line detail`. Below it, the prioritized fix list, worst
+first, each anchored at `file:line`. End with a one-line verdict: **green /
+green-with-warnings / red**. Never soften a red — if any gate fails, the verdict is red and
+the first fix is the blocker.

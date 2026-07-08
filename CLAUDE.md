@@ -1,48 +1,107 @@
-# CLAUDE.md — moodengine (core engine)
+# CLAUDE.md — moodengine
 
-Guidance for AI agents working in this repo. **Read this first** — it encodes the invariants every change must respect. Path-scoped conventions live in `.claude/rules/`; the maintainer keeps an improvement roadmap and engineering standards in `plans/`, which is git-ignored and not shipped with the repo.
+Guidance for anyone changing this repo. It holds the cross-cutting invariants and
+the commands you can't guess by reading the code. Per-area detail loads on demand
+from `.claude/rules/` when you touch matching files; multi-step procedures live in
+`.claude/skills/`. Run `/memory` to see what's currently loaded.
+
+<!--
+Maintainer note (stripped before this file enters context — costs no tokens):
+Keep this file under ~200 lines and free of anything inferable from the code.
+It loads in full every session, and length costs adherence. Put per-area
+conventions in .claude/rules/ (path-scoped) and procedures in .claude/skills/.
+-->
 
 ## What this is
 
-Pure, **stateless** music-mood computation library (MIR): audio → embeddings (MERT/CLAP, optional `[models]` extra) → pooling → clustering (UMAP/HDBSCAN/KMeans/Leiden) → zero-shot mood labeling → search / evaluation / calibration / viz. Two consumers, equal rank: the sibling app `moodengine-desktop` (git dependency) and **any external OSS adopter** — every API decision must hold for a stranger with no access to our plans or history.
+A **pure, stateless** music-mood library (music information retrieval). The pipeline:
+audio → embeddings (MERT / CLAP, optional `[models]` extra) → pooling → clustering →
+zero-shot mood labeling → search / evaluation / calibration / visualization. It is a
+library for external adopters — every public choice must make sense to a stranger who
+has only this repo, no other context.
 
-## Architecture — functional core, imperative shell (non-negotiable)
+## Invariants — read before changing anything
 
-- **No hexagonal/clean architecture here.** That layer lives in `moodengine-desktop` (`app/ports` + `app/adapters`). The core *is* the domain: pure functions + small frozen dataclasses, sklearn-style. No Pydantic, no stamina/pybreaker, no OOP hierarchies (decided after a full architecture audit; rationale and explicit vetoes are recorded in the maintainer's internal notes).
-- **Importing the package is torch-free.** torch/transformers/laion_clap load lazily inside the embedders only. Never import them at module top level; the default test suite must pass on a light install.
-- **Compute functions never write to disk.** I/O is opt-in (the `out_html=None` pattern in `viz.py`) or lives in the pipeline shell and scripts. Never anchor paths on `__file__`.
-- **`Config` is a frozen dataclass** — derive variants with `dataclasses.replace(...)`, never mutate, never read a global config.
-- Modules are flat and independent; only `pipeline.py` orchestrates across modules. Keep the dependency graph flat.
+These are the rules a change most often breaks. None is obvious from a single file, so
+hold them in every session.
+
+- **Importing the package is torch-free.** `import moodengine` MUST NOT pull in
+  torch / transformers / laion_clap. Those load lazily *inside* the embedders
+  (`get_embedder`, `embeddings/`). The default test suite runs on an install with no
+  torch — a top-level heavy import breaks it everywhere.
+- **The core is stateless and never writes to disk.** Compute functions are pure: they
+  return data, they don't persist it. File output is opt-in (the `out_html=None`
+  pattern in `viz.py`) or lives in `pipeline.py` and `scripts/`. Never anchor a path on
+  `__file__`.
+- **`Config` is a frozen dataclass.** Derive variants with `dataclasses.replace(...)`;
+  never mutate it, never read a module-level global config. New fields with a bounded
+  domain get validated in `__post_init__` in the same change.
+- **float32 end to end.** Watch silent float64 upcasts (numpy reductions, sklearn/scipy
+  round-trips) and cast back at function boundaries; say so in the docstring.
+- **Flat module graph.** Modules are independent; only `pipeline.py` orchestrates across
+  them. Don't introduce cross-module imports that turn the graph into a web.
+
+## Architecture
+
+Functional core, sklearn-style: pure functions + small frozen dataclasses. The only
+sanctioned OOP is the `Embedder` ABC (its concrete backbones) and structural
+`typing.Protocol`s. No service/manager classes, no inheritance hierarchies, no Pydantic,
+no dependency-injection framework, no global state. One responsibility per function — if
+one computes *and* formats *and* writes, split it.
 
 ## Commands
 
-- `uv sync` — light install (no torch; dev tooling comes from the PEP 735 `dev` group); `--extra models` pulls torch (~GBs, only to embed real audio).
-- `uv run pytest` — default suite (torch-free by contract). Real-model tests: `-m model` (opt-in). Coverage floor: `uv run pytest --cov` (`fail_under` in `[tool.coverage.report]`; pure-torch wrappers omitted).
-- `uv run ruff format . && uv run ruff check .` — format + lint (ruff lives in the PEP 735 `dev` group).
-- `uv run mypy` — types, default mode, must stay at zero errors; `uv run deptry .` — dependency hygiene (documented ignores in pyproject).
-- CI/CD: `ci.yml` (tests 3 OS × py3.11–3.14, `static` job for format/lint/mypy/deptry, coverage floor, lowest-direct, extras, conventional-commit + DCO sign-off gates, aggregated into one required `CI success` check), `security.yml` (weekly pip-audit + zizmor), `release-please.yml` (conventional commits → a release PR that bumps the version + `CHANGELOG.md`; merging it cuts the tag + GitHub release, then builds & attaches sdist/wheel). Prefer commands that exist; don't invent gates that aren't wired yet.
+Everything runs through `uv`; a plain `uv sync` is the torch-free "light" install.
 
-## Engineering standards (details in `.claude/rules/`)
+- `uv sync` — light install + dev tooling (PEP 735 `dev` group).
+  `uv sync --extra models` adds torch (~GBs; only needed to embed real audio).
+- `uv run pytest` — the default suite; torch-free by contract. `-m model` runs the
+  real-model tests (needs `--extra models`); `-m benchmark` runs hot-path benchmarks.
+  Both markers are deselected by default.
+- `uv run pytest --cov` — same suite with the coverage floor (`fail_under` in
+  `[tool.coverage.report]`).
+- `uv run ruff format . && uv run ruff check .` — format, then lint.
+- `uv run mypy` — types; must stay at zero errors. `uv run deptry .` — dependency hygiene.
+- `/quality-gate` — a skill that runs all of the above and reports a pass/fail table.
 
-- **Comments/docstrings**: self-contained, explain the *why*; **never cite internal docs** (R&D specs, `plans/`) — an external dev has none of them. English only.
-- **No volatile stats in CLAUDE.md or README.md** (test/file/symbol counts, durations) — they drift; describe contracts instead.
-- **Tests**: `tests/` mirrors the package layout 1:1; AAA; fluent assertions (assertpy); shared fakes in conftest.
-- **Dependencies**: state-of-the-art hygiene — minimal runtime deps, wheels-only, justified bounds, PEP 735 groups, committed `uv.lock`.
-- **Code**: airy, fully typed (`Literal`/`Protocol`/`TypedDict`/`NDArray`), float32 discipline, performance-conscious on hot paths.
-- **Docs**: `docs/` holds plain, standalone `.md` guides (e.g. `docs/benchmarking.md`) — no static-site generator, no build step, GitHub renders them directly. The API reference is the source docstrings; don't hand-write a duplicate per-module doc page.
+## Repo etiquette
 
-## Two-repo workflow (desktop lives downstream)
+- **Conventional Commits** (`type(scope): summary`; `feat` `fix` `perf` `refactor`
+  `docs` `test` `chore` `ci` `build` `style`; `!` marks a breaking change). The summary
+  becomes the changelog entry (release notes are generated from it), and CI checks every
+  commit in a PR.
+- **Sign off every commit** with `git commit -s` — the DCO check blocks any unsigned
+  commit on a PR.
+- **`main` is protected.** Changes land via PR with green CI, an approving review,
+  resolved conversations, and linear history (squash merge). Don't commit to `main`
+  directly.
+- **Releases are automated** — don't bump the version or tag by hand. `__version__` in
+  `src/moodengine/__init__.py` is the single source of truth; the release tooling bumps
+  it and the changelog from the merged commits.
 
-- Algorithms are implemented + unit-tested **here**, then the desktop wraps them in thin adapters. If the desktop must re-implement or contort around something (progress callbacks, re-normalization, error taxonomy…), that is an API defect of the core — fix it here.
-- The desktop repo path is machine-dependent — never hardcode it in code or docs; use relative sibling references (the desktop repo sits alongside this one).
-- Release flow: tag here (`vX.Y.Z`) → desktop bumps `rev` in its `[tool.uv.sources]` → `uv sync` → desktop tests.
-- New dependency bar (both repos): must ship cross-platform wheels (macOS arm64 / Windows / Linux, cp311+).
+## Gotchas
 
-## Working on the roadmap
+- **Optional backends.** The compute extras (`[ot]`, `[cluster-graph]`, `[pacmap]`,
+  `[explain]`) import lazily at use-site and raise `MissingDependencyError` naming the exact
+  `pip install "moodengine[...]"` when absent; their tests self-skip via
+  `pytest.importorskip`, so the light suite stays green. The `[models]` backbones differ —
+  torch is imported at the top of the embedder modules, so without it `get_embedder`
+  surfaces a plain `ModuleNotFoundError`, not the friendly error.
+- **Public API surface is a contract.** A new export goes in both the
+  `src/moodengine/__init__.py` imports *and* `__all__`; keep them in sync (a test checks it).
+- **No volatile stats** in `CLAUDE.md` or `README.md` (test/file counts, timings,
+  durations) — they drift. Describe the contract instead.
+- **English only** in code, comments, and docstrings.
 
-The `plans/` directory is **internal and git-ignored** — it lives only on the maintainer's machine and is not part of the published repo. When present, it holds:
+## Where the rest lives
 
-- `plans/production-readiness-audit.md` — prioritized P0→P3 backlog with file:line evidence, plus explicit **vetoes** (things we decided NOT to do). Reconcile against current code before executing any item; never redo what exists.
-- `plans/engineering-standards.md` — the normative standards this repo is converging to.
-
-If `plans/` is absent (e.g. a fresh clone), treat this file and `.claude/rules/` as the authoritative guidance.
+- **`.claude/rules/*.md`** — per-area conventions, auto-loaded when you touch matching
+  files: code style & typing plus hot-path performance (`src/`), the embedders/torch
+  boundary (`src/moodengine/embeddings/`), testing (`tests/`), comments & docstrings,
+  dependency & packaging policy, and CI/workflow conventions (`.github/workflows/`).
+- **`.claude/skills/`** — procedures: `/quality-gate` (run every local gate),
+  `/new-module` (scaffold an engine module + its mirrored test, wired into the API).
+- **`.claude/agents/standards-reviewer`** — a read-only reviewer that checks a diff
+  against these standards.
+- **`docs/*.md`** — standalone developer guides. The API reference *is* the source
+  docstrings; don't hand-write duplicate per-module doc pages.
