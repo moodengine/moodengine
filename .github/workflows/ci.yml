@@ -187,10 +187,15 @@ jobs:
 
   # Developer Certificate of Origin: every commit in a PR must carry a
   # `Signed-off-by:` trailer matching its author email (added by `git commit -s`).
-  # Self-contained on purpose — no third-party action to pin or audit.
+  # Self-contained on purpose — no third-party action to pin or audit. DCO is a
+  # human-contributor attestation, so bot-authored PRs (release-please's release
+  # PR, Renovate) are exempt — their automated commits carry no sign-off, and a
+  # skipped job is tolerated by the `CI success` gate.
   dco:
     name: DCO sign-off
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
