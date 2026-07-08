@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "moodengine"
+abstract: "Music mood embedding, clustering and zero-shot labeling engine (MERT + CLAP): audio to embeddings, mood clusters, calibrated zero-shot labels, search and evaluation."
+authors:
+  - family-names: Pasco
+    given-names: Aymeric
+repository-code: "https://github.com/moodengine/moodengine"
+url: "https://github.com/moodengine/moodengine"
+license: PolyForm-Noncommercial-1.0.0
+license-url: "https://github.com/moodengine/moodengine/blob/main/LICENSE"
+keywords:
+  - music-information-retrieval
+  - audio-embeddings
+  - mood
+  - clustering
+  - zero-shot-classification
+  - MERT
+  - CLAP

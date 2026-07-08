@@ -1,0 +1,42 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - uv.lock
+      - .github/workflows/**
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: dependency audit (pip-audit on uv.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+
+      - name: Export locked dependencies
+        run: uv export --locked --no-emit-project --format requirements-txt -o requirements-audit.txt
+
+      - name: Audit against known vulnerabilities
+        run: uvx pip-audit --strict --disable-pip -r requirements-audit.txt
+
+  actions-lint:
+    name: workflow security lint (zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+
+      - name: Lint workflows
+        run: uvx zizmor .github/workflows/
