@@ -23,9 +23,12 @@ paths:
 - `uv.lock` is committed (it pins dev/CI only — never constrains consumers). Refresh it as a deliberate, reviewed change, not as a side effect.
 - `.python-version` pins the dev interpreter.
 
-**Optional imports** are guarded at use-site with an actionable error naming the extra:
-`raise ImportError("cluster_leiden requires the optional Leiden backend: pip install 'moodengine[cluster-graph]'") from exc`
-Every optional backend follows this exact pattern — one style, no silent fallbacks between backends.
+**Optional imports** are guarded at use-site with `MissingDependencyError` (from
+`moodengine.exceptions`), which names the feature, the missing distribution, and the pip
+extra so the message spells out the exact install command:
+`raise MissingDependencyError("leiden clustering", "leidenalg + python-igraph", "cluster-graph") from exc`
+Every optional backend follows this exact pattern — one style, no silent fallbacks between
+backends, and never a bare `ImportError` (see the error taxonomy in `code-style.md`).
 
 **Never** `import` a package that isn't declared (scripts included). Declared-but-unused and used-but-undeclared are both defects; `uv run deptry .` is the wired guard (CI `static` job). Intentional exceptions live in `[tool.deptry.per_rule_ignores]` with a comment stating why — extend them only that way.
 
