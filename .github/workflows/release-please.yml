@@ -2,9 +2,11 @@ name: Release Please
 
 # Automated releases from conventional commits: release-please keeps a "release
 # PR" up to date (version bump + CHANGELOG). Merging that PR cuts the tag and the
-# GitHub release. Because release-please creates the tag with GITHUB_TOKEN — which
-# does NOT trigger tag-based workflows — the build+upload of artifacts runs here in
-# the same run, gated on a release actually being cut.
+# GitHub release. release-please authenticates with a GitHub App installation token
+# minted per run: a distinct identity that can open PRs even when the org forbids the
+# default Actions token from doing so, and whose commits/PRs carry the App bot's
+# noreply address (no maintainer email leaks). Build + upload of artifacts run in the
+# same job graph, gated on a release actually being cut.
 
 on:
   push:
@@ -21,16 +23,31 @@ jobs:
   release-please:
     name: maintain release PR / cut release
     runs-on: ubuntu-latest
+    # The GITHUB_TOKEN stays read-only; the App installation token below carries the
+    # contents / pull-requests / issues write scopes release-please actually uses.
     permissions:
-      contents: write # create the tag + GitHub release
-      pull-requests: write # open/update the release PR
+      contents: read
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          # Scope the minted token to exactly what release-please touches, not the
+          # App's full installation grant: version-bump commit + tag + release
+          # (contents), the release PR (pull-requests), and its labels (issues).
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
