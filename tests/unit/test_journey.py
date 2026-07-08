@@ -137,9 +137,10 @@ def test_ot_morph_shape_dedup_and_direction() -> None:
     assert_that(len(idxs)).is_equal_to(len(set(idxs)))  # distinct row indices
     assert_that(len(set(idxs))).is_less_than_or_equal_to(8)  # capped at n
     assert_that(all(0 <= i < 60 for i in idxs)).is_true()
-    # A→B progression: the last pick is at least as B-ward as the first (transported order).
+    # A→B progression: every pick is at least as B-ward as the previous one (monotonic by construction).
     sims_b = X @ b
-    assert_that(float(sims_b[idxs[-1]])).is_greater_than_or_equal_to(float(sims_b[idxs[0]]) - 1e-6)
+    seq = [float(sims_b[i]) for i in idxs]
+    assert_that(all(seq[k] <= seq[k + 1] + 1e-6 for k in range(len(seq) - 1))).is_true()
     assert_that(ot_morph(a, b, X, files, n=8)).is_equal_to(idxs)  # deterministic
 
 

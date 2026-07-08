@@ -93,9 +93,9 @@ def ot_morph(
     squared-Euclidean cost in that plane. Keeping the cost 2-D is what makes the transport *load-bearing*
     rather than a reg-smoothed 1-D ``sim_b`` sort: the perpendicular "on-arc fidelity" axis (``sim_a +
     sim_b``) re-ranks off-arc decoys a 1-D key would accept, and the ``nu`` target marginal spreads the
-    picks by density. The output order is the slot index, so A→B monotonicity holds regardless of the
-    plan's sharpness — the plan only chooses WHICH distinct track fills each ordered slot. (Design from a
-    3-way design panel + judge synthesis; robust to N<n, all-negative cosines, a≈b, empty pool.)
+    picks by density. The transport only chooses WHICH distinct tracks fill the journey; the returned
+    picks are then ordered by B-affinity, so the A→B progression is monotonic by construction. (Design
+    from a 3-way design panel + judge synthesis; robust to N<n, all-negative cosines, a≈b, empty pool.)
     """
     try:
         import ot  # noqa: PLC0415 — lazy on purpose: keeps SLERP mode POT-free
@@ -158,4 +158,9 @@ def ot_morph(
         j = int(np.argmax(row))  # first-max on ties → deterministic
         used[j] = True
         out.append(int(pool[j]))
+
+    # Greedy per-slot assignment picks the right SET of tracks but does not by itself
+    # guarantee they emerge ordered A→B, so make the promised progression explicit:
+    # order the picks by B-affinity (original row index as a deterministic tie-break).
+    out.sort(key=lambda t: (float(sb[t]), t))
     return out
