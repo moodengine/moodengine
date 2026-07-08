@@ -1,0 +1,205 @@
+[project]
+name = "moodengine"
+dynamic = ["version"]
+description = "Music mood embedding, clustering & zero-shot labeling engine (MERT + CLAP)"
+readme = "README.md"
+requires-python = ">=3.11"
+# PolyForm Noncommercial 1.0.0 plus a commercial-use exception for the author:
+# a composite license, so point at the file rather than an SPDX string.
+license = { file = "LICENSE" }
+authors = [{ name = "Aymeric Pasco" }]
+keywords = ["music", "mood", "embeddings", "MERT", "CLAP", "clustering", "MIR", "zero-shot"]
+
+# Core stays lightweight: clustering / labeling / search / eval / viz on already
+# computed embeddings, plus the full test suite — no deep-learning backbones.
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "librosa>=0.10.2.post1",      # older floors import pkg_resources (dead without setuptools); adds numpy 2 support
+    "umap-learn>=0.5.6",          # older floors crash at import under modern numba; 0.5.6 adds numpy 2 support
+    "hdbscan>=0.8.39",            # oldest with cross-platform cp311+ wheels AND numpy 2-compatible builds
+    "scipy>=1.15",                # explicit for cluster_hierarchy; <1.15 fcluster(maxclust) miscuts (returns fewer groups than asked)
+    "plotly>=5.18",
+    "pyarrow>=14.0",
+    "platformdirs>=3.0",          # OS-appropriate default cache dir (never write inside site-packages)
+]
+
+[project.optional-dependencies]
+# Heavy embedders: install to actually embed audio with MERT / CLAP.
+#   pip install "moodengine[models]"   (pulls torch ~ several GB)
+models = [
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "torchvision>=0.16",          # required by laion-clap (FrozenBatchNorm2d)
+    "transformers>=4.40,<5",      # MERT trust_remote_code targets the 4.x API
+    "laion-clap>=1.1.4",
+    "nnAudio>=0.3",               # MERT remote-code feature extractor dependency
+    "huggingface_hub>=0.23",      # imported directly (CLAP music checkpoint download)
+]
+# Optimal-transport journey morph (moodengine.journey.ot_morph). Opt-in — the SLERP journey works
+# without it. POT ships cross-platform wheels (macOS arm64 / Windows / Linux).
+#   pip install "moodengine[ot]"
+ot = [
+    "pot>=0.9",
+]
+# Leiden community detection (moodengine.cluster.cluster_leiden, spec 19). Opt-in — kmeans/hdbscan/
+# spherical work without it; cluster_leiden raises a clear error when absent. Wheels cross-OS cp311+.
+#   pip install "moodengine[cluster-graph]"
+cluster-graph = [
+    "leidenalg>=0.10",
+    "python-igraph>=0.11",
+]
+# PaCMAP 2-D projection (Config.projection_method="pacmap"). Opt-in — umap/densmap work without it.
+#   pip install "moodengine[pacmap]"
+pacmap = [
+    "pacmap>=0.7.3",
+]
+# TreeSHAP attributions (moodengine.explain, backend="treeshap"). Opt-in — the exact
+# dependency-free Shapley backend works without it.
+#   pip install "moodengine[explain]"
+explain = [
+    "shap>=0.46",                 # first release with numpy 2-compatible wheels
+]
+[project.urls]
+Homepage = "https://github.com/moodengine/moodengine"
+Repository = "https://github.com/moodengine/moodengine"
+Issues = "https://github.com/moodengine/moodengine/issues"
+Changelog = "https://github.com/moodengine/moodengine/releases"
+
+[tool.uv]
+# Lock-time constraint only (never lands in consumers' metadata): pynndescent
+# < 0.6 predates numpy 2 and drags an unbuildable llvmlite 0.36 — the resolver
+# otherwise picks that fork when maximizing the numpy version.
+constraint-dependencies = ["pynndescent>=0.6"]
+
+# Dev-only tooling (PEP 735): installed by `uv sync` (uv includes the "dev"
+# group by default), never published as an extra, never in consumers' trees.
+[dependency-groups]
+dev = [
+    "pytest>=7.4",
+    "pytest-mock>=3.12",          # mocking
+    "assertpy>=1.1",              # fluent assertions
+    "ruff>=0.15",                 # format + lint (single tool)
+    "mypy>=1.14",                 # static types, default mode (staged-strictness plan)
+    "deptry>=0.20",               # declared-vs-imported dependency hygiene
+    "typer>=0.15",                # scripts/ CLI walkthroughs
+    "soundfile>=0.12",            # tests write WAV fixtures directly (the package decodes via librosa)
+    "pytest-benchmark>=4.0",      # opt-in hot-path benchmarks (tests/benchmarks, -m benchmark)
+    "pytest-cov>=5.0",            # coverage gate (see [tool.coverage] + CI static job)
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Single source of truth for the version: src/moodengine/__init__.py::__version__.
+[tool.hatch.version]
+path = "src/moodengine/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moodengine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Real-model tests and benchmarks are opt-in: `-m model` / `-m benchmark`.
+addopts = "-q -m 'not model and not benchmark' --import-mode=importlib"
+markers = [
+    "model: requires the real torch models (MERT/CLAP); deselected by default",
+    "benchmark: hot-path performance benchmarks (pytest-benchmark); deselected by default",
+]
+# No blanket DeprecationWarning/FutureWarning ignores: a deprecation aimed at
+# OUR code must stay visible in dev. Only known third-party noise is silenced,
+# each entry with its reason.
+filterwarnings = [
+    # librosa's audioread fallback fires on the corrupt-file tests — that IS the
+    # code path under test, not a problem to fix.
+    "ignore:PySoundFile failed. Trying audioread instead.:UserWarning",
+    "ignore:librosa.core.audio.__audioread_load:FutureWarning",
+    # audioread ships aifc/sunau shims for the py3.13 stdlib removals.
+    "ignore:aifc was removed:DeprecationWarning",
+    "ignore:sunau was removed:DeprecationWarning",
+    # Seeded UMAP always forces n_jobs=1 — determinism is the point of the seed.
+    "ignore:n_jobs value 1 overridden to 1 by setting random_state:UserWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# src layout: classify `import moodengine` as first-party (isort-style rules).
+src = ["src", "tests", "scripts"]
+
+[tool.mypy]
+files = ["src/moodengine"]
+python_version = "3.11"
+
+# The scientific stack is largely untyped or stub-less; silence only the import
+# errors, never the checks on our own code.
+[[tool.mypy.overrides]]
+module = [
+    "sklearn.*",
+    "umap.*",
+    "hdbscan.*",
+    "librosa.*",
+    "soundfile",
+    "plotly.*",
+    "pacmap",
+    "shap",
+    "leidenalg",
+    "igraph",
+    "laion_clap",
+    "transformers",
+    "nnAudio.*",
+    "ot",
+    "pandas",
+    "pyarrow",
+    "scipy.*",
+    "torch",
+    "torch.*",
+    "huggingface_hub",
+]
+ignore_missing_imports = true
+
+[tool.deptry]
+# plans/ and outputs are not code; tests are covered by the dev group mapping.
+extend_exclude = ["plans", "outputs"]
+# src layout: the package no longer sits at the repo root, so deptry can't
+# auto-detect it as first-party.
+known_first_party = ["moodengine"]
+
+[tool.deptry.package_module_name_map]
+nnAudio = "nnAudio"
+laion-clap = "laion_clap"
+python-igraph = "igraph"
+pot = "ot"
+shap = "shap"
+
+[tool.deptry.per_rule_ignores]
+# Declared-but-never-imported, on purpose:
+#   pyarrow  — pandas' parquet engine, loaded by pandas at to_parquet() time
+#   torch* — imported by laion-clap, which doesn't declare them (packaging gap upstream)
+#   nnAudio  — imported by MERT's remote code, not by ours
+DEP002 = ["pyarrow", "torchaudio", "torchvision", "nnAudio"]
+# typer is dev-group on purpose: scripts/ are developer walkthroughs, not package code.
+DEP004 = ["typer"]
+
+[tool.coverage.run]
+source = ["moodengine"]
+# clap.py / mert.py are pure torch wrappers with no unit tests by contract (they run
+# only under the opt-in `-m model` suite) — counting their guaranteed-0% lines in the
+# default-suite denominator would make the floor dishonest, not stricter.
+omit = ["*/embeddings/clap.py", "*/embeddings/mert.py"]
+
+[tool.coverage.report]
+show_missing = true
+# Regression floor for the torch-free default suite, set below the value it actually
+# reaches so it catches real drops without tripping on normal churn — NOT an aspiration.
+# The torch/POT-gated paths in adapt/sequence/journey are covered by the extras/model
+# CI jobs, not measured here. Raise it only when a measured, sustained gain backs it.
+fail_under = 80
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+    "if __name__ == .__main__.:",
+]

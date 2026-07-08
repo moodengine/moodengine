@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.benchmarks/
+
+# Virtual env
+.venv/
+.venv-*/
+venv/
+
+# Data & artifacts (do not commit audio or cached embeddings)
+data/raw/
+data/cache/
+outputs/
+*.npy
+*.parquet
+*.html
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# Internal planning/roadmap notes — not part of the published OSS repo
+plans/

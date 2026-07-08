@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in moodengine behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in what you can —
+        a minimal reproducible example is worth ten paragraphs.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest code snippet (and inputs) that triggers the issue.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: moodengine version
+      description: "Output of `python -c 'import moodengine; print(moodengine.__version__)'`"
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install flavor
+      options:
+        - light core (no extras)
+        - "[models] (torch/MERT/CLAP)"
+        - other extra ([ot] / [cluster-graph] / [pacmap] / [explain])
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS & Python
+      placeholder: "e.g. macOS 14 arm64, Python 3.12"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Traceback / logs
+      description: Paste the full error output if any.
+      render: shell

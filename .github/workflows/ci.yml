@@ -1,0 +1,265 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test · ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install (light + dev group, locked)
+        run: uv sync --locked
+
+      # The default suite is the torch-free contract: it must pass on a light
+      # install with no optional extras.
+      - name: Tests (light install)
+        run: uv run pytest
+
+      - name: Build sdist + wheel
+        run: uv build
+
+  # Environment-independent gates, paid once instead of per matrix leg.
+  static:
+    name: format · lint · types · dependency hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Types (mypy, default mode)
+        run: uv run mypy
+
+      - name: Dependency hygiene (deptry)
+        run: uv run deptry .
+
+      # Comments must be self-contained for external readers: no references to
+      # internal planning documents in any comment or docstring.
+      - name: No internal-doc references in comments
+        shell: bash
+        run: |
+          if grep -rInE "R&D|master-plan|plans/|Family-[0-9]|spec[ -][0-9]+" \
+              src/ scripts/ tests/ --include="*.py"; then
+            echo "::error::internal-doc references found in comments (see matches above)"
+            exit 1
+          fi
+
+      # Tests assert through assertpy (assert_that), not the bare `assert`
+      # statement. `assert_that(...)` and `np.testing.assert_*` do not match this
+      # pattern, so it flags only the native statement form.
+      - name: No native asserts in tests
+        shell: bash
+        run: |
+          if grep -rInE "^[[:space:]]*assert " tests/ --include="*.py"; then
+            echo "::error::native assert statements found in tests — use assertpy assert_that(...)"
+            exit 1
+          fi
+
+  # Coverage floor for the torch-free default suite (one platform: the light suite
+  # runs the same lines everywhere, so a matrix would just re-measure the same number).
+  coverage:
+    name: coverage (default suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install (light + dev group, locked)
+        run: uv sync --locked
+
+      # fail_under lives in pyproject ([tool.coverage.report]); --cov with no path
+      # uses [tool.coverage.run] source/omit.
+      - name: Tests with coverage floor
+        run: uv run pytest --cov --cov-report=term-missing
+
+  # Keeps the declared lower bounds honest: resolve every direct dependency to
+  # its minimum version and run the suite against that.
+  test-lowest:
+    name: test · lowest direct resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The committed lock must go first: `uv lock` preserves already-locked
+      # versions, so resolving on top of it would silently test the pinned
+      # (recent) versions instead of the declared minimums.
+      - name: Re-lock at lowest direct versions
+        run: |
+          rm uv.lock
+          uv lock --resolution lowest-direct
+
+      # --frozen everywhere below: a plain sync/run may re-lock at the default
+      # (highest) resolution and silently un-test the minimums.
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Tests
+        run: uv run --frozen --no-sync pytest
+
+  test-extras:
+    # Python 3.13, not 3.14: POT publishes wheels up to cp313 only.
+    name: test · extras [ot, cluster-graph, pacmap, explain]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install with optional backends
+        run: uv sync --locked --extra ot --extra cluster-graph --extra pacmap --extra explain
+
+      # Same suite: the ot/leiden tests un-skip themselves when the backend is
+      # importable, so this job covers the optional code paths.
+      - name: Tests (optional backends)
+        run: uv run pytest
+
+  # Conventional-commit gate: every commit in a PR must parse.
+  commits:
+    name: conventional commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+      - name: Check commit messages
+        run: >
+          uvx --from commitizen cz check
+          --rev-range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+  # Developer Certificate of Origin: every commit in a PR must carry a
+  # `Signed-off-by:` trailer matching its author email (added by `git commit -s`).
+  # Self-contained on purpose — no third-party action to pin or audit.
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Signed-off-by on every commit
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          fail=0
+          for sha in $(git rev-list --no-merges "$BASE".."$HEAD"); do
+            email="$(git show -s --format='%ae' "$sha")"
+            subject="$(git show -s --format='%s' "$sha")"
+            # Collect emails from every Signed-off-by trailer, then match the
+            # author's exactly (grep -xF avoids treating '+'/'.' as regex).
+            signoffs="$(git show -s --format='%B' "$sha" \
+              | grep -iE '^Signed-off-by:' \
+              | sed -E 's/.*<(.*)>.*/\1/')"
+            if ! printf '%s\n' "$signoffs" | grep -qxF "$email"; then
+              echo "::error::commit ${sha} (\"${subject}\") has no Signed-off-by for <${email}>"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::DCO check failed — sign commits with 'git commit -s' (or 'git rebase --signoff ${BASE}')."
+            exit 1
+          fi
+
+  # Real MERT/CLAP models: multi-GB torch download + model fetch, so manual
+  # trigger only (workflow_dispatch). Keep it green before tagging a release.
+  test-models:
+    name: test · real models (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install with model backbones
+        run: uv sync --locked --extra models
+
+      - name: Tests (real models)
+        run: uv run pytest -m model
+
+  # Single required status check for branch protection: collapses the whole
+  # matrix + every gate into one context, so protection never has to enumerate
+  # individual job names (which change with the matrix). Fails if any required
+  # job failed or was cancelled; PR-only jobs (commits, dco) report "skipped" on
+  # push-to-main and are tolerated. test-models is manual-only, deliberately excluded.
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [test, static, coverage, test-lowest, test-extras, commits, dco]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify no required job failed
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::one or more required CI jobs did not succeed"
+          exit 1
