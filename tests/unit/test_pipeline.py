@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -20,8 +21,15 @@ from assertpy import assert_that
 
 import moodengine.pipeline as pipeline
 from moodengine.config import default_config
+from moodengine.exceptions import MissingDependencyError
 
 DIM = 8  # audio + text embedding dimensionality used by the fake embedder.
+
+# The real get_embedder, captured before the autouse fixture below monkeypatches it, so the
+# missing-``models``-extra test can exercise the genuine import path. torch lives only in that
+# extra, so a light install is exactly the "backbones absent" situation the guard must handle.
+_real_get_embedder = pipeline.get_embedder
+_TORCH_INSTALLED = importlib.util.find_spec("torch") is not None
 
 
 def _hash_unit_vec(key: bytes, dim: int) -> np.ndarray:
@@ -91,6 +99,18 @@ def _patch_embedder(monkeypatch, tmp_config):
         return _FakeEmbedder(key, sr_by_name[key])
 
     monkeypatch.setattr(pipeline, "get_embedder", _fake_get_embedder)
+
+
+@pytest.mark.skipif(
+    _TORCH_INSTALLED,
+    reason="exercises the models-extra-absent path; only meaningful on a torch-free install",
+)
+@pytest.mark.parametrize("name", ["mert", "clap"])
+def test_get_embedder_without_models_extra_raises_missing_dependency(name: str) -> None:
+    # Building a real embedder without the models extra must surface the actionable
+    # MissingDependencyError naming the extra, not a bare ModuleNotFoundError.
+    with pytest.raises(MissingDependencyError, match=r"moodengine\[models\]"):
+        _real_get_embedder(name, default_config())
 
 
 _BASE_COLUMNS = ["filename", "path", "cluster", "x", "y", "is_medoid", "outlier_score"]

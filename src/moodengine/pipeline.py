@@ -29,6 +29,7 @@ from moodengine import viz as _viz
 from moodengine._typing import ClusterMethod, ClusterMetrics, SupportsEmbedText
 from moodengine.config import Config
 from moodengine.embeddings.base import cache_key, load_cached, save_cached
+from moodengine.exceptions import MissingDependencyError
 from moodengine.pooling import POOLERS
 
 logger = logging.getLogger(__name__)
@@ -39,16 +40,25 @@ def get_embedder(name: str, config: Config):
 
     ``name`` is ``'mert'`` or ``'clap'``. The concrete module is imported inside
     this function so torch is only required when an embedder is actually built.
-    Raises :class:`ValueError` for an unknown name.
+    Raises :class:`ValueError` for an unknown name, and
+    :class:`~moodengine.exceptions.MissingDependencyError` (naming the ``models``
+    extra) when the deep-learning backbones are not installed — otherwise a bare
+    ``ModuleNotFoundError`` for the missing backbone would surface with no hint.
     """
     key = name.lower()
     if key == "mert":
-        from moodengine.embeddings.mert import MERTEmbedder
-
+        try:
+            from moodengine.embeddings.mert import MERTEmbedder
+        except ModuleNotFoundError as exc:
+            raise MissingDependencyError(
+                "MERT embedding", "torch + transformers", "models"
+            ) from exc
         return MERTEmbedder(config)
     if key == "clap":
-        from moodengine.embeddings.clap import CLAPEmbedder
-
+        try:
+            from moodengine.embeddings.clap import CLAPEmbedder
+        except ModuleNotFoundError as exc:
+            raise MissingDependencyError("CLAP embedding", "torch + laion-clap", "models") from exc
         return CLAPEmbedder(config)
     raise ValueError(f"unknown embedder name: {name!r} (expected 'mert' or 'clap')")
 
