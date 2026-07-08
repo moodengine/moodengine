@@ -42,7 +42,7 @@ Every commit message follows [Conventional Commits](https://www.conventionalcomm
 `type(scope): summary` with types `feat`, `fix`, `perf`, `refactor`, `docs`,
 `test`, `chore`, `ci`, `build`, `style`. A `!` after the type marks a breaking
 change. CI checks every PR commit, and release notes are generated from them
-(git-cliff), so the message you write is the changelog entry users read.
+(release-please), so the message you write is the changelog entry users read.
 
 ## Versioning & releases — SemVer
 
@@ -54,12 +54,15 @@ is on `0.x`:
 - **patch** (`0.x.Y`) never breaks anything.
 
 From `1.0.0` on, the public API (`moodengine.__all__` + documented signatures)
-only breaks on a major bump.
+only breaks on a major bump. During `0.x`, a breaking change (`feat!`/`fix!`)
+bumps the minor; every other `feat`/`fix` bumps the patch.
 
-Release flow: bump `__version__` in `src/moodengine/__init__.py` (single source of
-truth) → tag `vX.Y.Z` → push the tag. The Release workflow re-runs the suite,
-builds sdist + wheel, and publishes a GitHub release whose notes are generated
-from the conventional commits since the previous tag.
+Release flow (automated by **release-please**): you don't bump the version or tag
+by hand. As conventional commits land on `main`, release-please keeps a "release
+PR" open that bumps `__version__` (single source of truth in
+`src/moodengine/__init__.py`) and updates `CHANGELOG.md`. Merging that PR cuts the
+`vX.Y.Z` tag and publishes the GitHub release; a follow-up job then re-runs the
+suite, builds sdist + wheel, and attaches them to the release.
 
 ## Developer Certificate of Origin (DCO)
 

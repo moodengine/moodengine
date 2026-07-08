@@ -20,7 +20,7 @@ Pure, **stateless** music-mood computation library (MIR): audio → embeddings (
 - `uv run pytest` — default suite (torch-free by contract). Real-model tests: `-m model` (opt-in). Coverage floor: `uv run pytest --cov` (`fail_under` in `[tool.coverage.report]`; pure-torch wrappers omitted).
 - `uv run ruff format . && uv run ruff check .` — format + lint (ruff lives in the PEP 735 `dev` group).
 - `uv run mypy` — types, default mode, must stay at zero errors; `uv run deptry .` — dependency hygiene (documented ignores in pyproject).
-- CI/CD: `ci.yml` (tests 3 OS × py3.11–3.14, `static` job for format/lint/mypy/deptry, coverage floor, lowest-direct, extras, conventional-commit gate), `security.yml` (weekly pip-audit + zizmor), `release.yml` (tag `v*` → verify → build → GitHub release via git-cliff). Prefer commands that exist; don't invent gates that aren't wired yet.
+- CI/CD: `ci.yml` (tests 3 OS × py3.11–3.14, `static` job for format/lint/mypy/deptry, coverage floor, lowest-direct, extras, conventional-commit + DCO sign-off gates, aggregated into one required `CI success` check), `security.yml` (weekly pip-audit + zizmor), `release-please.yml` (conventional commits → a release PR that bumps the version + `CHANGELOG.md`; merging it cuts the tag + GitHub release, then builds & attaches sdist/wheel). Prefer commands that exist; don't invent gates that aren't wired yet.
 
 ## Engineering standards (details in `.claude/rules/`)
 
