@@ -6,6 +6,7 @@
     ".": {
       "release-type": "simple",
       "package-name": "moodengine",
+      "include-component-in-tag": false,
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         { "type": "generic", "path": "src/moodengine/__init__.py" }
