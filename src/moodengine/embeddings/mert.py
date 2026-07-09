@@ -71,8 +71,14 @@ class MERTEmbedder(Embedder):
             self.device,
         )
         try:
+            # transformers 5.x defaults the load dtype to "auto" (whatever precision
+            # the checkpoint declares); pin float32 explicitly so the engine's
+            # float32-end-to-end contract holds regardless of the model's config.
             self.model = AutoModel.from_pretrained(
-                config.mert_model_name, revision=revision, trust_remote_code=True
+                config.mert_model_name,
+                revision=revision,
+                trust_remote_code=True,
+                dtype=torch.float32,
             )
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(
                 config.mert_model_name, revision=revision, trust_remote_code=True

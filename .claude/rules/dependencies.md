@@ -15,7 +15,7 @@ paths:
 
 **Version bounds.**
 - Lower bound = the oldest version actually tested (CI job with `uv run --resolution lowest-direct` keeps us honest).
-- **No upper bounds** unless a breakage is known and reproduced; every cap carries an inline comment stating the exact reason and what unlocks removal (model: the `transformers<5` pin, which documents the MERT remote-code 4.x API dependency).
+- **No upper bounds** unless a breakage is known and reproduced; every cap carries an inline comment stating the exact reason and what unlocks removal — and is lifted once that condition clears (as the former `transformers<5` cap was, once MERT and laion-clap were verified on the transformers 5.x line). The project currently ships no upper caps.
 - Support window follows the scientific-Python ecosystem (SPEC 0): drop Python/numpy versions on schedule, in a minor release, noted in the changelog.
 
 **Tooling layout.**

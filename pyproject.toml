@@ -29,13 +29,18 @@ dependencies = [
 # Heavy embedders: install to actually embed audio with MERT / CLAP.
 #   pip install "moodengine[models]"   (pulls torch ~ several GB)
 models = [
-    "torch>=2.1",
-    "torchaudio>=2.1",
-    "torchvision>=0.16",          # required by laion-clap (FrozenBatchNorm2d)
-    "transformers>=4.40,<5",      # MERT trust_remote_code targets the 4.x API
+    "torch>=2.4",                 # floor set by transformers 5.x (requires torch >= 2.4)
+    "torchaudio>=2.4",            # tracks torch 2.4
+    "torchvision>=0.19",          # required by laion-clap (FrozenBatchNorm2d); tracks torch 2.4
+    # 5.3.0 is the first release fixing the config-injection RCE (CVE-2026-4372);
+    # every < 5.3.0 pin stays flagged, so a version bump (not a downward cap) is
+    # the only remediation. Verified compatible with MERT's pinned remote code and
+    # laion-clap 1.1.5 — both import only transformers symbols that survive the
+    # v4 -> v5 refactor. The former "< 5 / MERT targets 4.x" cap no longer holds.
+    "transformers>=5.3.0",
     "laion-clap>=1.1.4",
     "nnAudio>=0.3",               # MERT remote-code feature extractor dependency
-    "huggingface_hub>=0.23",      # imported directly (CLAP music checkpoint download)
+    "huggingface_hub>=1.0",       # imported directly (CLAP checkpoint); transformers 5.x needs hub >= 1.0
 ]
 # Optimal-transport journey morph (moodengine.journey.ot_morph). Opt-in — the SLERP journey works
 # without it. POT ships cross-platform wheels (macOS arm64 / Windows / Linux).
