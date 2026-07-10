@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/moodengine/moodengine/compare/v0.2.0...v0.2.1) (2026-07-10)
+
+
+### Fixes
+
+* **embeddings:** keep laion_clap single-prompt tokenizer output 2-D for transformers 5 ([#12](https://github.com/moodengine/moodengine/issues/12)) ([c850b72](https://github.com/moodengine/moodengine/commit/c850b72b5560adf6c76754450a5c0016b579e58b))
+
 ## [0.2.0](https://github.com/moodengine/moodengine/compare/v0.1.2...v0.2.0) (2026-07-10)
 
 
