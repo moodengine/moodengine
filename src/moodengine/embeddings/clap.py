@@ -49,6 +49,21 @@ def _as_float32(emb) -> np.ndarray:
     return np.asarray(emb, dtype=np.float32)
 
 
+def _ensure_batched(tokens: dict) -> dict:
+    """Restore a leading batch dim to any 1-D tensor in a tokenizer output.
+
+    laion_clap's default text tokenizer squeezes the batch dim (``{k: v.squeeze(0) ...}`` in its
+    ``hook.py``), so a *single* prompt yields a 1-D ``input_ids``. transformers < 5 reshaped 1-D → 2-D
+    inside RoBERTa, so this was harmless; transformers >= 5 (required by moodengine's CVE-fix pin) does
+    not, so a single-prompt text embed crashes in ``create_position_ids_from_input_ids`` — ``cumsum(mask,
+    dim=1)`` on a 1-D mask raises ``IndexError: Dimension out of range``. Re-adding the batch dim keeps
+    ``input_ids`` ``(n, seq)`` for any ``n``, which is byte-identical to the pre-5 reshape path.
+    """
+    return {
+        k: (v.unsqueeze(0) if hasattr(v, "dim") and v.dim() == 1 else v) for k, v in tokens.items()
+    }
+
+
 class CLAPEmbedder(Embedder):
     """Clip-level embedder backed by LAION CLAP.
 
@@ -179,6 +194,13 @@ class CLAPEmbedder(Embedder):
             return np.empty((0,), dtype=np.float32)
 
         with torch.no_grad():
-            emb = self.model.get_text_embedding(list(prompts))
+            emb = self.model.get_text_embedding(list(prompts), tokenizer=self._tokenizer_batched)
         emb = _as_float32(emb).reshape(len(prompts), -1)
         return _l2_normalize(emb, axis=-1)
+
+    def _tokenizer_batched(self, prompts: list[str]) -> dict:
+        """laion_clap's own RoBERTa tokenizer, but with the batch dim preserved (see
+        :func:`_ensure_batched`). Passed through ``get_text_embedding(..., tokenizer=)`` so a
+        single-prompt embed no longer emits a 1-D ``input_ids`` that transformers-5 RoBERTa rejects.
+        """
+        return _ensure_batched(self.model.tokenizer(prompts))

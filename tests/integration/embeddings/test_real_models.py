@@ -37,6 +37,21 @@ def test_real_clap_text_and_audio_shapes(synth_clip):
     assert_that(text.shape[1]).is_equal_to(audio.shape[0])
 
 
+def test_real_clap_single_prompt_does_not_crash():
+    """Regression: a SINGLE text prompt must embed cleanly. laion_clap's tokenizer squeezes the batch
+    dim, so N=1 reaches transformers-5 RoBERTa with a 1-D ``input_ids`` and used to raise ``IndexError``
+    in ``create_position_ids_from_input_ids`` (``cumsum(mask, dim=1)``). The N=2 test above never
+    exercised this (squeeze is a no-op for a batch), which is how the break shipped. ``embed_text`` now
+    re-batches (``_ensure_batched``)."""
+    cfg = default_config()
+    clap = get_embedder("clap", cfg)
+
+    text = clap.embed_text(["a single mellow jazz tune"])  # N=1 — the case that regressed
+
+    assert_that(text.ndim).is_equal_to(2)  # (1, hidden), not a crash
+    assert_that(text.shape[0]).is_equal_to(1)
+
+
 def test_real_mert_layered_shape(synth_clip):
     # Arrange
     cfg = default_config()
