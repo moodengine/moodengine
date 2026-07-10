@@ -12,8 +12,8 @@ CLAP expects 48 kHz mono float32 audio; callers resample upstream.
 from __future__ import annotations
 
 import logging
+import sys
 
-import laion_clap
 import numpy as np
 import torch
 
@@ -21,6 +21,18 @@ from moodengine._math import l2_normalize as _l2_normalize
 from moodengine.config import Config
 from moodengine.embeddings.base import Embedder
 from moodengine.exceptions import ModelLoadError
+
+# laion_clap parses sys.argv (argparse) at IMPORT time — its training/data.py runs a
+# module-level parse_args() — so importing it from a process that carries its own CLI
+# flags (pytest, or any host application) aborts with SystemExit before our code runs.
+# Import it behind a cleared argv; laion_clap's parsed training args are unused by the
+# inference-only path we drive. Restored in finally so no global argv state leaks.
+_saved_argv = sys.argv
+sys.argv = sys.argv[:1]
+try:
+    import laion_clap  # noqa: E402 — eager but argv-guarded (see the note above)
+finally:
+    sys.argv = _saved_argv
 
 logger = logging.getLogger(__name__)
 

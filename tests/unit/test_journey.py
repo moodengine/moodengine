@@ -48,12 +48,16 @@ def test_path_between_is_a_monotone_geodesic() -> None:
     cos_b = wp @ b
     assert_that(bool(np.all(np.diff(cos_a) <= 1e-5))).is_true()  # angle from a grows
     assert_that(bool(np.all(np.diff(cos_b) >= -1e-5))).is_true()  # angle from b shrinks
-    # SLERP's DEFINING property — constant angular velocity: arccos(wp·a) increases in EQUAL steps.
-    # This uniquely separates SLERP from a normalized lerp, which traces the SAME great-circle arc but
-    # bunches waypoints toward the endpoints (uneven mood-morph spacing) — so an nlerp regression that
-    # still satisfies every monotonicity/endpoint/unit check is caught right here.
-    theta = np.arccos(np.clip(cos_a, -1.0, 1.0))
-    assert_that(bool(np.allclose(np.diff(theta), theta[-1] / (len(wp) - 1), atol=1e-4))).is_true()
+    # SLERP's DEFINING property — constant angular velocity: the cosine from a follows cos(t·Ω)
+    # for EQUALLY spaced t over [0, 1]. Assert on the cosines directly, NOT on arccos(cos_a):
+    # arccos is ill-conditioned near cos = 1 (the endpoints), where the float32 storage of the
+    # waypoints amplifies rounding to ~1e-3 and flips across BLAS/CPU builds (a lowest-deps CI
+    # flake). The cosine form is well-conditioned and still uniquely separates SLERP from a
+    # normalized lerp, which traces the SAME great-circle arc but bunches waypoints toward the
+    # endpoints (uneven mood-morph spacing) — an nlerp regression is caught right here.
+    omega = float(np.arccos(np.clip(float(a @ b), -1.0, 1.0)))
+    expected_cos_a = np.cos(np.linspace(0.0, 1.0, len(wp)) * omega)
+    np.testing.assert_allclose(cos_a, expected_cos_a, atol=1e-4)
     # symmetric arc: the odd-n midpoint is cos-equidistant from both endpoints
     m = path_between(a, b, n=9)[4]
     assert_that(float(m @ a)).is_close_to(float(m @ b), tolerance=1e-4)

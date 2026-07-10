@@ -179,7 +179,8 @@ lives in the source docstrings — every public symbol is fully documented there
 
 - Python 3.11+ · numpy ≥ 1.26 (tested under numpy 2.x) · all dependencies ship
   cross-platform wheels (macOS arm64 / Windows / Linux).
-- `transformers` is capped `<5`: MERT's remote code targets the 4.x API.
+- The `[models]` extra requires `transformers` ≥ 5.3.0 (the release fixing
+  CVE-2026-4372) and `torch` ≥ 2.4; MERT and laion-clap both run on the v5 line.
 - The support window follows the scientific-Python ecosystem schedule
   ([SPEC 0](https://scientific-python.org/specs/spec-0000/)): Python and numpy
   versions are dropped on that calendar, in a minor release, noted in the
