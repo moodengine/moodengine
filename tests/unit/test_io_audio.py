@@ -241,6 +241,20 @@ def test_discover_audio_files_recursive_sorted_filtered(tmp_path) -> None:
     assert_that(set(names)).is_equal_to({"a.MP3", "b.wav", "c.flac"})
 
 
+def test_discover_audio_files_root_only_excludes_nested(tmp_path) -> None:
+    """``recursive=False`` scans only the directory root — nested files are excluded."""
+    cfg = default_config()
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "root.wav").write_bytes(b"x")
+    (tmp_path / "sub" / "nested.flac").write_bytes(b"x")
+
+    recursive = discover_audio_files(tmp_path, cfg)
+    root_only = discover_audio_files(tmp_path, cfg, recursive=False)
+
+    assert_that({p.name for p in recursive}).is_equal_to({"root.wav", "nested.flac"})
+    assert_that({p.name for p in root_only}).is_equal_to({"root.wav"})
+
+
 def test_discover_audio_files_missing_dir_returns_empty(tmp_path) -> None:
     """A non-existent directory yields an empty list."""
     cfg = default_config()

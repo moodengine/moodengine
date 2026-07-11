@@ -113,15 +113,21 @@ def segment_waveform(waveform: np.ndarray, sr: int, config: Config) -> list[np.n
     return segments
 
 
-def discover_audio_files(directory: PathLike, config: Config) -> list[Path]:
-    """Recursively list audio files under ``directory``, sorted by path.
+def discover_audio_files(
+    directory: PathLike, config: Config, *, recursive: bool = True
+) -> list[Path]:
+    """List audio files under ``directory``, sorted by path.
 
     A file is included when its lowercased suffix is in
-    ``config.audio_extensions``. Returns a sorted ``list[pathlib.Path]``.
+    ``config.audio_extensions``. When ``recursive`` is ``True`` (the default)
+    the entire tree under ``directory`` is walked; when ``False`` only files
+    directly in ``directory`` are considered (its sub-directories are ignored).
+    Returns a sorted ``list[pathlib.Path]``.
     """
     root = Path(directory)
     if not root.exists():
         return []
     exts = {e.lower() for e in config.audio_extensions}
-    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    entries = root.rglob("*") if recursive else root.glob("*")
+    files = [p for p in entries if p.is_file() and p.suffix.lower() in exts]
     return sorted(files)
