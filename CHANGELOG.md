@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/moodengine/moodengine/compare/v0.2.1...v0.2.2) (2026-07-11)
+
+
+### Features
+
+* **io:** add recursive flag to discover_audio_files ([#14](https://github.com/moodengine/moodengine/issues/14)) ([57f7671](https://github.com/moodengine/moodengine/commit/57f7671075ef2e92db05823a95fa5a47c60fd8ef))
+
 ## [0.2.1](https://github.com/moodengine/moodengine/compare/v0.2.0...v0.2.1) (2026-07-10)
 
 
