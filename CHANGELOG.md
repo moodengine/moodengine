@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/moodengine/moodengine/compare/v0.2.2...v0.2.3) (2026-07-12)
+
+
+### Fixes
+
+* **cluster:** coverage_entropy 0.0 for a single region; guard NaN cophenetic ([#16](https://github.com/moodengine/moodengine/issues/16)) ([6dfab98](https://github.com/moodengine/moodengine/commit/6dfab9819c6279b037c79f0abab2a78da6b04b19))
+
 ## [0.2.2](https://github.com/moodengine/moodengine/compare/v0.2.1...v0.2.2) (2026-07-11)
 
 
