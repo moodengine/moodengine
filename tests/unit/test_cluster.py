@@ -501,8 +501,8 @@ def test_coverage_entropy_uniform_is_one_singleton_is_zero():
     singleton = coverage_entropy(np.array([5, 5, 5, 5]))
     assert_that(singleton["entropy"]).is_close_to(0.0, tolerance=1e-9)
     assert_that(singleton["normalized_entropy"]).is_close_to(
-        1.0, tolerance=1e-6
-    )  # n_bins<=1 → defined as 1.0
+        0.0, tolerance=1e-6
+    )  # n_bins<=1 → defined as 0.0: a single occupied region is minimal diversity (entropy 0)
     assert_that(singleton["perplexity"]).is_close_to(1.0, tolerance=1e-6)
 
 
@@ -785,6 +785,17 @@ def test_cluster_hierarchy_shapes() -> None:
     assert_that(h["cophenetic"]).is_instance_of(float)  # K >= 3 → a real correlation
     assert_that(h["n_super_groups"]).is_between(2, K)
     json.dumps(h)  # must be JSON-serializable (native types)
+
+
+def test_cluster_hierarchy_cophenetic_none_on_degenerate_distances() -> None:
+    """A degenerate medoid distance matrix (identical medoids → zero-variance cosine distances) makes
+    scipy's cophenet return NaN (0/0 Pearson), not raise. cophenetic must be None then — a NaN is not
+    a real correlation and would break JSON rendering (allow_nan=False) once persisted downstream."""
+    cfg = default_config()
+    X = np.ones((9, 8), dtype=np.float32)  # all points identical → identical per-cluster medoids
+    labels = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])  # K == 3 triggers the cophenetic path
+    h = cluster_hierarchy(X, labels, cfg)
+    assert_that(h["cophenetic"]).is_none()
 
 
 def test_cluster_hierarchy_cut_covers_all_clusters() -> None:

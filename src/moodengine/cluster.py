@@ -413,7 +413,11 @@ def cluster_hierarchy(
     if K >= 3:
         try:
             corr, _ = cophenet(Z, pdist(M, metric="cosine"))
-            cophenetic = float(corr)
+            # cophenet returns NaN (not an exception) for a degenerate distance matrix — e.g. K>=3
+            # medoids with zero-variance cosine distances give a 0/0 Pearson correlation. A NaN here
+            # is not a real correlation; store None (anti-fabrication) so it never propagates into a
+            # persisted metric that would break JSON rendering (allow_nan=False) downstream.
+            cophenetic = float(corr) if np.isfinite(corr) else None
         except Exception:  # noqa: BLE001 — a degenerate distance matrix must not raise
             cophenetic = None
 
@@ -515,7 +519,8 @@ def coverage_entropy(labels: np.ndarray, *, base: float = 2.0) -> CoverageEntrop
     region, not dropped). Returns ``{'entropy', 'normalized_entropy', 'perplexity', 'n_bins',
     'shares'}`` where ``entropy = -Σ p·log_base(p)`` over the region shares ``p``,
     ``normalized_entropy = entropy / log_base(n_bins)`` in ``[0, 1]`` (``1.0`` for a perfectly uniform
-    spread, ``0.0`` for a single region; defined as ``1.0`` when ``n_bins <= 1``), ``perplexity =
+    spread, ``0.0`` for a single region; defined as ``0.0`` when ``n_bins <= 1`` — a single occupied
+    region is MINIMAL diversity, its true entropy is 0), ``perplexity =
     base ** entropy`` (the effective number of equally-occupied regions), and ``shares`` maps each
     label to its fraction of the library. Never raises: empty ``labels`` → all zeros / empty shares.
     """
@@ -538,7 +543,10 @@ def coverage_entropy(labels: np.ndarray, *, base: float = 2.0) -> CoverageEntrop
     # Clamp to [0, 1]: a perfectly uniform occupancy gives entropy == log_base(n_bins) exactly in theory,
     # but float rounding of the division can land at 1.0000000000000002 — mathematically the normalized
     # entropy is bounded by 1, so this keeps a downstream ``<= 1.0`` contract honest, not fabricated.
-    normalized = float(np.clip(entropy / denom, 0.0, 1.0)) if denom > 0 else 1.0
+    # n_bins <= 1 (denom == 0): a single occupied region is MINIMAL diversity — entropy is 0, so the
+    # normalized entropy is 0.0, NOT 1.0. Returning 1.0 here made the least-diverse library read as a
+    # perfectly even spread (the exact inverse of the truth). perplexity == base**0 == 1.0 agrees.
+    normalized = float(np.clip(entropy / denom, 0.0, 1.0)) if denom > 0 else 0.0
     perplexity = float(base**entropy)
     return {
         "entropy": entropy,
