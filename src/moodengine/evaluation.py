@@ -78,8 +78,21 @@ def retrieval_precision_at_k(ranked_idx: list[int], relevant: set[int], k: int) 
     return float(hits) / float(k)
 
 
-def _average_precision(ranked_idx: list[int], relevant: set[int]) -> float:
-    """Average precision of a ranking against ``relevant`` (0.0 if none relevant)."""
+def average_precision(ranked_idx: list[int], relevant: set[int]) -> float:
+    """Average precision of a full ranking against ``relevant`` (the AP in MAP).
+
+    ``ranked_idx`` is a ranking (best first) of item indices; ``relevant`` the gold set.
+    Averages the precision measured at each rank where a relevant item is found, over the
+    number of relevant items: ``sum(hits_so_far / rank at each hit) / len(relevant)``. Unlike
+    :func:`retrieval_precision_at_k` it reads the whole ranking, so it rewards placing
+    relevant items early rather than merely inside a top-``k`` window.
+
+    The denominator is the size of the gold set, so relevant items missing from
+    ``ranked_idx`` count as zero precision and cap the score below 1.0 — a truncated
+    ranking is penalised, mirroring the P@k convention. Returns ``0.0`` when nothing is
+    relevant or no relevant item is ranked; ``1.0`` iff every relevant item occupies the
+    top ``len(relevant)`` positions. Result is in ``[0, 1]``. Never raises.
+    """
     rel = set(relevant)
     if not rel:
         return 0.0
@@ -125,7 +138,7 @@ def evaluate_text_queries(
         rel = {int(i) for i in relevant if 0 <= int(i) < n}
         per_query[text] = {
             "precision_at_k": retrieval_precision_at_k(ranked, rel, k),
-            "average_precision": _average_precision(ranked, rel),
+            "average_precision": average_precision(ranked, rel),
             "n_relevant": len(rel),
         }
 
@@ -279,7 +292,7 @@ def evaluate_against_gold(df: pd.DataFrame, gold: dict) -> dict:
 
 
 # --- ranking metrics (binary relevance) -------------------------------------
-# Composed by callers alongside the existing retrieval_precision_at_k / _average_precision to
+# Composed by callers alongside the existing retrieval_precision_at_k / average_precision to
 # score retrieval gold sets (text->playlist, similar-track). Pure numpy, torch-free.
 
 
