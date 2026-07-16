@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/moodengine/moodengine/compare/v0.2.3...v0.2.4) (2026-07-16)
+
+
+### Features
+
+* **evaluation:** promote average_precision to the public API ([#18](https://github.com/moodengine/moodengine/issues/18)) ([7b16582](https://github.com/moodengine/moodengine/commit/7b165822c59357691d5e2a5d2d577ea8d331479a))
+
 ## [0.2.3](https://github.com/moodengine/moodengine/compare/v0.2.2...v0.2.3) (2026-07-12)
 
 
