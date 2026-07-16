@@ -191,6 +191,7 @@ from moodengine.feedback import aggregate_implicit, implicit_weight
 
 # --- evaluation ---
 from moodengine.evaluation import (
+    average_precision,
     axis_ranking_auc,
     concordance_correlation_coefficient,
     evaluate_against_gold,
@@ -385,6 +386,7 @@ __all__ = [
     # evaluation
     "axis_ranking_auc",
     "retrieval_precision_at_k",
+    "average_precision",
     "evaluate_text_queries",
     "load_gold",
     "evaluate_against_gold",

@@ -14,6 +14,7 @@ import pandas as pd
 from assertpy import assert_that
 
 from moodengine.evaluation import (
+    average_precision,
     axis_ranking_auc,
     concordance_correlation_coefficient,
     evaluate_against_gold,
@@ -102,6 +103,68 @@ def test_retrieval_precision_at_k_nonpositive_k() -> None:
     """``k <= 0`` is guarded and returns 0.0."""
     assert_that(retrieval_precision_at_k([0, 1], {0}, k=0)).is_equal_to(0.0)
     assert_that(retrieval_precision_at_k([0, 1], {0}, k=-2)).is_equal_to(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# average_precision
+# --------------------------------------------------------------------------- #
+
+
+def test_average_precision_all_relevant_first_is_one() -> None:
+    """Every relevant item in the top ``len(relevant)`` positions -> AP == 1.0 (the maximum)."""
+    assert_that(average_precision([0, 1, 2, 9], {0, 1, 2})).is_close_to(1.0, tolerance=1e-9)
+    # Order *within* the relevant prefix does not matter — all precisions are still 1.
+    assert_that(average_precision([2, 0, 1, 9], {0, 1, 2})).is_close_to(1.0, tolerance=1e-9)
+
+
+def test_average_precision_hand_value_single_hit_at_rank_two() -> None:
+    """One relevant item at rank 2 -> precision 1/2 there, averaged over 1 relevant -> 0.5."""
+    assert_that(average_precision([9, 1, 8], {1})).is_close_to(0.5, tolerance=1e-9)
+
+
+def test_average_precision_hand_value_two_hits() -> None:
+    """Hits at ranks 1 and 3 -> (1/1 + 2/3) / 2."""
+    expected = (1.0 + 2.0 / 3.0) / 2.0
+
+    assert_that(average_precision([0, 9, 1, 8], {0, 1})).is_close_to(expected, tolerance=1e-9)
+
+
+def test_average_precision_ranks_relevant_earlier_scores_higher() -> None:
+    """Monotone in rank position: promoting the relevant item strictly raises AP."""
+    early = average_precision([1, 9, 8], {1})
+    late = average_precision([9, 8, 1], {1})
+
+    assert_that(early).is_greater_than(late)
+    assert_that(early).is_close_to(1.0, tolerance=1e-9)
+    assert_that(late).is_close_to(1.0 / 3.0, tolerance=1e-9)
+
+
+def test_average_precision_unranked_relevant_caps_below_one() -> None:
+    """The denominator is the gold size, so a relevant item absent from the ranking costs AP."""
+    # Item 0 is ranked first (precision 1.0) but item 1 never appears -> 1.0 / 2 relevant.
+    val = average_precision([0], {0, 1})
+
+    assert_that(val).is_close_to(0.5, tolerance=1e-9)
+    assert_that(val).is_less_than(1.0)
+
+
+def test_average_precision_guards() -> None:
+    """No relevant items, or none of them ranked -> 0.0 (never raises)."""
+    assert_that(average_precision([0, 1, 2], set())).is_equal_to(0.0)
+    assert_that(average_precision([0, 1, 2], {9})).is_equal_to(0.0)
+    assert_that(average_precision([], {0})).is_equal_to(0.0)
+
+
+def test_average_precision_is_bounded_in_unit_interval() -> None:
+    """AP stays within [0, 1] across random rankings and gold sets."""
+    rng = np.random.default_rng(20260716)
+
+    for _ in range(50):
+        ranked = rng.permutation(12).tolist()
+        relevant = {int(i) for i in rng.choice(12, size=4, replace=False)}
+        val = average_precision(ranked, relevant)
+
+        assert_that(val).is_between(0.0, 1.0)
 
 
 # --------------------------------------------------------------------------- #
