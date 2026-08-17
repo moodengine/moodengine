@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 def get_embedder(name: str, config: Config):
     """Lazily construct a concrete embedder by name.
 
-    ``name`` is ``'mert'`` or ``'clap'``. The concrete module is imported inside
+    ``name`` is ``'mert'``, ``'clap'`` or ``'mulan'``. The concrete module is imported inside
     this function so torch is only required when an embedder is actually built.
     Raises :class:`ValueError` for an unknown name, and
     :class:`~moodengine.exceptions.MissingDependencyError` (naming the ``models``
@@ -60,7 +60,13 @@ def get_embedder(name: str, config: Config):
         except ModuleNotFoundError as exc:
             raise MissingDependencyError("CLAP embedding", "torch + laion-clap", "models") from exc
         return CLAPEmbedder(config)
-    raise ValueError(f"unknown embedder name: {name!r} (expected 'mert' or 'clap')")
+    if key == "mulan":
+        try:
+            from moodengine.embeddings.mulan import MuLanEmbedder
+        except ModuleNotFoundError as exc:
+            raise MissingDependencyError("MuQ-MuLan embedding", "torch + muq", "muq") from exc
+        return MuLanEmbedder(config)
+    raise ValueError(f"unknown embedder name: {name!r} (expected 'mert', 'clap' or 'mulan')")
 
 
 # The exact model variants the pre-tag cache keys were computed with. Frozen
@@ -113,6 +119,10 @@ def _model_variant_tag(embedder_name: str, config: Config) -> str:
         if config.clap_checkpoint is not None:
             parts.append(hashlib.sha1(str(config.clap_checkpoint).encode()).hexdigest()[:8])
         return "-".join(parts)
+    if embedder_name == "mulan":
+        # No legacy cache exists for this embedder, so the model is always named in the key —
+        # there is no byte-identical pre-tag key to keep compatible with.
+        return config.mulan_model_name.replace("/", "_")
     return ""
 
 

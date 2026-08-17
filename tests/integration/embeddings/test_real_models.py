@@ -12,6 +12,7 @@ honor the Embedder contract end-to-end.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from assertpy import assert_that
 
@@ -50,6 +51,48 @@ def test_real_clap_single_prompt_does_not_crash():
 
     assert_that(text.ndim).is_equal_to(2)  # (1, hidden), not a crash
     assert_that(text.shape[0]).is_equal_to(1)
+
+
+def test_real_mulan_text_and_audio_share_one_space(synth_clip):
+    """MuQ-MuLan is the alternative audio-text backbone: its audio and text embeddings must land in
+    the SAME 512-d space, or the zero-shot labeling stack cannot use it at all."""
+    mulan = pytest.importorskip("moodengine.embeddings.mulan", reason="needs the muq extra")
+    cfg = default_config()
+    embedder = mulan.MuLanEmbedder(cfg)
+    wav = synth_clip("tone", seconds=2.0, sr=cfg.mulan_sample_rate)
+
+    audio = embedder.extract(wav, cfg.mulan_sample_rate)
+    text = embedder.embed_text(["an energetic upbeat song", "a calm ambient track"])
+
+    assert_that(audio.ndim).is_equal_to(1)  # (hidden,) clip embedding, like CLAP
+    assert_that(text.shape[0]).is_equal_to(2)
+    assert_that(text.shape[1]).is_equal_to(audio.shape[0])
+
+
+def test_real_mulan_rows_are_unit_norm(synth_clip):
+    """The model L2-normalizes each internal 10 s clip then averages them WITHOUT re-normalizing,
+    so anything longer comes back with norm < 1 and a dot product against text would not be a
+    cosine. The embedder restores unit norm at the boundary; assert it on audio LONGER than one
+    clip, which is the only case that can regress."""
+    mulan = pytest.importorskip("moodengine.embeddings.mulan", reason="needs the muq extra")
+    cfg = default_config()
+    embedder = mulan.MuLanEmbedder(cfg)
+    wav = synth_clip("tone", seconds=25.0, sr=cfg.mulan_sample_rate)  # > the 10 s internal clip
+
+    audio = embedder.extract(wav, cfg.mulan_sample_rate)
+
+    assert_that(float(np.linalg.norm(audio))).is_close_to(1.0, tolerance=1e-5)
+
+
+def test_real_mulan_rejects_off_rate_audio(synth_clip):
+    """24 kHz, not CLAP's 48 kHz. Off-rate audio is time/pitch-warped in a way nothing downstream
+    can detect, so it must fail rather than embed."""
+    mulan = pytest.importorskip("moodengine.embeddings.mulan", reason="needs the muq extra")
+    cfg = default_config()
+    embedder = mulan.MuLanEmbedder(cfg)
+
+    with pytest.raises(ValueError, match=r"received audio at 48000 Hz but expects 24000 Hz"):
+        embedder.extract(synth_clip("tone", seconds=1.0, sr=48_000), 48_000)
 
 
 def test_real_mert_layered_shape(synth_clip):
