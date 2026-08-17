@@ -95,6 +95,25 @@ def test_real_mulan_rejects_off_rate_audio(synth_clip):
         embedder.extract(synth_clip("tone", seconds=1.0, sr=48_000), 48_000)
 
 
+def test_real_clap_batched_extract_matches_the_per_segment_path(synth_clip):
+    """Batching must not change the numbers. Segments are RAGGED — a track's trailing window is
+    short — so `np.stack` over all of them raises; grouping by length keeps each group rectangular
+    and leaves the arithmetic alone. Assert at float32-ULP tolerance, not exact equality: BLAS
+    accumulation order depends on the batch shape."""
+    cfg = default_config()
+    clap = get_embedder("clap", cfg)
+    segments = [
+        synth_clip("tone", seconds=10.0, sr=cfg.clap_sample_rate),
+        synth_clip("percussive", seconds=10.0, sr=cfg.clap_sample_rate),
+        synth_clip("tone", seconds=3.0, sr=cfg.clap_sample_rate),  # the ragged tail
+    ]
+
+    one_at_a_time = np.vstack([clap.extract(s, cfg.clap_sample_rate) for s in segments])
+    batched = np.vstack(clap.extract_batch(segments, cfg.clap_sample_rate))
+
+    np.testing.assert_allclose(batched, one_at_a_time, atol=2e-6)
+
+
 def test_real_mert_layered_shape(synth_clip):
     # Arrange
     cfg = default_config()
