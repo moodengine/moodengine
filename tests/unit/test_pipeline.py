@@ -159,6 +159,63 @@ def test_cache_extra_busts_mert_for_the_24khz_default() -> None:
     )
 
 
+def test_extract_embeddings_does_not_load_the_model_on_a_fully_cached_run(
+    tmp_config, make_audio_library, monkeypatch
+) -> None:
+    """The weights used to be loaded before the cache was consulted, so a run that reads every
+    vector off disk still paid a full model construction — ~7.5 s and gigabytes resident for CLAP,
+    four times over inside `compare_spaces`."""
+    make_audio_library(tmp_config.raw_dir, n=3)
+    pipeline.extract_embeddings(tmp_config, "clap")  # warm the cache
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "get_embedder",
+        lambda name, config: calls.append(name) or _FakeEmbedder(name, 48_000),
+    )
+    files, X = pipeline.extract_embeddings(tmp_config, "clap")
+
+    assert_that(calls).is_empty()  # every vector served from disk, no weights touched
+    assert_that(files).is_length(3)
+    assert_that(X.shape[0]).is_equal_to(3)
+
+
+def test_lazy_embedder_exposes_identity_without_loading() -> None:
+    """`name` and `sample_rate` are the only two facts a cache key needs, and both come from the
+    config — reading them must not materialize a model."""
+    lazy = pipeline.LazyEmbedder("clap", default_config())
+
+    assert_that(lazy.name).is_equal_to("clap")
+    assert_that(lazy.sample_rate).is_equal_to(48_000)
+    assert_that(lazy.loaded).is_false()
+
+
+def test_lazy_embedder_rejects_an_unknown_name_before_loading() -> None:
+    """A typo must fail here, not after a multi-second weight load."""
+    with pytest.raises(ValueError, match=r"unknown embedder name: 'nope'"):
+        pipeline.LazyEmbedder("nope", default_config())
+
+
+def test_track_embedding_from_waveform_falls_back_when_batching_is_absent(tmp_config) -> None:
+    """The embedder contract is STRUCTURAL: a caller's own object need only provide `extract`.
+    Requiring `extract_batch` would break every such implementation for a 12 % gain, so it is
+    probed, not required."""
+
+    class _ExtractOnly:
+        name, sample_rate = "clap", 48_000
+
+        def extract(self, waveform, sr):
+            return np.full(4, float(np.asarray(waveform).size), dtype=np.float32)
+
+    waveform = np.zeros(48_000 * 25, dtype=np.float32)
+
+    vector = pipeline.track_embedding_from_waveform(_ExtractOnly(), waveform, 48_000, tmp_config)
+
+    assert_that(vector.ndim).is_equal_to(1)
+    assert_that(bool(np.all(np.isfinite(vector)))).is_true()
+
+
 def test_track_embedding_from_waveform_rejects_an_off_rate_waveform() -> None:
     """The public post-decode entry point: a caller reaching it holds a waveform it decoded itself,
     and off-rate audio is time/pitch-warped in a way no downstream stage can detect — every

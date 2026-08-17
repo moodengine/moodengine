@@ -96,6 +96,59 @@ _LEGACY_CACHE_DEFAULTS = {
 }
 
 
+class LazyEmbedder:
+    """An embedder that loads its weights on FIRST USE, not on construction.
+
+    ``name`` and ``sample_rate`` come from ``config`` alone, and those are the only two facts a
+    cache lookup needs (:func:`_embedding_cache_extra` reads nothing else). So a run whose vectors
+    are already on disk never touches the model at all — every other attribute, ``extract``
+    included, materializes it on demand and delegates.
+
+    Worth the indirection because the eager load is not cheap and was unconditional: constructing
+    CLAP takes ~7.5 s and gigabytes of resident weights even with the checkpoint already cached,
+    :func:`extract_embeddings` paid it before consulting the cache, and
+    :func:`compare_spaces` builds four embedders per call — around 30 s of pure waste on a run that
+    reads every vector off disk.
+    """
+
+    #: Decode rate per embedder, resolvable without loading anything.
+    _RATE_FIELDS = {
+        "mert": "mert_sample_rate",
+        "clap": "clap_sample_rate",
+        "mulan": "mulan_sample_rate",
+    }
+
+    def __init__(self, name: str, config: Config) -> None:
+        key = name.lower()
+        if key not in self._RATE_FIELDS:
+            raise ValueError(
+                f"unknown embedder name: {name!r} (expected 'mert', 'clap' or 'mulan')"
+            )
+        self.name = key
+        self.sample_rate = int(getattr(config, self._RATE_FIELDS[key]))
+        self._config = config
+        self._loaded: object | None = None
+
+    @property
+    def loaded(self) -> bool:
+        """Whether the weights have actually been materialized yet (diagnostic; also what the
+        laziness test asserts on)."""
+        return self._loaded is not None
+
+    def _model(self):
+        if self._loaded is None:
+            self._loaded = get_embedder(self.name, self._config)
+        return self._loaded
+
+    def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
+        return self._model().extract(waveform, sr)
+
+    def __getattr__(self, item: str):
+        # Reached only for attributes not set in __init__ (e.g. `embed_text`), so the guarded
+        # fields above never trigger a load.
+        return getattr(self._model(), item)
+
+
 def _model_variant_tag(embedder_name: str, config: Config) -> str:
     """Cache-key component identifying the model variant behind ``embedder_name``.
 
@@ -224,7 +277,16 @@ def track_embedding_from_waveform(embedder, waveform, sr, config: Config) -> np.
             "load_audio does this) rather than relabeling the array."
         )
     segments = _io.segment_waveform(waveform, sr, config)
-    embedded = [embedder.extract(seg, sr) for seg in segments]
+    # One forward pass per distinct segment length rather than one per segment. Probed rather than
+    # required: `Embedder` supplies a looping default, but the embedder contract is structural —
+    # a caller's own object need only provide `extract`, and demanding `extract_batch` would break
+    # every such implementation for a 12 % gain.
+    batch = getattr(embedder, "extract_batch", None)
+    embedded = (
+        list(batch(segments, sr))
+        if callable(batch)
+        else [embedder.extract(s, sr) for s in segments]
+    )
     pooler = POOLERS[embedder.name]
     return np.asarray(pooler(embedded, config), dtype=np.float32)
 
@@ -251,7 +313,7 @@ def extract_embeddings(
     Returns an empty list and an empty ``(0, 0)`` matrix when nothing is found
     or everything fails.
     """
-    embedder = get_embedder(embedder_name, config)
+    embedder = LazyEmbedder(embedder_name, config)
     discovered = _io.discover_audio_files(config.raw_dir, config)
     total = len(discovered)
 

@@ -121,6 +121,16 @@ class Embedder(ABC):
     name: str
     sample_rate: int
 
+    def extract_batch(self, waveforms: list[np.ndarray], sr: int) -> list[np.ndarray]:
+        """Embed several segments at once. Defaults to looping :meth:`extract`.
+
+        Optional to override, and overriding must not change the numbers: a backbone that batches
+        has to return what the per-segment path returns, to float32 rounding. Kept off
+        :meth:`extract` rather than replacing it so a single-segment caller is unaffected and a
+        backbone with ragged-input constraints can simply not implement it.
+        """
+        return [self.extract(wav, sr) for wav in waveforms]
+
     @abstractmethod
     def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """Embed a single mono float32 waveform sampled at ``sr``.
