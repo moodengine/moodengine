@@ -14,7 +14,7 @@ paths:
 - Justify it in the commit/PR message: what it does, why stdlib/numpy can't.
 
 **Version bounds.**
-- Lower bound = the oldest version actually tested (CI job with `uv run --resolution lowest-direct` keeps us honest).
+- Lower bound = the oldest version actually tested (CI job with `uv run --resolution lowest-direct` keeps us honest). That gate runs on Python 3.11 only, and has to: `uv lock` resolves the whole requires-python range at once, so the floors it picks (pandas 2.0.0, scikit-learn 1.3.0, hdbscan 0.8.39, pyarrow 14.0.0) predate cp312+ wheels and source-build — and fail — on any newer interpreter. Floors are proven at the oldest supported Python; newer ones get wheel-bearing releases from ordinary resolution.
 - **No upper bounds** unless a breakage is known and reproduced; every cap carries an inline comment stating the exact reason and what unlocks removal — and is lifted once that condition clears (as the former `transformers<5` cap was, once MERT and laion-clap were verified on the transformers 5.x line). The project currently ships no upper caps.
 - Support window follows the scientific-Python ecosystem (SPEC 0): drop Python/numpy versions on schedule, in a minor release, noted in the changelog.
 

@@ -118,6 +118,17 @@ jobs:
 
   # Keeps the declared lower bounds honest: resolve every direct dependency to
   # its minimum version and run the suite against that.
+  #
+  # The 3.11 pin below is load-bearing, not a leftover default. `uv lock` resolves
+  # for the whole requires-python range at once, so lowest-direct selects the same
+  # floors whatever interpreter runs it — pandas 2.0.0, scikit-learn 1.3.0,
+  # hdbscan 0.8.39, pyarrow 14.0.0. Those releases predate cp312+ wheels yet declare
+  # an open-ended requires-python (or none), so from 3.12 up the resolver accepts
+  # them and falls back to a source build that dies on the pkg_resources modern
+  # setuptools no longer ships. Moving this job to a newer Python therefore tests
+  # nothing extra, it only fails — and "fixing" that by raising the floors would drop
+  # support we actually have. Ordinary (highest) resolution is unaffected on every
+  # supported Python: it picks wheel-bearing releases by itself.
   test-lowest:
     name: test · lowest direct resolution
     runs-on: ubuntu-latest
