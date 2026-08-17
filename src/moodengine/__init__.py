@@ -25,6 +25,7 @@ from moodengine._typing import (
     Reducer2D,
     SegmentSelection,
     StabilityMetrics,
+    StructureVerdict,
     SubClusterResult,
     SupportsEmbedText,
 )
@@ -76,6 +77,7 @@ from moodengine.cluster import (
     run_clustering,
     select_kmeans_k,
     silhouette_original,
+    structure_verdict,
     sub_cluster,
 )
 
@@ -90,6 +92,7 @@ from moodengine.labeling import (
     attribute_scores,
     build_label_matrix,
     cluster_mood_profiles,
+    label_prior,
     label_tracks,
     labeling_quality_metrics,
     name_clusters,
@@ -194,6 +197,7 @@ from moodengine.feedback import aggregate_implicit, implicit_weight
 from moodengine.evaluation import (
     average_precision,
     axis_ranking_auc,
+    ccc_components,
     concordance_correlation_coefficient,
     evaluate_against_gold,
     evaluate_text_queries,
@@ -251,6 +255,7 @@ __all__ = [
     "ClusteringResult",
     "ClusterMetrics",
     "StabilityMetrics",
+    "StructureVerdict",
     "CoverageEntropyResult",
     "SubClusterResult",
     # config
@@ -288,6 +293,7 @@ __all__ = [
     "cluster_metrics",
     "select_kmeans_k",
     "silhouette_original",
+    "structure_verdict",
     "cluster_medoids",
     "outlier_scores",
     "bootstrap_stability",
@@ -295,6 +301,7 @@ __all__ = [
     "per_cluster_silhouette",
     "sub_cluster",
     # labeling
+    "label_prior",
     "label_tracks",
     "attribute_scores",
     "cluster_mood_profiles",
@@ -391,6 +398,7 @@ __all__ = [
     "evaluate_text_queries",
     "load_gold",
     "evaluate_against_gold",
+    "ccc_components",
     "concordance_correlation_coefficient",
     # calibration + conformal uncertainty
     "fit_temperature",

@@ -57,18 +57,37 @@ class Reducer2D(Protocol):
     def transform(self, X: np.ndarray) -> np.ndarray: ...
 
 
+#: How much structure the ORIGINAL-space silhouette actually supports (see
+#: :func:`moodengine.cluster.structure_verdict`). ``"none_detected"`` means the reported clusters
+#: are an artifact of the dimensionality reduction, not of the data.
+StructureVerdict = Literal["clustered", "weak", "none_detected"]
+
+
 class ClusterMetrics(TypedDict):
     """Shape of :func:`moodengine.cluster.cluster_metrics` results.
 
-    ``run_clustering`` additionally stamps ``reduction`` so the tiny-input
-    UMAP skip is visible in the result, not only in the logs.
+    ``run_clustering`` additionally stamps ``reduction`` (so the tiny-input UMAP skip is visible in
+    the result, not only in the logs) plus the two-space honesty fields ``silhouette_space``,
+    ``silhouette_original`` and ``structure``. Those three need to know about BOTH the reduced and
+    the original space, which only ``run_clustering`` does — :func:`cluster_metrics` scores one
+    given space and cannot set them.
     """
 
     n_clusters: int
     noise_ratio: float
     cluster_sizes: dict[int, int]
+    #: Silhouette in whichever space the clustering ran in — the REDUCED (UMAP) space on the
+    #: normal path. Read ``silhouette_original`` before treating it as evidence of structure.
     silhouette: float | None
     reduction: NotRequired[Literal["umap", "none_tiny_input"]]
+    #: Which space ``silhouette`` was computed in, so the number is self-describing.
+    silhouette_space: NotRequired[Literal["reduced", "original"]]
+    #: Silhouette of the same labels in the ORIGINAL embedding space, always COSINE — unlike
+    #: ``silhouette``, which cluster_metrics scores with sklearn's euclidean default. ``None``
+    #: when undefined (< 2 clusters).
+    silhouette_original: NotRequired[float | None]
+    #: Verdict derived from ``silhouette_original`` — see :func:`moodengine.cluster.structure_verdict`.
+    structure: NotRequired[StructureVerdict | None]
 
 
 class ClusteringResult(TypedDict):

@@ -16,7 +16,12 @@ gain" was unfalsifiable. It compares the pipeline against human valence/arousal 
 
 Gold mapping: DEAM arousal -> the engine's ``energy`` axis, DEAM valence -> ``valence``;
 the 1-9 rating scale is affine-mapped to [0, 1] so CCC (which penalises scale/shift) is
-meaningful. Results (Pearson / Spearman / CCC per axis) are printed and written to JSON so
+meaningful. Zero-shot is reported TWICE — raw, and affine-calibrated out-of-fold — because a raw
+zero-shot score is a softmax whose spread is set by the labelling temperature, a free constant
+CCC would otherwise reward. Track the calibrated block across engine changes, and read each CCC
+next to its ``rho x c_b`` split.
+
+Results (Pearson / Spearman / CCC per axis) are printed and written to JSON so
 a before/after diff across an engine change is a file comparison. Runs on CPU; use
 ``--limit`` to bound the (dominant) embedding cost — a few hundred tracks already gives a
 stable correlation.
@@ -39,7 +44,7 @@ import pandas as pd
 import typer
 
 from moodengine.config import default_config
-from moodengine.evaluation import evaluate_against_gold
+from moodengine.evaluation import ccc_components, evaluate_against_gold
 from moodengine.labeling import attribute_scores, l2_normalize
 from moodengine.pipeline import get_embedder, track_embedding
 
@@ -130,13 +135,55 @@ def _probe_oof(X: np.ndarray, y: np.ndarray, seed: int, n_splits: int) -> np.nda
     return preds
 
 
+def _affine_oof(pred: np.ndarray, gold: np.ndarray, seed: int, n_splits: int) -> np.ndarray:
+    """Out-of-fold affine map of ``pred`` onto the gold scale — one slope/intercept per fold.
+
+    Needed because a raw zero-shot axis is a softmax probability, whose SPREAD is set by
+    ``labeling.DEFAULT_TEMPERATURE`` rather than by anything about the music. CCC penalises a scale
+    mismatch, so it reads that free constant: with the ranking frozen (Spearman identical at every
+    temperature) the reported CCC moved 0.367 → 0.503 → 0.578 → 0.378 across temperatures 0.02 /
+    0.05 / 0.1 / 0.3, peaking exactly where the predicted spread happened to match the gold spread.
+    A real prompt improvement could therefore register as a CCC regression, and a pure temperature
+    tweak be banked as a gain.
+
+    Fitting the two coefficients out-of-fold removes that degree of freedom without leaking: the
+    map applied to a held-out row was fit only on other rows, so the calibrated CCC measures what
+    the axis actually knows. Only two coefficients are fit, so each fold's map is order-preserving
+    WITHIN that fold; across folds the slopes differ slightly, so Pearson and Spearman move a
+    little between the raw and calibrated blocks (around a percent) rather than being identical. A
+    LARGE gap means some fold fit a near-zero or negative slope — read its CCC with suspicion.
+    """
+    from sklearn.linear_model import LinearRegression
+    from sklearn.model_selection import KFold
+
+    out = np.full(gold.shape[0], np.nan, dtype=np.float64)
+    kf = KFold(n_splits=min(n_splits, gold.shape[0]), shuffle=True, random_state=seed)
+    for train_idx, test_idx in kf.split(pred.reshape(-1, 1)):
+        model = LinearRegression().fit(pred[train_idx].reshape(-1, 1), gold[train_idx])
+        out[test_idx] = model.predict(pred[test_idx].reshape(-1, 1))
+    return out
+
+
 def _score(pred_energy: np.ndarray, pred_valence: np.ndarray, sel) -> dict:
-    """Pearson/Spearman/CCC of predicted vs gold energy & valence via evaluate_against_gold."""
+    """Pearson/Spearman/CCC of predicted vs gold energy & valence, plus Lin's CCC decomposition.
+
+    ``<axis>_ccc_rho`` and ``<axis>_ccc_cb`` split each CCC into how well the axis ORDERS the gold
+    values and how far it sits from the ``y = x`` line (``CCC = rho * c_b``). Reporting the pair
+    makes a scale artifact legible: a CCC that moves while ``rho`` holds still is a spread change,
+    not a quality change.
+    """
     df = pd.DataFrame(
         {"filename": [r[0] for r in sel], "energy": pred_energy, "valence": pred_valence}
     )
     gold = {r[0]: {"energy": r[2], "valence": r[3]} for r in sel}
-    return evaluate_against_gold(df, gold)
+    metrics = evaluate_against_gold(df, gold)
+
+    for axis, pred in (("energy", pred_energy), ("valence", pred_valence)):
+        truth = np.array([g[axis] for g in (gold[r[0]] for r in sel)], dtype=np.float64)
+        rho, c_b, _ = ccc_components(np.asarray(pred, dtype=np.float64), truth)
+        metrics[f"{axis}_ccc_rho"] = rho
+        metrics[f"{axis}_ccc_cb"] = c_b
+    return metrics
 
 
 def _print(title: str, metrics: dict) -> None:
@@ -146,7 +193,9 @@ def _print(title: str, metrics: dict) -> None:
         typer.echo(
             f"  {axis:8s} pearson={metrics.get(f'{axis}_pearson', float('nan')):.3f}  "
             f"spearman={metrics.get(f'{axis}_spearman', float('nan')):.3f}  "
-            f"ccc={metrics.get(f'{axis}_ccc', float('nan')):.3f}"
+            f"ccc={metrics.get(f'{axis}_ccc', float('nan')):.3f} "
+            f"(rho={metrics.get(f'{axis}_ccc_rho', float('nan')):.3f} x "
+            f"c_b={metrics.get(f'{axis}_ccc_cb', float('nan')):.3f})"
         )
 
 
@@ -192,9 +241,23 @@ def main(
         clap = get_embedder("clap", config)
         xc = _embed([r[1] for r in sel], "clap", config, force)
         attrs = attribute_scores(xc, clap)
-        zs = _score(attrs["energy"].to_numpy(), attrs["valence"].to_numpy(), sel)
-        _print("zero-shot (CLAP attribute_scores)", zs)
+        e_raw, v_raw = attrs["energy"].to_numpy(), attrs["valence"].to_numpy()
+        zs = _score(e_raw, v_raw, sel)
+        _print("zero-shot (CLAP attribute_scores, raw softmax scale)", zs)
         results["zeroshot"] = zs
+
+        # The raw CCC above is partly a readout of the softmax temperature (see _affine_oof).
+        # This second block puts both axes on the gold scale out-of-fold, so its CCC reflects the
+        # axis rather than that constant. Compare THIS one across engine changes. Pearson and
+        # Spearman shift only slightly between the blocks (each fold's map preserves order, but the
+        # folds' slopes differ); a large shift means a fold fit a degenerate slope.
+        zs_cal = _score(
+            _affine_oof(e_raw, energy_gold, config.seed, n_splits),
+            _affine_oof(v_raw, valence_gold, config.seed, n_splits),
+            sel,
+        )
+        _print(f"zero-shot, affine-calibrated out-of-fold ({n_splits}-fold)", zs_cal)
+        results["zeroshot_calibrated"] = zs_cal
 
     if mode in ("probe", "both"):
         X = _embed([r[1] for r in sel], embedder, config, force)

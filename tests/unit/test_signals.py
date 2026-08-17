@@ -122,6 +122,50 @@ def test_estimate_tempo_recovers_click_bpm_within_2pct(bpm):
     assert_that(est.stability).is_true()  # a metronome is maximally regular
 
 
+def test_estimate_tempo_confidence_ranks_a_pulse_above_noise():
+    """The regression that shipped: confidence used to be ANTI-correlated with tempo reliability.
+
+    ``librosa.autocorrelate`` does not mean-center and ``onset_strength`` is non-negative with a
+    large DC term, so ``ac[lag] / ac[0]`` measured the envelope's mean rather than its periodicity
+    — white noise scored 0.94 against a perfect click track's 0.73, while reporting a fabricated
+    BPM. The pre-existing tests only asserted ``is_between(0, 1)``, which the inverted metric
+    satisfied, so nothing caught it. Assert the ORDERING instead: a real pulse must outrank noise.
+    """
+    dur, bpm = 12.0, 120.0
+    times = np.arange(0.0, dur, 60.0 / bpm)
+    pulse = librosa.clicks(times=times, sr=_SR, click_duration=0.05, length=int(dur * _SR))
+    noise = np.random.default_rng(0).normal(0.0, 0.1, int(dur * _SR)).astype(np.float32)
+
+    pulse_est = estimate_tempo(pulse, _SR)
+    noise_est = estimate_tempo(noise, _SR)
+
+    assert_that(pulse_est.confidence).is_greater_than(noise_est.confidence)
+    assert_that(pulse_est.confidence).is_greater_than(0.5)  # a metronome is unambiguous
+    assert_that(noise_est.confidence).is_less_than(0.2)  # noise has no beat period to find
+
+
+def test_estimate_tempo_noise_is_not_reported_as_a_stable_grid():
+    """``beat_track``'s ``tightness`` prior emits a near-uniform grid whatever the audio is, so
+    inter-beat regularity alone made ``stability`` true for every analysable input — noise
+    included. It must now also clear the confidence floor."""
+    noise = np.random.default_rng(0).normal(0.0, 0.1, int(12.0 * _SR)).astype(np.float32)
+
+    est = estimate_tempo(noise, _SR)
+
+    assert_that(est.stability).is_false()  # a grid over noise is not a stable tempo
+    assert_that(len(est.beat_times)).is_greater_than(2)  # the grid itself still exists...
+    assert_that(est.bpm).is_not_none()  # ...and a BPM is still named — confidence is the caveat
+
+
+def test_estimate_tempo_constant_envelope_scores_zero_confidence():
+    """A DC-only envelope has no variance to correlate. Centering makes ``ac[0] == 0``, and the
+    guard must return 0.0 rather than dividing by it."""
+    est = estimate_tempo(np.full(int(6.0 * _SR), 0.5, dtype=np.float32), _SR)
+
+    assert_that(est.confidence).is_equal_to(0.0)
+    assert_that(est.stability).is_false()
+
+
 def test_estimate_tempo_too_short_signal_yields_none_bpm():
     est = estimate_tempo(np.zeros(16, dtype=np.float32), _SR)
 

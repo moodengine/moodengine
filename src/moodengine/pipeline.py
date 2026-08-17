@@ -326,6 +326,13 @@ class PipelineResult:
     ``labels_requested`` records the ``with_labels`` argument, and
     ``have_labels`` tells whether the label columns carry real content
     (``False`` when labeling was requested but no CLAP embedding succeeded).
+
+    ``mood_prior`` is the ``(n_moods,)`` modality-gap offset this run estimated over the whole
+    library and scored against (``None`` when no labelling happened). Keep it and pass it back as
+    ``prior=`` when scoring anything later against the same vocabulary — that is what makes a
+    track's label reproducible outside this batch. Without it, a follow-up call re-estimates the
+    offset from whatever rows it was handed and can name a different mood for a track this run
+    already labelled.
     """
 
     assignments: pd.DataFrame
@@ -337,6 +344,7 @@ class PipelineResult:
     config: Config
     labels_requested: bool
     have_labels: bool
+    mood_prior: NDArray[np.float32] | None
 
 
 def run_pipeline_core(
@@ -429,6 +437,7 @@ def run_pipeline_core(
             config=config,
             labels_requested=with_labels,
             have_labels=False,
+            mood_prior=None,
         )
 
     # KMeans auto-k: pick the silhouette-best k and bake it into a copy of config.
@@ -460,6 +469,7 @@ def run_pipeline_core(
 
     profiles: dict[int, list[tuple[str, float]]] = {}
     have_labels = False
+    mood_prior: NDArray[np.float32] | None = None
 
     if with_labels:
         clap_X, clap_embedder, clap_valid = _clap_embeddings_for(
@@ -491,7 +501,17 @@ def run_pipeline_core(
             # means for every real track.
             valid_idx = np.flatnonzero(clap_valid)
             X_valid = clap_X if clap_valid.all() else clap_X[valid_idx]
-            ld = _labeling.label_tracks(X_valid, recenter=recenter, label_matrix=mood_lm)
+
+            # Estimate the modality-gap offset ONCE, over the whole library, and pass it
+            # explicitly from here on. Letting each call fall back to its own batch mean would
+            # give the same numbers on this pass (the batch IS the library) but nothing to reuse:
+            # a caller later scoring one new track, or re-scoring a playlist, would re-estimate
+            # the offset from that handful of rows and land on a different label for a track this
+            # run already labelled. Returned on PipelineResult.mood_prior for exactly that reason.
+            mood_prior = _labeling.label_prior(X_valid @ np.asarray(mood_lm[1], dtype=np.float32).T)
+            ld = _labeling.label_tracks(
+                X_valid, recenter=recenter, label_matrix=mood_lm, prior=mood_prior
+            )
             attr = _labeling.attribute_scores(X_valid, clap_embedder, recenter=recenter)
 
             # Scatter back into full-length columns; failed rows get the same
@@ -518,7 +538,11 @@ def run_pipeline_core(
             df["valence"] = valence
 
             profiles = _labeling.cluster_mood_profiles(
-                X_valid, labels[valid_idx], recenter=recenter, label_matrix=mood_lm
+                X_valid,
+                labels[valid_idx],
+                recenter=recenter,
+                label_matrix=mood_lm,
+                prior=mood_prior,
             )
             cluster_mood = {cid: (profs[0][0] if profs else "") for cid, profs in profiles.items()}
             cluster_profile = {
@@ -539,6 +563,7 @@ def run_pipeline_core(
         config=config,
         labels_requested=with_labels,
         have_labels=have_labels,
+        mood_prior=mood_prior,
     )
 
 

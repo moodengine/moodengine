@@ -18,6 +18,7 @@ Quality levers over a naive single-prompt / top-1 scheme:
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 
@@ -29,9 +30,18 @@ from moodengine._math import l2_normalize
 from moodengine._typing import SupportsEmbedText
 from moodengine._validation import ensure_finite_2d
 
-# Default temperature for the softmax that calibrates cosine similarities. CLAP
-# audio/text cosines cluster in a narrow range (~0.2-0.45); dividing by a small
-# temperature spreads them into discriminative, comparable probabilities.
+logger = logging.getLogger(__name__)
+
+# Default temperature for the softmax that turns similarities into per-track scores.
+#
+# Read what it actually divides: `score_moods` softmaxes the RECENTERED similarities, not the raw
+# cosines. Raw CLAP audio/text cosines sit in a narrow band (~0.2-0.45), but recentering subtracts
+# each label's mean and roughly halves that spread, so this value is tuned against a quantity one
+# step removed from the one the band describes. It is a spread aesthetic, not a statistical
+# optimum — a 0.95 score does NOT mean "right 95 % of the time"; fitting an honest one is
+# `moodengine.calibration.fit_temperature` on a gold set. The principled starting point, if you
+# want one without gold labels, is `1 / exp(logit_scale_a)` read off the loaded CLAP model: the
+# temperature its own contrastive objective was trained at.
 DEFAULT_TEMPERATURE: float = 0.05
 
 # Mood name -> list of natural-language prompts (ensembled). A broad, musically
@@ -168,18 +178,71 @@ def softmax(
     return e / np.sum(e, axis=axis, keepdims=True)
 
 
-def recenter_similarities(sims: np.ndarray, enable: bool = True, min_n: int = 5) -> np.ndarray:
-    """Subtract each label's dataset-mean cosine to cancel its modality-gap offset.
+def label_prior(sims: np.ndarray) -> NDArray[np.float32]:
+    """Per-label mean cosine over a reference corpus — the FIXED offset :func:`recenter_similarities`
+    should subtract.
 
-    ``sims`` is ``(n, n_labels)`` cosine similarities. When ``enable`` and there are
-    at least ``min_n`` rows, returns ``sims - sims.mean(axis=0, keepdims=True)`` so
-    every label (column) is centered, removing CLAP's per-prompt / modality-gap
-    prior. Otherwise returns ``sims`` unchanged (too few tracks to estimate the
-    mean reliably). Pure; does not mutate the input.
+    ``sims`` is ``(n, n_labels)`` cosine similarities for the reference set (typically the whole
+    library, scored once against the vocabulary from :func:`build_label_matrix`). Returns the
+    ``(n_labels,)`` float32 column means. Persist it next to the label matrix and pass it back as
+    ``prior=`` from then on: the estimate is only as good as the corpus behind it, so it must
+    be computed on a set that represents the listening domain, not on whatever batch happens to be
+    in flight. Empty or mis-shaped input yields zeros — a no-op offset, never a fabricated one.
     """
     s = np.asarray(sims, dtype=np.float32)
-    if not enable or s.ndim != 2 or s.shape[0] < int(min_n):
+    if s.ndim != 2 or s.shape[0] == 0:
+        width = s.shape[1] if s.ndim == 2 else 0
+        return np.zeros((width,), dtype=np.float32)
+    return s.mean(axis=0, dtype=np.float32)
+
+
+def recenter_similarities(
+    sims: np.ndarray,
+    enable: bool = True,
+    min_n: int = 5,
+    prior: np.ndarray | None = None,
+) -> NDArray[np.float32]:
+    """Subtract each label's mean cosine to cancel its modality-gap offset.
+
+    ``sims`` is ``(n, n_labels)`` cosine similarities. With ``prior`` — a ``(n_labels,)`` reference
+    vector from :func:`label_prior` — that FIXED offset is subtracted and ``min_n`` does not apply:
+    one row alone is corrected exactly as it would be inside any other batch. Without one, the
+    offset falls back to this batch's own column means when there are at least ``min_n`` rows,
+    and ``sims`` passes through unchanged below that.
+
+    **Prefer a prior.** The batch-mean fallback makes a track's label depend on which other tracks
+    were scored alongside it: measured on CLAP-like geometry, 60 % of tracks get a different
+    ``top_mood`` in a 5-track batch than in their full corpus, 40 % at n=10, still 9 % at n=100.
+    It also fights the corpus it is meant to describe — on a library where 80 % of tracks genuinely
+    share one mood, centering removes exactly that shared component and the mood is predicted for
+    only ~8 % of them. The published account of the modality gap is a near-constant offset
+    direction, so estimating it ONCE on a reference set is the correction that matches the
+    phenomenon; a per-batch mean is only valid when the batch represents the whole domain, which a
+    playlist never does. Pure; does not mutate the input.
+    """
+    s = np.asarray(sims, dtype=np.float32)
+    if not enable or s.ndim != 2:
         return s
+    if prior is not None:
+        offset = np.asarray(prior, dtype=np.float32).reshape(1, -1)
+        if offset.shape[1] != s.shape[1]:
+            raise ValueError(
+                f"label_prior has {offset.shape[1]} entries but sims has {s.shape[1]} labels; "
+                "the prior must come from the same vocabulary (see label_prior)"
+            )
+        return (s - offset).astype(np.float32, copy=False)
+    if s.shape[0] < int(min_n):
+        logger.info(
+            "recenter: %d rows < min_n=%d and no prior given; leaving similarities uncentered.",
+            s.shape[0],
+            int(min_n),
+        )
+        return s
+    logger.info(
+        "recenter: no prior given; falling back to this batch's own column means over %d rows, "
+        "so these labels depend on the batch composition (pass prior= from label_prior to fix).",
+        s.shape[0],
+    )
     return s - s.mean(axis=0, keepdims=True)
 
 
@@ -242,6 +305,7 @@ def score_moods(
     *,
     temperature: float = DEFAULT_TEMPERATURE,
     recenter: bool = True,
+    prior: np.ndarray | None = None,
 ) -> MoodScores:
     """Score tracks against a precomputed label matrix: sims → recenter → softmax.
 
@@ -251,8 +315,10 @@ def score_moods(
     without a live embedder. ``audio_embs`` is ``(n, d)`` (a single ``(d,)``
     track is promoted to ``(1, d)``); ``label_matrix`` is ``(n_moods, d)``;
     both are assumed L2-normalized so the matmul is cosine similarity.
-    ``recenter`` applies :func:`recenter_similarities` (active only for
-    ``n >= 5``). Non-finite audio embeddings raise ``ValueError`` naming the
+    ``recenter`` applies :func:`recenter_similarities`: with ``prior`` — a ``(n_moods,)`` fixed
+    offset from :func:`label_prior` — at ANY ``n`` including 1; without one it falls back to this
+    batch's own column means and is active only for ``n >= 5``, which makes the result depend on
+    the batch. Non-finite audio embeddings raise ``ValueError`` naming the
     offending rows — a NaN row would otherwise poison the per-mood recentering
     means for every track. Returns a :class:`MoodScores` — see it for the
     semantics of each stage. Pure numpy, deterministic; inputs are never mutated.
@@ -264,7 +330,7 @@ def score_moods(
     M = np.asarray(label_matrix, dtype=np.float32)
 
     sims = X @ M.T  # (n, n_moods) cosine similarities
-    recentered = recenter_similarities(sims, enable=recenter)
+    recentered = recenter_similarities(sims, enable=recenter, prior=prior)
     probs = softmax(recentered, temperature=temperature, axis=1)
     return MoodScores(mood_names=list(mood_names), sims=sims, recentered=recentered, probs=probs)
 
@@ -352,6 +418,7 @@ def label_tracks(
     temperature: float = DEFAULT_TEMPERATURE,
     recenter: bool = True,
     label_matrix: tuple[list[str], np.ndarray] | None = None,
+    prior: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Assign calibrated zero-shot mood labels to a batch of CLAP embeddings.
 
@@ -378,7 +445,7 @@ def label_tracks(
     k = max(0, min(int(top_k), n_moods))
 
     probs = score_moods(
-        X, mood_names, mood_matrix, temperature=temperature, recenter=recenter
+        X, mood_names, mood_matrix, temperature=temperature, recenter=recenter, prior=prior
     ).probs  # (n, n_moods)
 
     rows: list[dict] = []
@@ -408,13 +475,15 @@ def score_axis(
     axis_prompts: dict[str, list[str]],
     temperature: float = DEFAULT_TEMPERATURE,
     recenter: bool = True,
+    prior: np.ndarray | None = None,
 ) -> np.ndarray:
     """Score tracks on a two-pole axis as the softmax prob of the positive pole.
 
     ``axis_prompts`` must have exactly two entries ``{negative_pole, positive_pole}``
-    (insertion order = [negative, positive]). When ``recenter`` (and n>=5), the two
-    pole similarities are centered via :func:`recenter_similarities` before the
-    softmax. Returns a (n,) array in [0, 1]: 0 = fully negative pole, 1 = fully
+    (insertion order = [negative, positive]). When ``recenter``, the two pole similarities are
+    centered via :func:`recenter_similarities` first — against ``prior`` (a ``(2,)`` offset from
+    :func:`label_prior`, applying at any ``n``) when given, else this batch's own means for
+    ``n >= 5``. Returns a (n,) array in [0, 1]: 0 = fully negative pole, 1 = fully
     positive pole.
     """
     poles = list(axis_prompts.keys())
@@ -425,7 +494,7 @@ def score_axis(
         X = X[None, :]
     _, matrix = build_label_matrix(clap_embedder, axis_prompts)  # (2, d): [neg, pos]
     sims = X @ matrix.T  # (n, 2)
-    sims = recenter_similarities(sims, enable=recenter)
+    sims = recenter_similarities(sims, enable=recenter, prior=prior)
     probs = softmax(sims, temperature=temperature, axis=1)
     return probs[:, 1].astype(np.float32)  # P(positive pole)
 
@@ -435,15 +504,34 @@ def attribute_scores(
     clap_embedder: SupportsEmbedText,
     temperature: float = DEFAULT_TEMPERATURE,
     recenter: bool = True,
+    energy_prior: np.ndarray | None = None,
+    valence_prior: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Per-track interpretable attributes from two-pole axes.
 
     Returns a DataFrame (index ``0..n-1``) with ``energy`` and ``valence`` in
     [0, 1] (0 = low-energy / negative, 1 = high-energy / positive). ``recenter``
-    is forwarded to :func:`score_axis` for both axes.
+    is forwarded to :func:`score_axis` for both axes, as are the per-axis ``(2,)``
+    ``energy_prior`` / ``valence_prior`` reference offsets (see
+    :func:`recenter_similarities` for why a fixed prior beats the batch mean). The two axes have
+    separate priors because each is built from its own two-pole vocabulary.
     """
-    energy = score_axis(audio_embs, clap_embedder, ENERGY_PROMPTS, temperature, recenter=recenter)
-    valence = score_axis(audio_embs, clap_embedder, VALENCE_PROMPTS, temperature, recenter=recenter)
+    energy = score_axis(
+        audio_embs,
+        clap_embedder,
+        ENERGY_PROMPTS,
+        temperature,
+        recenter=recenter,
+        prior=energy_prior,
+    )
+    valence = score_axis(
+        audio_embs,
+        clap_embedder,
+        VALENCE_PROMPTS,
+        temperature,
+        recenter=recenter,
+        prior=valence_prior,
+    )
     return pd.DataFrame({"energy": energy, "valence": valence})
 
 
@@ -455,6 +543,7 @@ def cluster_mood_profiles(
     top_k: int = 3,
     recenter: bool = True,
     label_matrix: tuple[list[str], np.ndarray] | None = None,
+    prior: np.ndarray | None = None,
 ) -> dict[int, list[tuple[str, float]]]:
     """Describe each cluster by its average mood affinity.
 
@@ -476,7 +565,7 @@ def cluster_mood_profiles(
     mood_names, mood_matrix = _resolve_label_matrix(clap_embedder, prompts, label_matrix)
     # Cluster profiles aggregate the CENTERED similarities (comparable across
     # moods), not the per-track softmax probabilities.
-    sims = score_moods(X, mood_names, mood_matrix, recenter=recenter).recentered
+    sims = score_moods(X, mood_names, mood_matrix, recenter=recenter, prior=prior).recentered
     k = max(0, min(int(top_k), len(mood_names)))
 
     profiles: dict[int, list[tuple[str, float]]] = {}
@@ -510,13 +599,23 @@ def name_clusters(cluster_labels: np.ndarray, top_moods: list[str]) -> dict:
 
 
 def labeling_quality_metrics(label_df: pd.DataFrame, mood_names: list[str] | None = None) -> dict:
-    """Temperature-invariant health metrics for a :func:`label_tracks` output.
+    """Health metrics for a :func:`label_tracks` output — three temperature-invariant, two not.
 
     Reports how well-spread the assignments are (diversity / dominance) and how
     confident/separated the top picks are. ``mood_names`` is accepted for API
     symmetry but unused by these metrics. Returns
     ``{"n_distinct_top_moods", "top_mood_histogram", "max_mood_share",
     "mean_top1_minus_top2", "mean_top_score"}``. Pure; robust to an empty df.
+
+    **Only the three argmax-derived metrics survive a temperature change.** The softmax temperature
+    is a monotone rescaling, so it never reorders a row: ``n_distinct_top_moods``,
+    ``top_mood_histogram`` and ``max_mood_share`` are identical at any ``temperature``. The two
+    that read the probability VALUES are not, and they move enormously — swept on a fixed 200-track
+    batch across ``temperature`` 0.5 / 0.05 / 0.005, ``mean_top1_minus_top2`` went 0.001 → 0.027 →
+    0.590 and ``mean_top_score`` 0.060 → 0.121 → 0.745. Comparing either across runs is only
+    meaningful at a FIXED temperature; to compare across temperatures, work from
+    :attr:`MoodScores.recentered` (whose scale the temperature does not touch) or calibrate first
+    with :func:`moodengine.calibration.fit_temperature`.
     """
     top_moods = list(label_df["top_mood"]) if "top_mood" in label_df else []
     n = len(top_moods)

@@ -25,6 +25,7 @@ from moodengine.labeling import (
     build_label_matrix,
     cluster_mood_profiles,
     compose_mood_vector,
+    label_prior,
     label_tracks,
     labeling_quality_metrics,
     l2_normalize,
@@ -458,6 +459,87 @@ def test_recenter_similarities_disabled_is_identity() -> None:
     sims = rng.standard_normal((10, 4)).astype(np.float32)
     out = recenter_similarities(sims, enable=False)
     np.testing.assert_array_equal(out, sims)
+
+
+def _clap_like_corpus(n: int = 200, n_moods: int = 8, dim: int = 64, seed: int = 0):
+    """A corpus with CLAP's defining geometry: every track dominated by ONE shared direction (the
+    modality gap) plus a small per-track signal. Shared by the two batch-coupling tests so they
+    provably run on the same data."""
+    rng = np.random.default_rng(seed)
+    matrix = l2_normalize(rng.standard_normal((n_moods, dim)).astype(np.float32), axis=1)
+    shared = rng.standard_normal(dim).astype(np.float32)
+    corpus = l2_normalize(
+        (0.85 * shared + 0.15 * rng.standard_normal((n, dim))).astype(np.float32), axis=1
+    )
+    return corpus, [f"m{i}" for i in range(n_moods)], matrix
+
+
+def test_label_prior_makes_a_track_label_independent_of_its_batch() -> None:
+    """The defect this closes: with the batch mean as the offset, the SAME track gets a different
+    ``top_mood`` depending on which tracks were scored alongside it — measured at 60 % of tracks in
+    a 5-track batch, still 9 % at n=100. A fixed prior removes the coupling entirely, so a single
+    track scored alone lands exactly where it lands inside the full corpus."""
+    corpus, names, matrix = _clap_like_corpus()
+    prior = label_prior(corpus @ matrix.T)
+
+    full = score_moods(corpus, names, matrix, prior=prior).probs.argmax(axis=1)
+    alone = np.array(  # scored one at a time — the pathological batch size
+        [
+            int(score_moods(corpus[i : i + 1], names, matrix, prior=prior).probs.argmax())
+            for i in range(5)
+        ]
+    )
+
+    np.testing.assert_array_equal(alone, full[:5])
+
+
+def test_batch_mean_recentering_does_couple_labels_to_the_batch() -> None:
+    """The counterpart on the SAME corpus: without a prior the coupling is real, so the test above
+    is proving something. Pinned so a future 'simplification' back to the batch mean cannot pass
+    silently."""
+    corpus, names, matrix = _clap_like_corpus()
+
+    full = score_moods(corpus, names, matrix).probs.argmax(axis=1)
+    small = score_moods(corpus[:10], names, matrix).probs.argmax(axis=1)
+
+    assert_that(bool((small != full[:10]).any())).is_true()
+
+
+def test_label_prior_applies_below_min_n() -> None:
+    """``min_n`` guards a mean estimated from too few rows. A supplied prior was estimated
+    elsewhere, so it applies at any n — including a single row."""
+    sims = np.array([[0.30, 0.10]], dtype=np.float32)
+    prior = np.array([0.20, 0.05], dtype=np.float32)
+
+    out = recenter_similarities(sims, enable=True, prior=prior)
+
+    np.testing.assert_allclose(out, np.array([[0.10, 0.05]], dtype=np.float32), atol=1e-6)
+
+
+def test_label_prior_disabled_recentering_ignores_the_prior() -> None:
+    """``enable=False`` means no offset at all — a prior must not sneak one back in."""
+    sims = np.array([[0.3, 0.1], [0.2, 0.4]], dtype=np.float32)
+
+    out = recenter_similarities(sims, enable=False, prior=np.array([9.0, 9.0], dtype=np.float32))
+
+    np.testing.assert_array_equal(out, sims)
+
+
+def test_label_prior_vocabulary_mismatch_raises() -> None:
+    """A prior from a different vocabulary would silently shift the wrong moods — name the
+    mismatch at the boundary instead."""
+    sims = np.zeros((4, 3), dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"label_prior has 2 entries but sims has 3 labels"):
+        recenter_similarities(sims, enable=True, prior=np.zeros(2, dtype=np.float32))
+
+
+def test_label_prior_of_empty_input_is_a_no_op_offset() -> None:
+    """No reference rows means no measured offset — zeros, never a fabricated one."""
+    out = label_prior(np.empty((0, 5), dtype=np.float32))
+
+    assert_that(out.shape).is_equal_to((5,))
+    np.testing.assert_array_equal(out, np.zeros(5, dtype=np.float32))
 
 
 def test_recenter_similarities_does_not_mutate_input() -> None:

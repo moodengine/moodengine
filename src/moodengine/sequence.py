@@ -322,11 +322,26 @@ def _evaluate_context_fn(
 ) -> dict:
     """Leave-last-out ranking metrics for a ``prefix -> (d,) vector`` context function.
 
-    Ranks each held-out target against ALL items by cosine to ``context_fn(prefix)`` — the exact
-    serve-time scoring — and returns ``{'hit_at_k', 'mrr', 'n_eval', 'k'}``. A degenerate context
-    (near-zero norm, e.g. an all-invalid prefix) is skipped rather than counted as a miss. Shared
-    core of :func:`evaluate_sequence_model` (trained-model context) and the kNN-of-last baseline
-    used for model selection in :func:`train_sequence_model`. Pure numpy aside from ``context_fn``.
+    Ranks each held-out target by cosine to ``context_fn(prefix)`` against every item EXCEPT the
+    ones already played in that session — the standard leave-last-out protocol, and the same rule
+    the serving path applies (:mod:`moodengine.search` excludes played tracks). Returns
+    ``{'hit_at_k', 'mrr', 'n_eval', 'k'}``. A degenerate context (near-zero norm, e.g. an
+    all-invalid prefix) is skipped rather than counted as a miss.
+
+    Excluding the prefix is not a refinement, it is what makes the number mean anything. Ranking
+    against ALL items lets the session's own history compete with the target: for the kNN-of-last
+    warm start the context IS ``X[prefix[-1]]``, whose self-similarity is exactly 1.0, so that seed
+    permanently held rank 1 and the true target could never rank better than 2. Measured on 200
+    five-item synthetic sessions that pinned MRR at 0.284 with 0 of 200 targets at rank 1, against
+    0.508 and 50 of 200 once the prefix is masked. Worse, it biased the model-selection gate in
+    :func:`train_sequence_model`: a trained context that drifts away from ``X[last]`` stops
+    tripping over the seed and can reach rank 1, which the baseline provably cannot — so the gate
+    that promises "never ship a model worse than its warm start" leaned toward shipping. A repeat
+    listen (target also present in the prefix) is never masked; the target must stay rankable.
+
+    Shared core of :func:`evaluate_sequence_model` (trained-model context) and the kNN-of-last
+    baseline used for model selection in :func:`train_sequence_model`. Pure numpy aside from
+    ``context_fn``.
     """
     X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
     n = X.shape[0]
@@ -339,6 +354,9 @@ def _evaluate_context_fn(
         if norm < _EPS:
             continue
         sims = Xn @ (vec / norm)
+        played = np.asarray([i for i in prefix if i != target], dtype=np.intp)
+        if played.size:  # sims is freshly allocated per session, so writing into it is safe
+            sims[played] = -np.inf  # out of the running, not merely down-weighted
         ranks.append(1 + int(np.sum(sims > sims[target])))  # 1-based; ties resolve optimistically
 
     hit, mrr = _hit_mrr(ranks, k)
@@ -351,8 +369,10 @@ def evaluate_sequence_model(
     """Leave-last-out hit@k / MRR of ``model`` on ``sessions`` over frozen CLAP ``X`` ``(n, d)``.
 
     For each session (row indices, ≥2 in-range items) the final item is held out and ranked, by
-    cosine to ``model.predict_context(prefix, X)``, against ALL items — the serve-time scoring, so
-    the number reflects real next-track quality rather than training loss. Returns
+    cosine to ``model.predict_context(prefix, X)``, against every item the session has not already
+    played — the serve-time scoring, so the number reflects real next-track quality rather than
+    training loss (see :func:`_evaluate_context_fn` for why the already-played exclusion is load
+    bearing rather than cosmetic). Returns
     ``{'hit_at_k', 'mrr', 'n_eval', 'k'}`` (``mrr`` is mean reciprocal rank over the held-out
     targets); zeros when nothing is evaluable. Uses the model (torch) but does no training and is
     deterministic. This is the metric :func:`train_sequence_model` uses to keep the warm-start

@@ -192,6 +192,56 @@ def test_evaluate_context_fn_oracle_is_perfect():
     assert_that(out["n_eval"]).is_equal_to(3)
 
 
+def test_evaluate_context_fn_warm_start_seed_cannot_occupy_rank_one():
+    """The structural bias this closes. For the kNN-of-last warm start the context IS
+    ``X[prefix[-1]]``, so its self-similarity is exactly 1.0 — unmasked, that seed held rank 1 in
+    every session and the true target could never rank better than 2. Measured over 200 structured
+    five-item sessions: MRR 0.214 with 0/200 targets at rank 1 before, 0.343 with 25/200 after."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((300, 64)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    sims = X @ X.T
+    np.fill_diagonal(sims, -np.inf)
+    sessions = []  # each next track drawn from the current one's neighbourhood -> real structure
+    for _ in range(200):
+        current = int(rng.integers(X.shape[0]))
+        session = [current]
+        for _ in range(4):
+            current = int(rng.choice(np.argpartition(-sims[current], 10)[:10]))
+            session.append(current)
+        sessions.append(session)
+
+    out = _evaluate_context_fn(lambda prefix: X[prefix[-1]], sessions, X, k=10)
+
+    # Unmasked, hit@10 was pinned by the prefix itself and MRR could not exceed 0.5.
+    assert_that(out["mrr"]).is_greater_than(0.25)
+    assert_that(out["n_eval"]).is_equal_to(200)
+
+
+def test_evaluate_context_fn_excludes_played_items_from_the_ranking():
+    """Directly: an already-played track must not be able to outrank the held-out target."""
+    X = np.eye(5, dtype=np.float32)
+    # Context = the first played item, which is a perfect self-match. Target is item 3.
+    session = [[0, 1, 3]]
+
+    out = _evaluate_context_fn(lambda prefix: X[prefix[0]], session, X, k=1)
+
+    # Item 0 scores 1.0 and item 3 scores 0.0, but item 0 was played: the target ranks first.
+    assert_that(out["hit_at_k"]).is_close_to(1.0, tolerance=1e-9)
+
+
+def test_evaluate_context_fn_repeat_listen_target_stays_rankable():
+    """A target that also appears in the prefix (a repeat listen) must NOT be masked away — the
+    held-out item always has to remain in the running, or its rank is meaningless."""
+    X = np.eye(4, dtype=np.float32)
+    session = [[2, 1, 2]]  # item 2 played first, then held out again as the target
+
+    out = _evaluate_context_fn(lambda prefix: X[2], session, X, k=1)
+
+    assert_that(out["n_eval"]).is_equal_to(1)
+    assert_that(out["hit_at_k"]).is_close_to(1.0, tolerance=1e-9)
+
+
 def test_evaluate_context_fn_skips_degenerate_context():
     """A near-zero context vector is skipped, not scored as a miss."""
     X = np.eye(4, dtype=np.float32)

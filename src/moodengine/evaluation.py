@@ -231,6 +231,49 @@ def concordance_correlation_coefficient(pred: np.ndarray, gold: np.ndarray) -> t
     return float(2.0 * cov / denom), n
 
 
+def ccc_components(pred: np.ndarray, gold: np.ndarray) -> tuple[float, float, int]:
+    """Lin's decomposition of the CCC into ``(precision, accuracy)`` — ``CCC = rho * c_b``.
+
+    ``rho`` is the Pearson correlation: how well ``pred`` ORDERS the gold values, invariant to
+    shift and scale. ``c_b`` ∈ ``(0, 1]`` is the bias-correction factor: how far ``pred`` sits from
+    the ``y = x`` line in location and spread, with ``1.0`` meaning no location or scale mismatch
+    at all. Returns ``(rho, c_b, support)`` — the family convention of never reporting a metric
+    without its sample count.
+
+    Report it whenever a CCC is reported, because the two halves answer different questions and a
+    change can move them in opposite directions. It matters most for an UNCALIBRATED score: the
+    zero-shot axes are a softmax whose temperature sets their spread, so ``c_b`` (and with it the
+    CCC) can be tuned by a constant that leaves ``rho`` — the actual quality — untouched. Seeing
+    ``rho`` flat while the CCC moves is exactly that situation.
+
+    ``(nan, nan, n)`` when ``n < 2``, after dropping non-finite pairs, or when either series is
+    constant. Never raises.
+    """
+    p = np.asarray(pred, dtype=np.float64).ravel()
+    g = np.asarray(gold, dtype=np.float64).ravel()
+    n = min(p.shape[0], g.shape[0])
+    if n < 2:
+        return float("nan"), float("nan"), n
+    p, g = p[:n], g[:n]
+
+    mask = np.isfinite(p) & np.isfinite(g)
+    p, g = p[mask], g[mask]
+    if p.shape[0] < 2:
+        return float("nan"), float("nan"), n
+
+    mp, mg = float(p.mean()), float(g.mean())
+    sd_p = float(np.sqrt(((p - mp) ** 2).mean()))
+    sd_g = float(np.sqrt(((g - mg) ** 2).mean()))
+    if sd_p == 0.0 or sd_g == 0.0:  # a constant series has no correlation to decompose
+        return float("nan"), float("nan"), n
+
+    rho = float(((p - mp) * (g - mg)).mean() / (sd_p * sd_g))
+    # c_b = 2 / (v + 1/v + u²) with v the scale ratio and u the standardized mean difference.
+    v = sd_p / sd_g
+    u = (mp - mg) / np.sqrt(sd_p * sd_g)
+    return rho, float(2.0 / (v + 1.0 / v + u**2)), n
+
+
 def evaluate_against_gold(df: pd.DataFrame, gold: dict) -> dict:
     """Compare predicted labels/axes in ``df`` to a human gold set.
 

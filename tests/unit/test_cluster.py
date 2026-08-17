@@ -25,6 +25,7 @@ from moodengine.cluster import (
     run_clustering,
     select_kmeans_k,
     silhouette_original,
+    structure_verdict,
     sub_cluster,
 )
 from moodengine.config import default_config
@@ -177,6 +178,85 @@ def test_run_clustering_hdbscan_full_path() -> None:
     assert_that(out["coords2d"].shape).is_equal_to((n, 2))
     assert_that(out["method"]).is_equal_to("hdbscan")
     assert_that(out["metrics"]["reduction"]).is_equal_to("umap")
+
+
+def test_run_clustering_reports_structure_none_on_pure_noise() -> None:
+    """The defect this guards: metrics were scored inside the UMAP layout, which is fit to separate
+    exactly these points — so structureless input came back certified as many well-separated
+    clusters. On 600 rows of isotropic noise the reduced silhouette reads ≈0.27 while the original
+    space reads ≈0.01. The verdict must follow the ORIGINAL space."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((600, 64)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)  # no structure by construction
+
+    metrics = run_clustering(X, method="hdbscan", config=default_config())["metrics"]
+
+    assert_that(metrics["structure"]).is_equal_to("none_detected")
+    assert_that(metrics["silhouette_space"]).is_equal_to("reduced")
+    assert_that(metrics["silhouette_original"]).is_less_than(0.05)
+    # The reduced score is still reported — and is still much higher. That gap IS the finding.
+    assert_that(metrics["silhouette"]).is_greater_than(metrics["silhouette_original"])
+
+
+def test_run_clustering_reports_structure_clustered_on_real_blobs() -> None:
+    """The gate must not cry wolf: genuinely separated blobs read as clustered.
+
+    ``kmeans_n_clusters`` is pinned to the true blob count. Leaving it at the default 8 splits
+    three blobs eight ways, and the resulting original-space silhouette lands at 0.251 against
+    this band's 0.25 edge — a margin thinner than the float differences between platforms, which
+    is a test of the fixture's arithmetic rather than of the gate. At the true k it is 0.995.
+    """
+    X, _ = _three_blobs(seed=8, per=40)
+    cfg = dataclasses.replace(default_config(), kmeans_n_clusters=3)
+
+    metrics = run_clustering(X, method="kmeans", config=cfg)["metrics"]
+
+    assert_that(metrics["structure"]).is_equal_to("clustered")
+    assert_that(metrics["silhouette_original"]).is_greater_than(0.9)
+
+
+def test_run_clustering_tiny_input_marks_silhouette_space_original() -> None:
+    """When UMAP is skipped the two spaces ARE the same one — but the honesty fields must still be
+    populated rather than left absent, and the cosine score must be recomputed rather than aliased
+    to ``silhouette`` (which cluster_metrics produces with sklearn's euclidean default, a different
+    quantity from the one structure_verdict's bands were calibrated on)."""
+    X, _ = _three_blobs(seed=7, per=3)  # 9 samples -> UMAP skipped
+
+    metrics = run_clustering(X, method="kmeans", config=default_config())["metrics"]
+
+    assert_that(metrics["silhouette_space"]).is_equal_to("original")
+    # Not equal to metrics["silhouette"]: that one is euclidean (cluster_metrics' default) while
+    # the verdict's bands are calibrated on cosine, so it is recomputed rather than reused.
+    assert_that(metrics["silhouette_original"]).is_not_none()
+    assert_that(metrics["structure"]).is_not_none()  # a verdict is still reached on this path
+
+
+@pytest.mark.parametrize(
+    ("silhouette", "expected"),
+    [
+        (0.0, "none_detected"),
+        (0.05, "none_detected"),  # inclusive upper edge
+        (0.051, "weak"),
+        (0.25, "weak"),  # inclusive upper edge
+        (0.26, "clustered"),
+        (None, None),  # < 2 clusters: an absence, never a fabricated verdict
+        (float("nan"), None),
+    ],
+)
+def test_structure_verdict_maps_a_silhouette_to_its_band(silhouette, expected) -> None:
+    assert_that(structure_verdict(silhouette)).is_equal_to(expected)
+
+
+def test_silhouette_original_sampling_is_seeded_and_deterministic() -> None:
+    """The O(n²·d) pass is capped by sampling on the run_clustering path; the estimate must stay
+    reproducible, or the reported structure verdict would drift between identical runs."""
+    X, truth = _three_blobs(seed=3, per=60)
+
+    first = silhouette_original(X, truth, sample_size=50, random_state=42)
+    second = silhouette_original(X, truth, sample_size=50, random_state=42)
+
+    assert_that(first).is_not_none()
+    assert_that(first).is_equal_to(second)
 
 
 def test_run_clustering_rejects_non_finite_input() -> None:
