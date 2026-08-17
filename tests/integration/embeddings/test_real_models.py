@@ -5,7 +5,7 @@ Opt-in only: marked ``model`` and deselected by default (see pyproject addopts
 
     pytest -m model
 
-Needs ``pip install "moodengine[models]"`` and the checkpoints downloaded
+Needs the ``models`` extra (``uv sync --extra models``) and the checkpoints downloaded
 (MERT-v1-95M + the CLAP music checkpoint). Validates that the real embedders
 honor the Embedder contract end-to-end.
 """
