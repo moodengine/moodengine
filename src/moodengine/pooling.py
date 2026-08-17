@@ -38,7 +38,10 @@ def weight_layers(
     - ``'uniform'``: mean over all layers.
     - ``'last'``: last layer only.
     - ``'subset'``: mean over ``layers`` (tuple of indices) if given, else the
-      middle third of layers (``range(n//3, 2*n//3 + 1)``), clamped to valid range.
+      middle third of layers (``range(n//3, 2*n//3 + 1)``). Out-of-range indices are dropped, but
+      ``layers`` selecting NO valid layer raises ``ValueError`` rather than falling back to all of
+      them — the cache key records the subset that was requested, so a silent fallback persists a
+      uniform vector under a key naming a subset.
     - ``'weighted'``: ``softmax(layer_weights)``-weighted sum over layers;
       ``layer_weights`` length must equal ``n_layers`` — a missing or
       mis-sized tuple raises ``ValueError`` (a silent uniform fallback would
@@ -60,7 +63,16 @@ def weight_layers(
         if layers:
             idx = sorted({int(i) for i in layers if 0 <= int(i) < n_layers})
             if not idx:
-                idx = list(range(n_layers))
+                # Every requested index is out of range, so "subset" would quietly become
+                # "uniform" — and the cache key still spells the subset that was asked for
+                # (`_lw-subset-20.21`), so the full-uniform vector is persisted under a name
+                # claiming otherwise and every later run serves it. The `weighted` branch below
+                # already refuses its own version of this; refuse here for the same reason.
+                raise ValueError(
+                    f"mert_layers={tuple(layers)!r} selects no valid layer: the model produced "
+                    f"{n_layers} layers, so indices must be in [0, {n_layers}). Pass indices in "
+                    f"range, or use mert_layer_weighting='uniform' if you meant all of them."
+                )
         else:
             idx = list(range(n_layers // 3, 2 * n_layers // 3 + 1))
             idx = [i for i in idx if 0 <= i < n_layers] or list(range(n_layers))

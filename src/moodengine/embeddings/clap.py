@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from moodengine._math import l2_normalize as _l2_normalize
-from moodengine.config import Config
+from moodengine.config import CLAP_FUSION_SAMPLE_LIMIT, Config
 from moodengine.embeddings.base import Embedder
 from moodengine.exceptions import ModelLoadError
 
@@ -82,6 +82,17 @@ class CLAPEmbedder(Embedder):
         / ``config.clap_amodel``. ``config.clap_checkpoint`` selects a specific
         checkpoint path; ``None`` loads LAION's default pretrained weights.
         """
+        samples = config.segment_seconds * config.clap_sample_rate
+        if samples > CLAP_FUSION_SAMPLE_LIMIT:
+            raise ValueError(
+                f"segment_seconds={config.segment_seconds} at clap_sample_rate="
+                f"{config.clap_sample_rate} gives {samples:.0f} samples per segment, above the "
+                f"{CLAP_FUSION_SAMPLE_LIMIT} at which laion-clap truncates by drawing chunks from "
+                "the unseeded global numpy RNG. Embeddings past that point are not reproducible "
+                "and would be cached as if they were, so this refuses rather than producing them. "
+                f"Use segment_seconds <= {CLAP_FUSION_SAMPLE_LIMIT / config.clap_sample_rate:g} "
+                "for CLAP (MERT has no such limit)."
+            )
         self.config = config
         self.sample_rate = config.clap_sample_rate
         self.device = config.device
@@ -165,13 +176,39 @@ class CLAPEmbedder(Embedder):
             )
         return None
 
+    def _model_sample_rate(self) -> int | None:
+        """The rate the LOADED checkpoint's audio config declares, or ``None`` if it cannot be read.
+
+        Checked against ``config.clap_sample_rate`` rather than trusting it: the pipeline calls
+        ``extract(seg, sr=embedder.sample_rate)``, so ``sr`` echoes the config and comparing the two
+        would always agree — including when the config itself is wrong. Only the model can say what
+        it was trained at. Read defensively (``None`` skips the check) because the attribute path is
+        laion-clap's internal structure, not a published API, and a missing attribute must not stop
+        a correctly-configured run.
+        """
+        cfg = getattr(getattr(self.model, "model", None), "model_cfg", None)
+        if not isinstance(cfg, dict):
+            return None
+        audio_cfg = cfg.get("audio_cfg")
+        rate = audio_cfg.get("sample_rate") if isinstance(audio_cfg, dict) else None
+        return int(rate) if isinstance(rate, (int, float)) else None
+
     def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """Embed one mono float32 waveform into a clip-level vector.
 
-        Returns a 1-D ``(hidden,)`` float32 array. Empty/degenerate inputs are
-        padded to a small floor so the model never receives a zero-length clip.
-        Quantization is disabled so embeddings stay in raw float space.
+        Returns a 1-D ``(hidden,)`` float32 array. ``sr`` must be the rate the waveform was decoded
+        at and must match the loaded checkpoint's declared rate; a mismatch raises ``ValueError``
+        rather than embedding time/pitch-warped audio, mirroring the MERT embedder. Empty/degenerate
+        inputs are padded to a small floor so the model never receives a zero-length clip.
         """
+        expected = self._model_sample_rate()
+        if expected is not None and int(sr) != expected:
+            raise ValueError(
+                f"CLAP received audio at {int(sr)} Hz but the loaded checkpoint "
+                f"(amodel={self.config.clap_amodel!r}) declares {expected} Hz; set "
+                f"config.clap_sample_rate={expected} so audio is decoded at the model's rate "
+                "(off-rate audio silently warps every embedding)."
+            )
         wav = np.asarray(waveform, dtype=np.float32).reshape(-1)
 
         # Guard the degenerate empty/very-short case: pad to a small floor.

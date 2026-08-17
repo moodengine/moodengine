@@ -89,15 +89,27 @@ def test_weight_layers_subset_explicit_indices() -> None:
     np.testing.assert_allclose(out, expected, rtol=1e-5)
 
 
-def test_weight_layers_subset_clamps_out_of_range_indices() -> None:
-    """Indices outside [0, n_layers) are dropped; invalid-only falls back to all."""
+def test_weight_layers_subset_drops_out_of_range_indices() -> None:
+    """A partly-valid selection keeps the valid indices — only those contribute."""
     rng = np.random.default_rng(12)
     frame_emb = rng.standard_normal((4, 4, 3)).astype(np.float32)
+
     out = weight_layers(frame_emb, "subset", layers=(1, 99, -5))
+
     np.testing.assert_allclose(out, frame_emb[1], rtol=1e-5)
-    # All-invalid layers fall back to a uniform mean over every layer.
-    fallback = weight_layers(frame_emb, "subset", layers=(50, 60))
-    np.testing.assert_allclose(fallback, frame_emb.mean(axis=0), rtol=1e-5)
+
+
+def test_weight_layers_subset_with_no_valid_index_raises() -> None:
+    """This test previously pinned the OPPOSITE: an all-invalid selection silently became a
+    uniform mean over every layer. That fallback is unobservable in the result and the cache key
+    still spells the requested subset (``_lw-subset-20.21``), so a full-uniform vector was
+    persisted under a name claiming otherwise and served by every later run. The ``weighted`` mode
+    twenty lines away already refuses its own version of this, for the same reason."""
+    rng = np.random.default_rng(12)
+    frame_emb = rng.standard_normal((4, 4, 3)).astype(np.float32)
+
+    with pytest.raises(ValueError, match=r"selects no valid layer.*indices must be in \[0, 4\)"):
+        weight_layers(frame_emb, "subset", layers=(50, 60))
 
 
 def test_weight_layers_weighted_matches_softmax_weights() -> None:

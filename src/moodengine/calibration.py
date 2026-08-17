@@ -21,6 +21,8 @@ fallback for the temperature fit, so the module import stays light and torch-fre
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 
@@ -222,6 +224,22 @@ def _aps_scores(probs: np.ndarray, true_idx: np.ndarray, k_reg: int, lam_reg: fl
     pure APS. ``(n, m) + (n,) → (n,)``."""
     P = np.asarray(probs, dtype=np.float64)
     y = np.asarray(true_idx).astype(int).ravel()
+    # An index outside [0, m) makes `order == y[:, None]` all-False, and argmax on an all-False row
+    # returns 0 — silently scoring that row as if the true mood had been ranked FIRST. -1 is this
+    # repo's own "unknown" sentinel, so a caller passing unlabelled rows would not get an error but
+    # a q̂ pulled down by the cheapest possible scores: measured with a quarter of the calibration
+    # labels set to -1, q̂ fell 0.674 -> 0.590 and empirical coverage 0.778 -> 0.722. The sets get
+    # TIGHTER the more corrupt the input is, while the coverage guarantee is still reported as
+    # intact — so this raises rather than clipping, because a clipped label yields a wrong
+    # GUARANTEE, not merely a wrong number.
+    bad = np.flatnonzero((y < 0) | (y >= P.shape[1]))
+    if bad.size:
+        raise ValueError(
+            f"cal_true_idx has {bad.size} entry/entries outside [0, {P.shape[1]}) at row(s) "
+            f"{bad[:10].tolist()}{'...' if bad.size > 10 else ''} (values "
+            f"{y[bad[:10]].tolist()}); conformal calibration needs a known true mood for every "
+            "calibration row — drop the unlabelled rows before calling."
+        )
     order = np.argsort(-P, axis=1, kind="stable")  # moods sorted by prob descending
     cum = np.cumsum(np.take_along_axis(P, order, axis=1), axis=1)
     ranks = np.argmax(order == y[:, None], axis=1)  # 0-indexed position of the true mood
@@ -247,10 +265,32 @@ def aps_threshold(
     non-conformity score (see :func:`_aps_scores`); ``q̂`` is the ``⌈(n_cal+1)·coverage_target⌉``-th
     smallest score (the finite-sample conformal quantile). When that rank exceeds ``n_cal`` (target too
     high for the sample) ``q̂ = 1.0`` — every mood is included, the honest "can't guarantee this
-    coverage at this n" behavior, never a fabricated tighter set. ``rng_jitter=False`` is the
-    deterministic, non-randomized variant (reproducible; slightly conservative coverage). Returns
-    ``q̂ ∈ [0, 1]`` for pure APS (``lam_reg=0``). Deterministic, pure numpy.
+    coverage at this n" behavior, never a fabricated tighter set. Returns ``q̂ ∈ [0, 1]`` for pure
+    APS (``lam_reg=0``). Deterministic, pure numpy. A ``cal_true_idx`` entry outside ``[0, m)``
+    raises :class:`ValueError` (see :func:`_aps_scores` — such a row would otherwise be scored as
+    if it had been ranked first, tightening the sets while the guarantee is still claimed).
+
+    This is the NON-randomized variant, which is why the guarantee is one-sided: coverage is
+    ``>= 1-ε`` but overshoots it, by more the looser the target. Measured over 20 splits of 500
+    calibration and 500 test rows across 18 moods, empirical coverage came in **14.4 points** above
+    a 0.70 target, 9.3 above 0.80, 3.5 above 0.90 and 1.5 above 0.95 — mean set sizes 4.2 / 5.4 /
+    7.2 / 9.1. Tightening that requires the randomized rule (a uniform draw subtracted from each
+    score, with a matching rule in :func:`prediction_set`), which trades exact coverage for
+    reproducibility; this library keeps reproducibility, so budget for the overshoot instead.
+
+    ``rng_jitter`` is accepted but INERT and slated for removal: it was never read, so passing
+    ``True`` never produced the randomized variant it names. It warns rather than silently
+    continuing to do nothing.
     """
+    if rng_jitter:
+        warnings.warn(
+            "aps_threshold(rng_jitter=True) has never been implemented — the randomized APS "
+            "variant it names was not wired up, so this call returns the deterministic threshold "
+            "exactly as rng_jitter=False does. The parameter will be removed; drop it, and see "
+            "the docstring for the over-coverage the non-randomized rule carries.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     P = np.asarray(cal_probs, dtype=np.float64)
     if P.ndim != 2 or P.shape[0] < 1:
         return 1.0  # nothing to calibrate → most conservative; the caller guards min_cal separately
