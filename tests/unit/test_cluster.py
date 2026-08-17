@@ -199,13 +199,20 @@ def test_run_clustering_reports_structure_none_on_pure_noise() -> None:
 
 
 def test_run_clustering_reports_structure_clustered_on_real_blobs() -> None:
-    """The gate must not cry wolf: genuinely separated blobs read as clustered in BOTH spaces."""
-    X, _ = _three_blobs(seed=8, per=40)
+    """The gate must not cry wolf: genuinely separated blobs read as clustered.
 
-    metrics = run_clustering(X, method="kmeans", config=default_config())["metrics"]
+    ``kmeans_n_clusters`` is pinned to the true blob count. Leaving it at the default 8 splits
+    three blobs eight ways, and the resulting original-space silhouette lands at 0.251 against
+    this band's 0.25 edge — a margin thinner than the float differences between platforms, which
+    is a test of the fixture's arithmetic rather than of the gate. At the true k it is 0.995.
+    """
+    X, _ = _three_blobs(seed=8, per=40)
+    cfg = dataclasses.replace(default_config(), kmeans_n_clusters=3)
+
+    metrics = run_clustering(X, method="kmeans", config=cfg)["metrics"]
 
     assert_that(metrics["structure"]).is_equal_to("clustered")
-    assert_that(metrics["silhouette_original"]).is_greater_than(0.25)
+    assert_that(metrics["silhouette_original"]).is_greater_than(0.9)
 
 
 def test_run_clustering_tiny_input_marks_silhouette_space_original() -> None:
