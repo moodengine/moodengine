@@ -260,7 +260,11 @@ def test_mlp_probe_early_stop_beats_the_full_budget_on_memorizable_data():
     at least as well as running every epoch, which on a few dozen rows is pure memorization."""
     pytest.importorskip("torch")
     X, Y, moods = _separable_dataset(n_per=12, seed=9)
-    train, test = slice(None, 36), slice(36, None)
+    # SHUFFLED split. `_separable_dataset` lays its rows out grouped by mood, so a contiguous
+    # slice is a split by CLASS, not by row: the head would never see the held-out mood and would
+    # score 0.0 for being right about that.
+    order = np.random.default_rng(0).permutation(X.shape[0])
+    train, test = order[:36], order[36:]
 
     head = fit_linear_probe(X[train], Y[train], moods, method="mlp", seed=0)
 
