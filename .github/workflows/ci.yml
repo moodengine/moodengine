@@ -272,10 +272,29 @@ jobs:
     needs: [test, static, coverage, test-lowest, test-extras, commits, dco]
     runs-on: ubuntu-latest
     steps:
-      - name: Verify no required job failed
-        if: >-
-          contains(needs.*.result, 'failure') ||
-          contains(needs.*.result, 'cancelled')
+      # Fail closed. The previous form guarded the failing step with
+      # `contains(needs.*.result, 'failure')`, so the gate passed by default and only
+      # failed when that expression fired — and it did not always fire. Observed on
+      # run 32050745798: a matrix leg died in "Set up job", the run concluded
+      # `failure`, yet this guard was reported as `skipped` and the one context branch
+      # protection requires went green over a red run. Asserting the accepted results
+      # instead means an unrecognised or missing result fails the gate rather than
+      # slipping through it. `skipped` is accepted on purpose: the PR-only gates
+      # (commits, dco) legitimately skip on push-to-main, and test-models is not in
+      # `needs` at all. Dumping the whole context makes the next anomaly diagnosable
+      # from the log instead of by re-deriving it from check-run timestamps.
+      - name: Verify every required job succeeded
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "::error::one or more required CI jobs did not succeed"
-          exit 1
+          printf '%s\n' "$NEEDS"
+          bad="$(printf '%s' "$NEEDS" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | "\(.key)=\(.value.result)"')"
+          if [ -n "$bad" ]; then
+            echo "::error::required job(s) did not succeed: $(printf '%s' "$bad" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "every required job succeeded or was legitimately skipped"
