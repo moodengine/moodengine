@@ -18,6 +18,16 @@ from moodengine._typing import LayerWeighting, PoolingMode, ProjectionMethod, Se
 # Audio file extensions discovered when scanning an input directory.
 AUDIO_EXTENSIONS: tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac")
 
+# Samples per segment above which laion-clap's fusion truncation starts drawing which chunks to
+# keep from the GLOBAL, unseeded numpy RNG (its `training/data.py` `len > 480000` branch).
+# moodengine seeds only its own Generator instances, so past this length every CLAP track vector
+# depends on ambient process state, is persisted under a cache key that cannot encode the draw, and
+# differs on a `force=True` recompute. The 10 s default lands on exactly 480000 samples at 48 kHz
+# and so takes the deterministic branch — safe by arithmetic coincidence, not by design, which is
+# why it is enforced rather than merely documented. Enforced in `CLAPEmbedder.__init__` (the only
+# place it applies) rather than in `Config`, which cannot know whether CLAP will be used at all.
+CLAP_FUSION_SAMPLE_LIMIT: int = 480_000
+
 
 def default_cache_dir() -> Path:
     """Per-user, OS-appropriate cache root for computed embeddings.
@@ -116,8 +126,11 @@ class Config:
     )  # (mert, clap) block weights when clustering "fused"
 
     # --- labeling calibration ---
-    # Subtract the per-mood dataset-mean cosine before softmax to cancel CLAP's
-    # modality-gap / per-prompt prior (batch-only; skipped for n < 5).
+    # Subtract the per-mood mean cosine before softmax to cancel CLAP's modality-gap / per-prompt
+    # prior. The pipeline estimates that offset ONCE over the whole library and returns it as
+    # PipelineResult.mood_prior; pass it back as `prior=` when scoring anything later, or the
+    # labeling functions fall back to the batch's own means (n >= 5 only) and a track's label then
+    # depends on which tracks were scored with it.
     recenter_labels: bool = True
 
     # --- clustering ---
@@ -173,6 +186,11 @@ class Config:
                 f"max_segments_per_track must be >= 0 (0 = no cap); "
                 f"got {self.max_segments_per_track}"
             )
+        # NOTE: the CLAP fusion-truncation limit on `segment_seconds * clap_sample_rate` is NOT
+        # checked here. It is a property of laion-clap, not of the configuration, and a MERT-only
+        # run at 15 s segments is perfectly valid — raising here would block it for a reason that
+        # never applies to it. `CLAPEmbedder.__init__` enforces it instead, before any audio is
+        # embedded. See `_CLAP_FUSION_SAMPLE_LIMIT`.
 
         if len(self.fusion_weights) != 2:
             raise ValueError(

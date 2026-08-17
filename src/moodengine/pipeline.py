@@ -204,6 +204,15 @@ def track_embedding_from_waveform(embedder, waveform, sr, config: Config) -> np.
     the waveform was decoded at). Byte-identical to the inline body it replaced, so existing ``.npy``
     caches stay valid. Does no I/O and no caching (the caller owns those).
     """
+    # Guard the PUBLIC entry point: `track_embedding` always passes `embedder.sample_rate`, but a
+    # caller reaching this function directly holds a waveform it decoded itself, and off-rate audio
+    # is time/pitch-warped in a way no downstream stage can detect.
+    if int(sr) != int(embedder.sample_rate):
+        raise ValueError(
+            f"waveform was decoded at {int(sr)} Hz but the {embedder.name!r} embedder expects "
+            f"{int(embedder.sample_rate)} Hz; decode at the embedder's rate (moodengine.io_audio."
+            "load_audio does this) rather than relabeling the array."
+        )
     segments = _io.segment_waveform(waveform, sr, config)
     embedded = [embedder.extract(seg, sr) for seg in segments]
     pooler = POOLERS[embedder.name]

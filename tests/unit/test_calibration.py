@@ -8,6 +8,7 @@ synthetic set. ECE is imported from :mod:`moodengine.evaluation` — never redef
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from assertpy import assert_that
 
 from moodengine.calibration import (
@@ -254,6 +255,37 @@ def test_aps_pure_when_reg_disabled() -> None:
     cum = np.cumsum(p[order])
     expected_len = int(np.searchsorted(cum, q, side="left")) + 1
     assert_that(len(prediction_set(p, q))).is_equal_to(min(max(expected_len, 1), len(p)))
+
+
+def test_aps_threshold_rejects_a_true_index_outside_the_vocabulary() -> None:
+    """``-1`` is this repo's own "unknown mood" sentinel, and ``np.argmax`` on an all-False row
+    returns 0 — so an unlabelled calibration row was scored as if its true mood had ranked FIRST,
+    the cheapest possible score. Measured with a quarter of the labels set to -1, q̂ fell 0.674 to
+    0.590 and coverage 0.778 to 0.722: the sets got TIGHTER the more corrupt the input was, while
+    the guarantee was still reported as intact. Clipping would fix the number and keep the wrong
+    guarantee, so this raises."""
+    rng = np.random.default_rng(0)
+    probs = rng.random((20, 5))
+    probs /= probs.sum(axis=1, keepdims=True)
+    labels = rng.integers(0, 5, 20)
+    labels[3] = -1  # an unlabelled row that slipped into the calibration set
+
+    with pytest.raises(ValueError, match=r"cal_true_idx has 1 entry.*outside \[0, 5\)"):
+        aps_threshold(probs, labels, coverage_target=0.9)
+
+
+def test_aps_threshold_rng_jitter_warns_that_it_never_did_anything() -> None:
+    """The parameter named the randomized APS variant but was never read, so passing it produced
+    the deterministic threshold while implying otherwise. It must say so rather than keep pretending."""
+    rng = np.random.default_rng(0)
+    probs = rng.random((20, 5))
+    probs /= probs.sum(axis=1, keepdims=True)
+    labels = rng.integers(0, 5, 20)
+
+    with pytest.warns(DeprecationWarning, match="never been implemented"):
+        jittered = aps_threshold(probs, labels, coverage_target=0.9, rng_jitter=True)
+
+    assert_that(jittered).is_equal_to(aps_threshold(probs, labels, coverage_target=0.9))
 
 
 def test_aps_threshold_degenerate_returns_conservative() -> None:

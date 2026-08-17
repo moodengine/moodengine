@@ -159,6 +159,18 @@ def test_cache_extra_busts_mert_for_the_24khz_default() -> None:
     )
 
 
+def test_track_embedding_from_waveform_rejects_an_off_rate_waveform() -> None:
+    """The public post-decode entry point: a caller reaching it holds a waveform it decoded itself,
+    and off-rate audio is time/pitch-warped in a way no downstream stage can detect — every
+    embedding is silently degraded rather than failing. ``track_embedding`` always passes the
+    embedder's own rate, so only this door needed the guard."""
+    embedder = _FakeEmbedder("clap", 48_000)
+    waveform = np.zeros(48_000, dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"decoded at 44100 Hz but the 'clap' embedder expects"):
+        pipeline.track_embedding_from_waveform(embedder, waveform, 44_100, default_config())
+
+
 def test_cache_extra_distinguishes_fractional_segment_seconds() -> None:
     """10.2 s and 10.7 s no longer collide under the old ``int()`` truncation."""
     base = _legacy_config()
