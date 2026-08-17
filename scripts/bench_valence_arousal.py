@@ -44,7 +44,11 @@ import pandas as pd
 import typer
 
 from moodengine.config import default_config
-from moodengine.evaluation import ccc_components, evaluate_against_gold
+from moodengine.evaluation import (
+    ccc_components,
+    concordance_correlation_coefficient,
+    evaluate_against_gold,
+)
 from moodengine.labeling import attribute_scores, l2_normalize
 from moodengine.pipeline import get_embedder, track_embedding
 
@@ -54,42 +58,63 @@ app = typer.Typer(add_completion=False, help=__doc__)
 _SCALE_LO, _SCALE_HI = 1.0, 9.0
 
 
-def _load_gold(data_dir: pathlib.Path) -> dict[int, tuple[float, float]]:
-    """Map ``song_id -> (energy01, valence01)`` from DEAM's averaged per-song CSVs.
+def _load_gold(data_dir: pathlib.Path) -> dict[int, tuple[float, float, float]]:
+    """Map ``song_id -> (energy01, valence01, disagreement)`` from DEAM's averaged per-song CSVs.
 
     Reads every ``static_annotations_averaged_songs_*.csv`` under ``data_dir`` (column
     names carry leading spaces, hence ``skipinitialspace``), maps DEAM arousal onto the
     engine's energy axis and valence onto valence, and affine-scales 1-9 -> [0, 1].
+
+    ``disagreement`` is ``max(arousal_std, valence_std)`` on the same [0, 1] scale — the spread
+    between annotators, which sits in the same CSV row and was being discarded. A song the
+    annotators themselves disagreed about cannot discriminate between two models, so a correlation
+    computed over the whole set is partly measuring label noise. ``--max-disagreement`` filters on
+    it. ``nan`` when the columns are absent, which filters to "keep everything" rather than
+    silently dropping every song.
     """
-    gold: dict[int, tuple[float, float]] = {}
+    gold: dict[int, tuple[float, float, float]] = {}
     span = _SCALE_HI - _SCALE_LO
     for csv_path in sorted(data_dir.rglob("static_annotations_averaged_songs_*.csv")):
         frame = pd.read_csv(csv_path, skipinitialspace=True)
+        has_std = {"arousal_std", "valence_std"} <= set(frame.columns)
         for _, row in frame.iterrows():
             energy01 = (float(row["arousal_mean"]) - _SCALE_LO) / span
             valence01 = (float(row["valence_mean"]) - _SCALE_LO) / span
-            gold[int(row["song_id"])] = (energy01, valence01)
+            spread = (
+                max(float(row["arousal_std"]), float(row["valence_std"])) / span
+                if has_std
+                else float("nan")
+            )
+            gold[int(row["song_id"])] = (energy01, valence01, spread)
     return gold
 
 
 def _select(
-    data_dir: pathlib.Path, gold: dict[int, tuple[float, float]], limit: int
-) -> list[tuple[str, pathlib.Path, float, float]]:
-    """Return ``(filename, path, energy01, valence01)`` for songs with both audio and gold.
+    data_dir: pathlib.Path,
+    gold: dict[int, tuple[float, float, float]],
+    limit: int,
+    seed: int = 0,
+) -> list[tuple[str, pathlib.Path, float, float, float]]:
+    """Return ``(filename, path, energy01, valence01, disagreement)`` for songs with audio + gold.
 
-    Sorted by numeric song id and truncated to ``limit`` (0 = all) so a run is
-    deterministic and a subset is a stable prefix, not a random sample.
+    ``limit`` takes a SEEDED PERMUTATION, not a prefix. DEAM's song ids run by annotation
+    campaign, so ``sorted(gold)[:150]`` evaluated one contiguous block of provenance — a
+    determinism that bought reproducibility at the cost of representativeness. Permuting under a
+    fixed seed keeps both: the same 150 songs every run, drawn from the whole corpus.
     """
     audio_dirs = {p.parent for p in data_dir.rglob("*.mp3")}
-    rows: list[tuple[str, pathlib.Path, float, float]] = []
+    rows: list[tuple[str, pathlib.Path, float, float, float]] = []
     for song_id in sorted(gold):
         for d in audio_dirs:
             path = d / f"{song_id}.mp3"
             if path.is_file():
-                energy01, valence01 = gold[song_id]
-                rows.append((path.name, path, energy01, valence01))
+                energy01, valence01, disagreement = gold[song_id]
+                rows.append((path.name, path, energy01, valence01, disagreement))
                 break
-    return rows[:limit] if limit and limit > 0 else rows
+    if not limit or limit <= 0 or limit >= len(rows):
+        return rows
+    order = np.random.default_rng(seed).permutation(len(rows))[:limit]
+    return [rows[i] for i in sorted(order)]
 
 
 def _embed(paths: list[pathlib.Path], embedder_name: str, config, force: bool) -> np.ndarray:
@@ -164,6 +189,80 @@ def _affine_oof(pred: np.ndarray, gold: np.ndarray, seed: int, n_splits: int) ->
     return out
 
 
+_BOOTSTRAP_RESAMPLES: int = 2000
+
+
+def _bootstrap_ci(
+    pred: np.ndarray, gold: np.ndarray, statistic, seed: int = 0, alpha: float = 0.05
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for a paired statistic — the number that was missing entirely.
+
+    Without an interval, two runs differing by 0.03 are indistinguishable from two runs differing
+    by 0.30: both read as "it moved". Resampling the (pred, gold) PAIRS with replacement and
+    re-computing the statistic gives the sampling spread directly, with no distributional
+    assumption — which matters because Pearson and CCC are both bounded and skewed near their
+    limits. 2000 resamples of a few hundred float pairs is milliseconds.
+    """
+    p_arr = np.asarray(pred, dtype=np.float64).ravel()
+    g_arr = np.asarray(gold, dtype=np.float64).ravel()
+    mask = np.isfinite(p_arr) & np.isfinite(g_arr)
+    p_arr, g_arr = p_arr[mask], g_arr[mask]
+    n = p_arr.shape[0]
+    if n < 3:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, n, size=(_BOOTSTRAP_RESAMPLES, n))
+    vals = np.array([statistic(p_arr[d], g_arr[d]) for d in draws], dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < 2:
+        return float("nan"), float("nan")
+    return float(np.quantile(vals, alpha / 2)), float(np.quantile(vals, 1 - alpha / 2))
+
+
+def _paired_delta_ci(
+    pred_a: np.ndarray, pred_b: np.ndarray, gold: np.ndarray, statistic, seed: int = 0
+) -> tuple[float, float, float]:
+    """CI on the DIFFERENCE between two predictors scored on the SAME songs.
+
+    The comparison a benchmark exists for, and the one marginal intervals answer wrongly: both
+    arms see identical audio and identical labels, so their errors are correlated and the paired
+    interval is far tighter than either marginal one. Resample the song indices ONCE per draw and
+    score both arms on that same resample, preserving the pairing. Returns
+    ``(delta, lo, hi)``; an interval excluding 0 is a real difference.
+    """
+    a = np.asarray(pred_a, dtype=np.float64).ravel()
+    b = np.asarray(pred_b, dtype=np.float64).ravel()
+    g = np.asarray(gold, dtype=np.float64).ravel()
+    mask = np.isfinite(a) & np.isfinite(b) & np.isfinite(g)
+    a, b, g = a[mask], b[mask], g[mask]
+    n = a.shape[0]
+    if n < 3:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, n, size=(_BOOTSTRAP_RESAMPLES, n))
+    deltas = np.array(
+        [statistic(a[d], g[d]) - statistic(b[d], g[d]) for d in draws], dtype=np.float64
+    )
+    deltas = deltas[np.isfinite(deltas)]
+    if deltas.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    return (
+        float(statistic(a, g) - statistic(b, g)),
+        float(np.quantile(deltas, 0.025)),
+        float(np.quantile(deltas, 0.975)),
+    )
+
+
+def _pearson_stat(p: np.ndarray, g: np.ndarray) -> float:
+    if p.size < 2 or float(p.std()) == 0.0 or float(g.std()) == 0.0:
+        return float("nan")
+    return float(np.corrcoef(p, g)[0, 1])
+
+
+def _ccc_stat(p: np.ndarray, g: np.ndarray) -> float:
+    return float(concordance_correlation_coefficient(p, g)[0])
+
+
 def _score(pred_energy: np.ndarray, pred_valence: np.ndarray, sel) -> dict:
     """Pearson/Spearman/CCC of predicted vs gold energy & valence, plus Lin's CCC decomposition.
 
@@ -177,12 +276,21 @@ def _score(pred_energy: np.ndarray, pred_valence: np.ndarray, sel) -> dict:
     )
     gold = {r[0]: {"energy": r[2], "valence": r[3]} for r in sel}
     metrics = evaluate_against_gold(df, gold)
+    # Kept so a later run can pair against this one; a paired bootstrap needs the per-song values,
+    # not the summary statistics.
+    metrics["energy_pred"] = [float(v) for v in np.asarray(pred_energy).ravel()]
+    metrics["valence_pred"] = [float(v) for v in np.asarray(pred_valence).ravel()]
 
     for axis, pred in (("energy", pred_energy), ("valence", pred_valence)):
         truth = np.array([g[axis] for g in (gold[r[0]] for r in sel)], dtype=np.float64)
-        rho, c_b, _ = ccc_components(np.asarray(pred, dtype=np.float64), truth)
+        arr = np.asarray(pred, dtype=np.float64)
+        rho, c_b, _ = ccc_components(arr, truth)
         metrics[f"{axis}_ccc_rho"] = rho
         metrics[f"{axis}_ccc_cb"] = c_b
+        lo, hi = _bootstrap_ci(arr, truth, _pearson_stat)
+        metrics[f"{axis}_pearson_ci"] = [lo, hi]
+        lo, hi = _bootstrap_ci(arr, truth, _ccc_stat)
+        metrics[f"{axis}_ccc_ci"] = [lo, hi]
     return metrics
 
 
@@ -197,6 +305,59 @@ def _print(title: str, metrics: dict) -> None:
             f"(rho={metrics.get(f'{axis}_ccc_rho', float('nan')):.3f} x "
             f"c_b={metrics.get(f'{axis}_ccc_cb', float('nan')):.3f})"
         )
+        p_ci = metrics.get(f"{axis}_pearson_ci", [float("nan")] * 2)
+        c_ci = metrics.get(f"{axis}_ccc_ci", [float("nan")] * 2)
+        typer.echo(
+            f"           95% CI  pearson [{p_ci[0]:.3f}, {p_ci[1]:.3f}]  "
+            f"ccc [{c_ci[0]:.3f}, {c_ci[1]:.3f}]"
+        )
+
+
+def _report_paired(baseline_path: pathlib.Path, current: dict, energy_gold, valence_gold) -> None:
+    """Compare this run against an earlier ``--out`` JSON with a PAIRED bootstrap.
+
+    The question a benchmark exists to answer — "did that change help?" — and the one marginal
+    intervals answer wrongly. Two runs over the same songs share their audio and their labels, so
+    their errors are correlated and the paired interval on the DIFFERENCE is far tighter than the
+    overlap of two separate intervals suggests. Two marginal CIs can overlap heavily while the
+    paired difference excludes zero.
+
+    Refuses to compare runs that did not score the same song set, since the pairing is the whole
+    point: a mismatched comparison is a marginal one wearing a paired label.
+    """
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        typer.echo(f"\nCannot read --compare baseline {baseline_path}: {exc}")
+        return
+
+    if baseline.get("songs") != current.get("songs"):
+        typer.echo(
+            f"\nRefusing to pair: {baseline_path.name} scored a different song set "
+            f"({len(baseline.get('songs') or [])} vs {len(current.get('songs') or [])}). "
+            "Re-run both arms with the same --limit/--seed/--max-disagreement."
+        )
+        return
+
+    typer.echo(f"\nPaired vs {baseline_path.name}  (95% CI on the difference; excludes 0 = real)")
+    for block in ("zeroshot", "zeroshot_calibrated", "probe"):
+        if block not in baseline or block not in current:
+            continue
+        for axis, gold in (("energy", energy_gold), ("valence", valence_gold)):
+            key = f"{axis}_pred"
+            if key not in baseline[block] or key not in current[block]:
+                continue
+            delta, lo, hi = _paired_delta_ci(
+                np.asarray(current[block][key], dtype=np.float64),
+                np.asarray(baseline[block][key], dtype=np.float64),
+                gold,
+                _pearson_stat,
+            )
+            verdict = "significatif" if (lo > 0 or hi < 0) else "dans le bruit"
+            typer.echo(
+                f"  {block:<20} {axis:8s} pearson delta={delta:+.3f} "
+                f"[{lo:+.3f}, {hi:+.3f}]  {verdict}"
+            )
 
 
 @app.command()
@@ -208,7 +369,21 @@ def main(
     embedder: str = typer.Option(
         "mert", "--embedder", help="Probe space: 'mert', 'clap' or 'fused'."
     ),
+    zeroshot_embedder: str = typer.Option(
+        "clap",
+        "--zeroshot-embedder",
+        help="Text-capable backbone for the zero-shot block: 'clap' or 'mulan'.",
+    ),
     limit: int = typer.Option(150, "--limit", help="Max tracks (0 = all); bounds embedding cost."),
+    seed: int = typer.Option(0, "--seed", help="Seeds the subset permutation; fixes which songs."),
+    max_disagreement: float = typer.Option(
+        0.0,
+        "--max-disagreement",
+        help="Keep only songs whose annotators agreed within this (0-1 scale; 0 = keep all).",
+    ),
+    compare: pathlib.Path | None = typer.Option(
+        None, "--compare", help="An earlier --out JSON; reports a PAIRED CI on the difference."
+    ),
     n_splits: int = typer.Option(5, "--folds", help="Probe cross-validation folds."),
     cache_dir: pathlib.Path | None = typer.Option(
         None, "--cache-dir", help="Embedding cache (defaults to the config cache dir)."
@@ -227,7 +402,13 @@ def main(
     config.ensure_dirs()
 
     gold = _load_gold(data_dir)
-    sel = _select(data_dir, gold, limit)
+    sel = _select(data_dir, gold, limit, seed=seed)
+    if max_disagreement > 0:
+        kept = [r for r in sel if not np.isfinite(r[4]) or r[4] <= max_disagreement]
+        typer.echo(
+            f"Annotator-agreement filter <= {max_disagreement}: kept {len(kept)}/{len(sel)} songs."
+        )
+        sel = kept
     if not sel:
         typer.echo(f"No annotated audio found under {data_dir}. Run fetch_deam.py first.")
         raise typer.Exit(code=1)
@@ -235,16 +416,31 @@ def main(
 
     energy_gold = np.array([r[2] for r in sel], dtype=np.float64)
     valence_gold = np.array([r[3] for r in sel], dtype=np.float64)
-    results: dict = {"n": len(sel), "mode": mode, "embedder": embedder, "limit": limit}
+    results: dict = {
+        "n": len(sel),
+        "mode": mode,
+        "embedder": embedder,
+        "limit": limit,
+        "seed": seed,
+        "max_disagreement": max_disagreement,
+        # Songs, not just their count: a paired comparison is only valid across runs that scored
+        # the SAME set, and this is what lets --compare check that instead of assuming it.
+        "songs": sorted(r[0] for r in sel),
+    }
 
     if mode in ("zeroshot", "both"):
-        clap = get_embedder("clap", config)
-        xc = _embed([r[1] for r in sel], "clap", config, force)
-        attrs = attribute_scores(xc, clap)
+        # Text-capable backbone, selectable: the zero-shot block used to be hard-wired to CLAP,
+        # which made the one comparison this benchmark exists for — CLAP against MuQ-MuLan on
+        # ACCURACY rather than on separability proxies — impossible to run.
+        zs_name = zeroshot_embedder
+        zs = get_embedder(zs_name, config)
+        xc = _embed([r[1] for r in sel], zs_name, config, force)
+        attrs = attribute_scores(xc, zs)
         e_raw, v_raw = attrs["energy"].to_numpy(), attrs["valence"].to_numpy()
-        zs = _score(e_raw, v_raw, sel)
-        _print("zero-shot (CLAP attribute_scores, raw softmax scale)", zs)
-        results["zeroshot"] = zs
+        zs_block = _score(e_raw, v_raw, sel)
+        _print(f"zero-shot ({zs_name} attribute_scores, raw softmax scale)", zs_block)
+        results["zeroshot"] = zs_block
+        results["zeroshot_embedder"] = zs_name
 
         # The raw CCC above is partly a readout of the softmax temperature (see _affine_oof).
         # This second block puts both axes on the gold scale out-of-fold, so its CCC reflects the
@@ -266,6 +462,9 @@ def main(
         pr = _score(pe, pv, sel)
         _print(f"linear probe ({embedder}, {n_splits}-fold out-of-fold)", pr)
         results["probe"] = pr
+
+    if compare is not None:
+        _report_paired(compare, results, energy_gold, valence_gold)
 
     if out is not None:
         out.write_text(json.dumps(results, indent=2), encoding="utf-8")
