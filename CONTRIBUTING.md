@@ -17,8 +17,14 @@ uv run pytest        # default suite, must pass on this light install
 uv run ruff format . && uv run ruff check .
 ```
 
-Optional stacks: `uv sync --extra models` (torch backbones, several GB),
-`--extra ot`, `--extra cluster-graph`. Real-model tests: `uv run pytest -m model`.
+Optional stacks — all five extras: `uv sync --extra models` (torch backbones, several
+GB), `--extra ot`, `--extra cluster-graph`, `--extra pacmap`, `--extra explain`. The CI
+`test-extras` job installs the last four together; `models` is manual-only. Real-model
+tests: `uv run pytest -m model`.
+
+Note that this is the *development* setup, cloning the repository. moodengine is
+published to no package index; consuming it from another project goes through a git
+reference — see [Installation](README.md#installation).
 
 ## Ground rules
 
@@ -89,3 +95,11 @@ git rebase --signoff main    # every commit on your branch
 run (all jobs), at least one approving review, resolved conversations, and a linear history
 (squash merge). Keep commit messages conventional — the squash-merge title becomes the
 changelog entry.
+
+## Conduct and security
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md) (Contributor
+Covenant 2.1); it applies to issues, pull requests and reviews alike.
+
+Found a vulnerability? Do **not** open a public issue — follow the
+[security policy](SECURITY.md), which uses GitHub private vulnerability reporting.

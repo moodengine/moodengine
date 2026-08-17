@@ -27,10 +27,45 @@ Design principles:
 
 ## Installation
 
+moodengine is distributed **from this repository only**. It is not published to PyPI or
+any other index — and the name is unclaimed there, so `pip install moodengine` would at
+best fail and at worst install someone else's package. Every install goes through the
+repository or a release artifact.
+
 ```bash
-pip install moodengine            # light core (not yet on PyPI: pip install "moodengine @ git+https://github.com/moodengine/moodengine")
-pip install "moodengine[models]"  # + MERT/CLAP backbones (pulls torch, several GB)
+# uv — this project is uv-native
+uv add "moodengine @ git+https://github.com/moodengine/moodengine@v0.3.0"
+uv add "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0"
+
+# pip (or `uv pip`), into the environment you already have active
+pip install "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0"
 ```
+
+To declare it as a dependency, use the same PEP 508 direct reference — in
+`pyproject.toml`, `requirements.txt`, or anywhere a requirement string is accepted:
+
+```
+moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0
+```
+
+Every release also carries a prebuilt wheel and sdist, if you would rather not resolve
+from git:
+
+```bash
+gh release download v0.3.0 --repo moodengine/moodengine --pattern '*.whl'
+pip install ./moodengine-0.3.0-py3-none-any.whl   # add [models] etc. separately
+```
+
+**Pin deliberately.** `@v0.3.0` above is a git tag, and a tag can be moved; for a build
+you need to reproduce exactly, pin the commit instead — `@7d82371…` (full 40-char SHA).
+Omitting the `@…` entirely tracks the default branch, which is fine for a scratch
+environment and unwise anywhere else.
+
+**Poetry users:** `poetry add "moodengine[models] @ git+…"` fails version solving unless
+your project excludes Python 3.14.1, because `torchvision` 0.28 declares
+`requires-python != 3.14.1` and Poetry — unlike uv and pip — will not resolve per
+interpreter. Set `requires-python = ">=3.11,!=3.14.1"` (or Poetry's
+`python = ">=3.11,<3.14.1 || >3.14.1"`) and it resolves. The light core is unaffected.
 
 | Extra | Enables | Pulls |
 |---|---|---|
@@ -81,8 +116,9 @@ print(df[["filename", "cluster", "top_mood", "energy", "valence", "cluster_profi
 `run_pipeline` writes its artifacts under `config.output_dir`: `assignments.parquet`
 (one row per track: cluster, calibrated top-3 moods, energy/valence in [0, 1],
 medoid + outlier scores), interactive `dashboard.html` and `clusters.html` /
-`mood_space.html` scatters, a `cluster_report.md`, an annotation UI
-(`label_ui.html`) and per-cluster `.m3u` playlists.
+`mood_space.html` scatters, a `cluster_report.md`, and one `.m3u` playlist per
+cluster. The gold-labeling UI (`label_ui.html`) is not part of the pipeline —
+`scripts/05_evaluate.py` writes it, via `viz.build_labeling_ui`.
 
 The clustering space and the labeling model are independent: cluster with
 `embedder_name="mert"`, `"clap"` or `"fused"` — zero-shot labels always come
@@ -111,6 +147,8 @@ to CPU instead of crashing.
 | `labeling` | zero-shot mood taxonomy (prompt ensembling, customizable), softmax calibration, similarity recentering, energy/valence axes, cluster mood profiles |
 | `search` | text→audio and audio→audio cosine search (pure numpy) |
 | `evaluation`, `calibration` | retrieval P@k, axis AUC, gold-set tooling, score calibration |
+| `io_audio` | audio discovery + decode to mono float32, segment selection for long tracks |
+| `mood_arc` | within-track mood trajectory: segment bounds, per-segment embeddings and arc scoring |
 | `novelty`, `signals`, `sequence`, `journey`, `adapt`, `explain`, `feedback` | OOD/near-duplicate detection, BPM/key signals, next-track models, playlist morphing, metric adapters, SHAP explanations, feedback loops |
 | `viz` | self-contained HTML dashboard/scatters, annotation UI, playlist export |
 | `pipeline` | end-to-end orchestration with caching (the only module that writes files) |
@@ -135,8 +173,9 @@ uv run python scripts/03_label_and_explore.py --embedder clap --method kmeans
 - The `[models]` extra downloads checkpoints from the Hugging Face hub and the
   laion-clap release page on first use.
 - **Offline / air-gapped use**: pre-download the checkpoints once
-  (`huggingface-cli download m-a-p/MERT-v1-95M` and `huggingface-cli download
-  lukewys/laion_clap music_audioset_epoch_15_esc_90.14.pt`), point `HF_HOME` at
+  (`hf download m-a-p/MERT-v1-95M` and `hf download
+  lukewys/laion_clap music_audioset_epoch_15_esc_90.14.pt` — `hf` is the
+  huggingface_hub 1.x CLI; `huggingface-cli` still runs but is deprecated), point `HF_HOME` at
   the cache location if needed, and set `HF_HUB_OFFLINE=1` to force cache-only
   resolution. A load failure raises `ModelLoadError` naming the exact artifact
   and this remediation.
@@ -152,8 +191,9 @@ uv run python scripts/03_label_and_explore.py --embedder clap --method kmeans
 Every library-specific failure derives from `moodengine.MoodengineError`:
 `AudioDecodeError` (an existing file cannot be decoded — a missing path raises
 stdlib `FileNotFoundError` instead), `MissingDependencyError` (an optional
-backend is absent; the message names the exact `pip install "moodengine[...]"`
-command), `ModelLoadError` (a checkpoint could not be fetched or loaded).
+backend is absent; the message carries a ready-to-run install command for the
+missing extra, repository URL included), `ModelLoadError` (a checkpoint could
+not be fetched or loaded).
 Argument errors stay plain `ValueError`, following the numpy/sklearn convention.
 
 ## Development
@@ -175,12 +215,18 @@ SemVer policy, test layout) and [docs/](docs/) for developer guides (e.g.
 [benchmarking against ground truth](docs/benchmarking.md)). API documentation
 lives in the source docstrings — every public symbol is fully documented there.
 
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). To report
+a vulnerability, follow the [security policy](SECURITY.md) — please don't open a
+public issue for anything exploitable.
+
 ## Compatibility
 
 - Python 3.11+ · numpy ≥ 1.26 (tested under numpy 2.x) · all dependencies ship
   cross-platform wheels (macOS arm64 / Windows / Linux).
-- The `[models]` extra requires `transformers` ≥ 5.3.0 (the release fixing
-  CVE-2026-4372) and `torch` ≥ 2.4; MERT and laion-clap both run on the v5 line.
+- The `[models]` extra carries security floors, not comfort floors: `transformers`
+  ≥ 5.3.0 (CVE-2026-4372, CVE-2026-1839), `torch` ≥ 2.13.0 (GHSA-rrmf-rvhw-rf47,
+  whose affected range covers every earlier release) and the `torchvision` ≥ 0.28
+  that pairs with it. MERT and laion-clap both run on the transformers v5 line.
 - The support window follows the scientific-Python ecosystem schedule
   ([SPEC 0](https://scientific-python.org/specs/spec-0000/)): Python and numpy
   versions are dropped on that calendar, in a minor release, noted in the
@@ -196,6 +242,14 @@ lives in the source docstrings — every public symbol is fully documented there
   atomic (temp file + rename), partial or corrupt entries are treated as cache
   misses and recomputed, and several processes may fill the same cache
   directory concurrently.
+
+## Citation
+
+If moodengine contributes to published work, please cite the release you actually ran —
+the version and release date are recorded in [CITATION.cff](CITATION.cff), which GitHub
+renders as *Cite this repository* in the sidebar (BibTeX and APA included). Citing a
+specific `vX.Y.Z` rather than the repository matters here: clustering and zero-shot
+labeling behaviour changes between releases.
 
 ## License
 
