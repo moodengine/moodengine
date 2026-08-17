@@ -29,9 +29,15 @@ dependencies = [
 # Heavy embedders: install to actually embed audio with MERT / CLAP.
 #   pip install "moodengine[models]"   (pulls torch ~ several GB)
 models = [
-    "torch>=2.4",                 # floor set by transformers 5.x (requires torch >= 2.4)
-    "torchaudio>=2.4",            # tracks torch 2.4
-    "torchvision>=0.19",          # required by laion-clap (FrozenBatchNorm2d); tracks torch 2.4
+    # 2.13.0 is the first release outside the torch.jit.script memory-corruption
+    # advisory (GHSA-rrmf-rvhw-rf47), whose affected range is "<= 2.12.1" — i.e. every
+    # earlier release. moodengine never calls torch.jit, so the flaw is unreachable
+    # through this library, but a floor is the only way to stop a consumer resolving
+    # onto a flagged build; a cap would remediate nothing. Supersedes the previous
+    # ">= 2.4, floor set by transformers 5.x" bound, which stays satisfied.
+    "torch>=2.13.0",
+    "torchaudio>=2.4",            # versioned independently of torch; declares no torch bound
+    "torchvision>=0.28",          # required by laion-clap (FrozenBatchNorm2d); 0.28 pins torch == 2.13
     # 5.3.0 is the first release fixing the config-injection RCE (CVE-2026-4372);
     # every < 5.3.0 pin stays flagged, so a version bump (not a downward cap) is
     # the only remediation. Verified compatible with MERT's pinned remote code and
@@ -73,10 +79,24 @@ Issues = "https://github.com/moodengine/moodengine/issues"
 Changelog = "https://github.com/moodengine/moodengine/releases"
 
 [tool.uv]
-# Lock-time constraint only (never lands in consumers' metadata): pynndescent
-# < 0.6 predates numpy 2 and drags an unbuildable llvmlite 0.36 — the resolver
-# otherwise picks that fork when maximizing the numpy version.
-constraint-dependencies = ["pynndescent>=0.6"]
+# Lock-time constraints only (never land in consumers' metadata). Two kinds live here:
+# resolver steering, and security floors on packages we never declare ourselves —
+# for a transitive dependency there is no requirement of ours to raise, so a
+# constraint is the only place to say "never resolve onto a flagged build".
+constraint-dependencies = [
+    # pynndescent < 0.6 predates numpy 2 and drags an unbuildable llvmlite 0.36 —
+    # the resolver otherwise picks that fork when maximizing the numpy version.
+    "pynndescent>=0.6",
+    # Reaches the lock through [models]: laion-clap -> wandb -> gitpython. 3.1.58 is
+    # the first release clear of the whole 2026 run of config-injection and
+    # submodule-path-traversal advisories (GHSA-jm78-9fvv-mhgr, GHSA-hmq2-w58f-27jc
+    # and siblings), each of which patched only the release before the next landed.
+    "gitpython>=3.1.58",
+    # Reaches the lock through [models]: torch -> setuptools. 83.0.0 fixes the
+    # MANIFEST.in exclusion bypass on macOS (GHSA-h35f-9h28-mq5c), where a NFC rule
+    # silently fails to exclude a NFD filename from a built sdist.
+    "setuptools>=83.0.0",
+]
 
 # Dev-only tooling (PEP 735): installed by `uv sync` (uv includes the "dev"
 # group by default), never published as an extra, never in consumers' trees.
