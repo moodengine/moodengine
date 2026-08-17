@@ -59,15 +59,18 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement confidentially
-through this repository's private reporting form:
-<https://github.com/moodengine/moodengine/security/advisories/new>.
+reported to the community leaders responsible for enforcement confidentially, at
+<hello@moodengine.app>.
 
-That form is labelled for security advisories — it is the only private channel a
-GitHub repository offers, and conduct reports are welcome through it. Title the
-report "Code of Conduct" and describe the incident in your own words; you do not
-need to fill in the security-specific fields. What you send is visible to the
-maintainers only and never becomes public.
+If you would rather not send email, this repository's private reporting form
+reaches the same people:
+<https://github.com/moodengine/moodengine/security/advisories/new>. It is
+labelled for security advisories — that is simply the only private form GitHub
+gives a repository — so title the report "Code of Conduct", describe the incident
+in your own words, and leave the security-specific fields blank.
+
+Either way, what you send is visible to the maintainers only and never becomes
+public.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
