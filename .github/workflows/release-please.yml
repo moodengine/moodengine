@@ -11,6 +11,19 @@ name: Release Please
 on:
   push:
     branches: [main]
+  # Recovery hatch for a half-cut release. release-please reports `release_created`
+  # only on the run that actually creates the release, so if that run dies after the
+  # release exists but before the output is set, publish-artifacts is skipped and can
+  # never be re-run: retrying the run fails with `Release already_exists`. That is not
+  # hypothetical — a GitHub API outage left v0.3.0 tagged and published with no sdist
+  # or wheel attached. Dispatching with the tag builds and attaches artifacts for an
+  # already-cut release, without letting release-please near it.
+  workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Existing release tag to build and attach artifacts to (e.g. v0.3.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,6 +35,9 @@ concurrency:
 jobs:
   release-please:
     name: maintain release PR / cut release
+    # Push only. A manual dispatch exists to republish artifacts for a release that
+    # already happened, so release-please must stay out of it entirely.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # The GITHUB_TOKEN stays read-only; the App installation token below carries the
     # contents / pull-requests / issues write scopes release-please actually uses.
@@ -54,14 +70,23 @@ jobs:
   publish-artifacts:
     name: build + attach sdist/wheel
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    # always(): on a dispatch the release-please job is skipped, and without this the
+    # skip would cascade here — which is exactly the path being recovered.
+    if: >-
+      always() &&
+      (needs.release-please.outputs.release_created == 'true' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write # upload assets to the freshly created release
+    # One name for the tag whichever trigger fired, and read through `env` rather than
+    # interpolated into any `run:` block — the dispatch input is caller-controlled.
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_tag || needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ env.TAG }}
           persist-credentials: false
 
       # Cache explicitly off (setup-uv enables it by default): release artifacts
@@ -73,10 +98,10 @@ jobs:
       - name: Install (locked)
         run: uv sync --locked
 
+      # Also the guard on the dispatch input: a tag that does not name a real release
+      # of this package fails here, before anything is built or uploaded.
       - name: Tag must match the package version
         shell: bash
-        env:
-          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           pkg="v$(uv run python -c 'import moodengine; print(moodengine.__version__)')"
           if [ "$pkg" != "$TAG" ]; then
@@ -90,8 +115,9 @@ jobs:
       - name: Build sdist + wheel
         run: uv build
 
+      # --clobber: a dispatch re-run of a partially uploaded release must overwrite
+      # what is there rather than abort on the first existing asset.
       - name: Attach artifacts to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: gh release upload "$TAG" dist/*
+        run: gh release upload "$TAG" dist/* --clobber
