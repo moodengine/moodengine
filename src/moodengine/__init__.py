@@ -17,6 +17,7 @@ __version__ = "0.3.1"  # x-release-please-version
 from moodengine._typing import (
     ClusteringResult,
     ClusterMethod,
+    ClusterSpace,
     ClusterMetrics,
     CoverageEntropyResult,
     HDBSCANDetail,
@@ -251,6 +252,7 @@ __all__ = [
     "__version__",
     # typing vocabulary
     "ClusterMethod",
+    "ClusterSpace",
     "PoolingMode",
     "LayerWeighting",
     "SegmentSelection",

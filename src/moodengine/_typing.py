@@ -27,6 +27,15 @@ SegmentSelection = Literal["head", "uniform"]
 first N (legacy), ``"uniform"`` spreads N across the whole track so a long track's mood is not
 represented by its intro alone."""
 
+ClusterSpace = Literal["reduced", "original"]
+"""Which space :func:`moodengine.cluster.run_clustering` clusters in (``Config.cluster_space``).
+
+``"reduced"`` (the default, and what the pipeline has always done) clusters the UMAP layout;
+``"original"`` clusters the embeddings themselves. The choice is exposed rather than decided
+because measurement does not settle it: the reduced space recovers overlapping blobs better in
+some regimes and worse in others. What it does settle is that COSINE is meaningless on a UMAP
+layout — see the note on ``cluster_spherical_kmeans``."""
+
 ProjectionMethod = Literal["umap", "densmap", "pacmap"]
 """2-D map projections (``Config.projection_method``)."""
 

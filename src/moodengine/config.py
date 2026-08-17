@@ -13,7 +13,13 @@ from typing import get_args
 
 from platformdirs import user_cache_path
 
-from moodengine._typing import LayerWeighting, PoolingMode, ProjectionMethod, SegmentSelection
+from moodengine._typing import (
+    ClusterSpace,
+    LayerWeighting,
+    PoolingMode,
+    ProjectionMethod,
+    SegmentSelection,
+)
 
 # Audio file extensions discovered when scanning an input directory.
 AUDIO_EXTENSIONS: tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac")
@@ -144,8 +150,20 @@ class Config:
     umap_n_components_viz: int = 2  # dims for the 2D scatter
     umap_metric: str = "cosine"
     projection_method: ProjectionMethod = "umap"  # 2-D map projection
+    # Which space the clustering itself runs in. "reduced" is what the pipeline has always done;
+    # "original" skips the reduction for the clustering step (the 2-D map is still produced).
+    cluster_space: ClusterSpace = "reduced"
     hdbscan_min_cluster_size: int = 5
     hdbscan_min_samples: int | None = None
+    # The knobs that address HDBSCAN's known failure on a homogeneous library — one dominant
+    # cluster swallowing most of the catalogue. Both backends accept all four; leaving them
+    # unexposed meant the only remedy was changing min_cluster_size and hoping.
+    #   "eom"  — excess of mass, the default: prefers few large, stable clusters
+    #   "leaf" — the finest stable clusters, which is what splits that dominant blob
+    hdbscan_cluster_selection_method: str = "eom"
+    hdbscan_cluster_selection_epsilon: float = 0.0  # merge clusters closer than this distance
+    hdbscan_max_cluster_size: int | None = None  # cap a runaway cluster (standalone backend only)
+    hdbscan_allow_single_cluster: bool = False  # let a genuinely uniform library say so
     kmeans_n_clusters: int = 8
     # Leiden community detection — kNN graph degree + RBConfiguration resolution. Optional
     # backend (leidenalg + python-igraph); these knobs are inert unless method == "leiden".
@@ -175,6 +193,12 @@ class Config:
         _check_choice("mert_layer_weighting", self.mert_layer_weighting, get_args(LayerWeighting))
         _check_choice("projection_method", self.projection_method, get_args(ProjectionMethod))
         _check_choice("segment_selection", self.segment_selection, get_args(SegmentSelection))
+        _check_choice("cluster_space", self.cluster_space, get_args(ClusterSpace))
+        _check_choice(
+            "hdbscan_cluster_selection_method",
+            self.hdbscan_cluster_selection_method,
+            ("eom", "leaf"),
+        )
 
         if self.segment_seconds <= 0:
             raise ValueError(f"segment_seconds must be > 0; got {self.segment_seconds}")
@@ -212,6 +236,15 @@ class Config:
             raise ValueError(f"kmeans_n_clusters must be >= 1; got {self.kmeans_n_clusters}")
         if self.leiden_resolution <= 0:
             raise ValueError(f"leiden_resolution must be > 0; got {self.leiden_resolution}")
+        if self.hdbscan_cluster_selection_epsilon < 0:
+            raise ValueError(
+                "hdbscan_cluster_selection_epsilon must be >= 0; got "
+                f"{self.hdbscan_cluster_selection_epsilon}"
+            )
+        if self.hdbscan_max_cluster_size is not None and self.hdbscan_max_cluster_size < 2:
+            raise ValueError(
+                f"hdbscan_max_cluster_size must be >= 2 or None; got {self.hdbscan_max_cluster_size}"
+            )
         if self.bootstrap_n < 0:
             raise ValueError(f"bootstrap_n must be >= 0; got {self.bootstrap_n}")
 
