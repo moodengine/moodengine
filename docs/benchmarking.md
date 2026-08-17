@@ -3,8 +3,8 @@
 The engine's mood outputs are only trustworthy if you can *measure* them. This guide runs
 the pipeline against human valence/arousal ratings so a change can be shown to improve or
 regress quality, rather than asserted to. It needs the model backbones
-(`pip install "moodengine[models]"`) and is a developer workflow, not part of the library
-surface.
+(`uv sync --extra models`) and is a developer workflow run from a clone, not part of the
+library surface.
 
 ## The dataset
 
