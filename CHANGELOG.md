@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/moodengine/moodengine/compare/v0.2.4...v0.3.0) (2026-08-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** clear all 20 open Dependabot advisories ([#20](https://github.com/moodengine/moodengine/issues/20))
+
+### Fixes
+
+* **deps:** clear all 20 open Dependabot advisories ([#20](https://github.com/moodengine/moodengine/issues/20)) ([df196ab](https://github.com/moodengine/moodengine/commit/df196abe88b7fb1ace0ec77738992b8d7edaacc8))
+
 ## [0.2.4](https://github.com/moodengine/moodengine/compare/v0.2.3...v0.2.4) (2026-07-16)
 
 
