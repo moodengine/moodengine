@@ -9,7 +9,7 @@ authors:
 # Kept in step by release-please: both lines carry a generic-updater annotation and
 # CITATION.cff is listed in extra-files, so cutting a release rewrites them along with
 # __version__. Editing either by hand will be overwritten at the next release.
-version: "0.3.0" # x-release-please-version
+version: "0.3.1" # x-release-please-version
 date-released: 2026-08-17 # x-release-please-date
 repository-code: "https://github.com/moodengine/moodengine"
 url: "https://github.com/moodengine/moodengine"
