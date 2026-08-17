@@ -32,34 +32,44 @@ any other index — and the name is unclaimed there, so `pip install moodengine`
 best fail and at worst install someone else's package. Every install goes through the
 repository or a release artifact.
 
+<!-- Versions below are rewritten by release-please at each release (README.md is in
+     extra-files). The block must end before the Poetry note: the updater rewrites the
+     first version-shaped string on every line it covers, which would turn that note's
+     Python 3.14.1 into a release number. The wheel is fetched by glob for the same
+     reason — a literal moodengine-X.Y.Z-py3-none-any.whl would have its `-py3` eaten as
+     a pre-release suffix. -->
+<!-- x-release-please-start-version -->
+
 ```bash
 # uv — this project is uv-native
-uv add "moodengine @ git+https://github.com/moodengine/moodengine@v0.3.0"
-uv add "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0"
+uv add "moodengine @ git+https://github.com/moodengine/moodengine@v0.3.1"
+uv add "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.1"
 
 # pip (or `uv pip`), into the environment you already have active
-pip install "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0"
+pip install "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.1"
 ```
 
 To declare it as a dependency, use the same PEP 508 direct reference — in
 `pyproject.toml`, `requirements.txt`, or anywhere a requirement string is accepted:
 
 ```
-moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.0
+moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.3.1
 ```
 
 Every release also carries a prebuilt wheel and sdist, if you would rather not resolve
 from git:
 
 ```bash
-gh release download v0.3.0 --repo moodengine/moodengine --pattern '*.whl'
-pip install ./moodengine-0.3.0-py3-none-any.whl   # add [models] etc. separately
+gh release download v0.3.1 --repo moodengine/moodengine --pattern '*.whl'
+pip install ./moodengine-*.whl   # add [models] etc. separately
 ```
 
-**Pin deliberately.** `@v0.3.0` above is a git tag, and a tag can be moved; for a build
-you need to reproduce exactly, pin the commit instead — `@7d82371…` (full 40-char SHA).
+**Pin deliberately.** `@v0.3.1` above is a git tag, and a tag can be moved; for a build
+you need to reproduce exactly, pin the commit instead — the full 40-character SHA.
 Omitting the `@…` entirely tracks the default branch, which is fine for a scratch
 environment and unwise anywhere else.
+
+<!-- x-release-please-end -->
 
 **Poetry users:** `poetry add "moodengine[models] @ git+…"` fails version solving unless
 your project excludes Python 3.14.1, because `torchvision` 0.28 declares

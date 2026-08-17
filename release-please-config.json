@@ -10,7 +10,8 @@
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         { "type": "generic", "path": "src/moodengine/__init__.py" },
-        { "type": "generic", "path": "CITATION.cff" }
+        { "type": "generic", "path": "CITATION.cff" },
+        { "type": "generic", "path": "README.md" }
       ],
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
