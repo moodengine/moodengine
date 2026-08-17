@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/moodengine/moodengine/compare/v0.3.0...v0.3.1) (2026-08-17)
+
+
+### Fixes
+
+* **errors:** install hints now resolve (GitHub-only distribution) ([#26](https://github.com/moodengine/moodengine/issues/26)) ([2f93ce5](https://github.com/moodengine/moodengine/commit/2f93ce5fd8dc4f36a2d0a34bbd3eff32bdd5f495))
+
 ## [0.3.0](https://github.com/moodengine/moodengine/compare/v0.2.4...v0.3.0) (2026-08-17)
 
 
