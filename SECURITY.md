@@ -22,5 +22,9 @@ exploitable. You should receive an acknowledgement within a week.
   pinned to a reviewed revision precisely to keep that code immutable —
   anything that weakens or bypasses this pinning is in scope and worth
   reporting.
-- Dependency advisories are monitored continuously (weekly `pip-audit` over the
-  committed lockfile, Renovate update PRs).
+- Dependency advisories are monitored continuously, by two independent means:
+  GitHub Dependabot alerts on the committed lockfile, with automated security
+  fixes enabled so a patched version arrives as a pull request; and a weekly
+  `pip-audit` over that same lockfile, exported with every extra and dependency
+  group so the optional `[models]` tree is covered rather than just the default
+  install.
