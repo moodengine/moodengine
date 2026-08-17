@@ -11,12 +11,14 @@ from assertpy import assert_that
 from moodengine.cluster import (
     bootstrap_stability,
     cluster_hdbscan,
+    cluster_hdbscan_detailed,
     cluster_hierarchy,
     cluster_kmeans,
     cluster_leiden,
     cluster_medoids,
     cluster_metrics,
     coverage_entropy,
+    density_validity_index,
     cluster_spherical_kmeans,
     graph_modularity,
     outlier_scores,
@@ -151,6 +153,118 @@ def test_reduce_umap_shape() -> None:
     assert_that(emb.shape).is_equal_to((X.shape[0], 2))
     assert_that(emb.dtype).is_equal_to(np.float32)
     assert_that(hasattr(reducer, "transform")).is_true()
+
+
+def _two_elongated_clusters(seed: int = 0, per: int = 80):
+    """Two long, thin, parallel bands — dense but nowhere near globular. This is the shape HDBSCAN
+    is chosen for and the shape a centroid-distance outlier score cannot describe."""
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0.0, 1.0, per)
+    lower = np.stack([t * 10.0, np.zeros_like(t)], axis=1) + rng.normal(0, 0.15, (per, 2))
+    upper = np.stack([t * 10.0, np.full_like(t, 4.0)], axis=1) + rng.normal(0, 0.15, (per, 2))
+    return np.vstack([lower, upper]).astype(np.float32)
+
+
+def test_cluster_hdbscan_detailed_agrees_with_the_labels_only_call() -> None:
+    """Same seam, same parameters: the detailed call must not be a second, subtly different fit."""
+    cfg = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+    X, _ = _three_blobs(seed=20, per=12)
+
+    detail = cluster_hdbscan_detailed(X, cfg)
+
+    np.testing.assert_array_equal(detail["labels"], cluster_hdbscan(X, cfg))
+
+
+def test_cluster_hdbscan_detailed_reports_membership_strength() -> None:
+    """``probabilities`` is the per-point confidence the fit already computed and used to discard —
+    a bare label cannot say whether a track sits at its cluster's core or on its fringe."""
+    cfg = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+    X = _two_elongated_clusters()
+
+    detail = cluster_hdbscan_detailed(X, cfg)
+
+    assert_that(detail["probabilities"].shape).is_equal_to((X.shape[0],))
+    assert_that(float(detail["probabilities"].min())).is_greater_than_or_equal_to(0.0)
+    assert_that(float(detail["probabilities"].max())).is_less_than_or_equal_to(1.0)
+    # Noise, where present, carries no membership at all.
+    noise = detail["labels"] == -1
+    if bool(noise.any()):
+        np.testing.assert_allclose(detail["probabilities"][noise], 0.0, atol=1e-6)
+
+
+def test_glosh_and_centroid_outlier_scores_disagree_on_elongated_clusters() -> None:
+    """The substantive reason to surface GLOSH. ``outlier_scores`` measures distance to a centroid,
+    which presumes globular clusters — precisely the assumption HDBSCAN exists to avoid. On two
+    long thin bands the two rankings share little: Spearman rho ~0.24, so they are not
+    interchangeable and the density-based one is the honest signal for a density partition."""
+    from scipy.stats import spearmanr
+
+    cfg = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+    X = _two_elongated_clusters()
+
+    detail = cluster_hdbscan_detailed(X, cfg)
+
+    if detail["glosh"] is None:
+        pytest.skip("GLOSH needs the standalone hdbscan backend")
+    clustered = detail["labels"] != -1
+    rho = float(
+        spearmanr(
+            detail["glosh"][clustered], outlier_scores(X, detail["labels"])[clustered]
+        ).statistic
+    )
+    assert_that(abs(rho)).is_less_than(0.6)  # measuring different things, not a reimplementation
+
+
+def test_cluster_hdbscan_detailed_tiny_input_is_all_noise() -> None:
+    """One sample cannot form a cluster of size >= 2, so it is noise by definition — reported
+    without touching a backend, and with no fabricated diagnostics."""
+    detail = cluster_hdbscan_detailed(np.zeros((1, 4), dtype=np.float32), default_config())
+
+    assert_that(detail["labels"].tolist()).is_equal_to([-1])
+    assert_that(detail["probabilities"].tolist()).is_equal_to([0.0])
+    assert_that(detail["glosh"]).is_none()
+    assert_that(detail["backend"]).is_equal_to("none_tiny_input")
+
+
+def test_density_validity_index_ranks_real_density_above_noise() -> None:
+    """DBCV is the index silhouette cannot be for density clusters. Two genuinely dense bands must
+    score well above a structureless cloud cut into the same number of pieces."""
+    cfg = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+    X = _two_elongated_clusters()
+    labels = cluster_hdbscan(X, cfg)
+    noise = np.random.default_rng(1).standard_normal(X.shape).astype(np.float32)
+
+    real = density_validity_index(X, labels)
+    fake = density_validity_index(noise, labels)
+
+    if real is None or fake is None:
+        pytest.skip("DBCV needs the standalone hdbscan package")
+    assert_that(real).is_greater_than(fake)
+    assert_that(real).is_between(-1.0, 1.0)
+
+
+def test_density_validity_index_absent_when_it_cannot_be_measured() -> None:
+    """Fewer than two clusters leaves nothing to score the separation between — an absence, never
+    a fabricated 0.0."""
+    X = np.eye(6, dtype=np.float32)
+
+    assert_that(density_validity_index(X, np.zeros(6, dtype=int))).is_none()
+    assert_that(density_validity_index(X, np.full(6, -1, dtype=int))).is_none()
+
+
+def test_density_validity_index_sampling_is_reproducible() -> None:
+    """The pairwise pass is O(m²) per cluster (~512 MB at m=8000), so it is sampleable — and the
+    sample must be seeded, or the reported validity would drift between identical runs."""
+    cfg = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+    X = _two_elongated_clusters()
+    labels = cluster_hdbscan(X, cfg)
+
+    first = density_validity_index(X, labels, sample_size=60, random_state=7)
+    second = density_validity_index(X, labels, sample_size=60, random_state=7)
+
+    if first is None:
+        pytest.skip("DBCV needs the standalone hdbscan package")
+    assert_that(first).is_equal_to(second)
 
 
 def test_run_clustering_tiny_input_does_not_crash() -> None:

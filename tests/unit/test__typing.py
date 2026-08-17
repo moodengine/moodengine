@@ -19,6 +19,7 @@ from moodengine import (
     ClusterMethod,
     ClusterMetrics,
     CoverageEntropyResult,
+    HDBSCANDetail,
     LayerWeighting,
     PoolingMode,
     ProjectionMethod,
@@ -32,6 +33,7 @@ from moodengine import (
 from moodengine.cluster import (
     _IdentityReducer,
     bootstrap_stability,
+    cluster_hdbscan_detailed,
     cluster_metrics,
     coverage_entropy,
     run_clustering,
@@ -118,6 +120,15 @@ def test_run_clustering_stamps_every_cluster_metrics_key() -> None:
     assert_that(set(metrics)).is_equal_to(set(ClusterMetrics.__annotations__))
 
 
+def test_hdbscan_detail_keys_match_the_typeddict() -> None:
+    rng = np.random.default_rng(4)
+    X = rng.standard_normal((40, 5)).astype(np.float32)
+
+    result = cluster_hdbscan_detailed(X, default_config())
+
+    assert_that(set(result)).is_equal_to(set(HDBSCANDetail.__annotations__))
+
+
 def test_coverage_entropy_keys_match_the_typeddict() -> None:
     result = coverage_entropy(np.array([0, 0, 1, -1]))
 
@@ -161,6 +172,7 @@ def test_typing_vocabulary_is_exported_from_the_package_root() -> None:
         "ClusterMetrics",
         "StabilityMetrics",
         "CoverageEntropyResult",
+        "HDBSCANDetail",
         "SubClusterResult",
     ):
         assert_that(moodengine.__all__).contains(name)
