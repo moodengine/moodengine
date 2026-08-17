@@ -90,6 +90,22 @@ class ClusterMetrics(TypedDict):
     structure: NotRequired[StructureVerdict | None]
 
 
+class HDBSCANDetail(TypedDict):
+    """Shape of :func:`moodengine.cluster.cluster_hdbscan_detailed` results.
+
+    The per-point diagnostics an HDBSCAN fit already computes and used to discard.
+    """
+
+    labels: NDArray[np.int_]
+    #: Membership strength of each point in its OWN cluster, 0.0 for noise.
+    probabilities: NDArray[np.float32]
+    #: GLOSH density-based outlier score per point, or ``None`` under the scikit-learn backend,
+    #: which does not expose it.
+    glosh: NDArray[np.float32] | None
+    #: Which implementation produced the partition — the two agree closely but not exactly.
+    backend: Literal["hdbscan", "sklearn", "none_tiny_input"]
+
+
 class ClusteringResult(TypedDict):
     """Shape of :func:`moodengine.cluster.run_clustering` results."""
 

@@ -24,6 +24,7 @@ from moodengine._typing import (
     ClusterMethod,
     ClusterMetrics,
     CoverageEntropyResult,
+    HDBSCANDetail,
     Reducer2D,
     StabilityMetrics,
     StructureVerdict,
@@ -170,41 +171,154 @@ def procrustes_disparity(A: np.ndarray, B: np.ndarray) -> "float | None":
         return None
 
 
+def _fit_hdbscan(X: np.ndarray, config: Config):
+    """Fit an HDBSCAN clusterer, returning ``(clusterer, backend)`` — the shared seam.
+
+    Split out so :func:`cluster_hdbscan` and :func:`cluster_hdbscan_detailed` fit ONE way. The
+    standalone ``hdbscan`` package is preferred over ``sklearn.cluster.HDBSCAN`` because it alone
+    exposes the per-point diagnostics the fit has already computed (see
+    :func:`cluster_hdbscan_detailed`); the two give close but not identical partitions, so which
+    one ran is logged rather than left to guesswork.
+    """
+    n_samples = X.shape[0]
+    # min_cluster_size must be >= 2 and cannot exceed the sample count.
+    min_cluster_size = max(2, min(config.hdbscan_min_cluster_size, n_samples))
+    try:
+        import hdbscan as _hdbscan
+
+        return (
+            _hdbscan.HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=config.hdbscan_min_samples,
+            ).fit(X),
+            "hdbscan",
+        )
+    except ImportError:
+        from sklearn.cluster import HDBSCAN
+
+        logger.info("hdbscan package unavailable; falling back to sklearn.cluster.HDBSCAN")
+        return (
+            HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=config.hdbscan_min_samples,
+            ).fit(X),
+            "sklearn",
+        )
+
+
 def cluster_hdbscan(X: np.ndarray, config: Config) -> np.ndarray:
     """Cluster ``X`` with HDBSCAN; ``-1`` marks noise.
 
     Uses ``config.hdbscan_min_cluster_size`` and ``config.hdbscan_min_samples``.
     Prefers the standalone ``hdbscan`` package and falls back to
     ``sklearn.cluster.HDBSCAN`` when it is unavailable. Returns integer labels
-    of shape (n,).
+    of shape (n,). :func:`cluster_hdbscan_detailed` returns the same labels plus the per-point
+    confidence and outlier scores the same fit already produced.
     """
     X = np.asarray(X, dtype=np.float32)
-    n_samples = X.shape[0]
     # Both HDBSCAN backends raise on a single sample (their nearest-neighbour
     # queries need >1 point). A lone point can never form a cluster of size >= 2,
     # so it is noise by definition; return all-noise without touching the backend.
-    if n_samples < 2:
-        return np.full(n_samples, -1, dtype=int)
-    # min_cluster_size must be >= 2 and cannot exceed the sample count.
-    min_cluster_size = max(2, min(config.hdbscan_min_cluster_size, n_samples))
+    if X.shape[0] < 2:
+        return np.full(X.shape[0], -1, dtype=int)
+    clusterer, _backend = _fit_hdbscan(X, config)
+    return np.asarray(clusterer.labels_, dtype=int)
+
+
+def cluster_hdbscan_detailed(X: np.ndarray, config: Config) -> HDBSCANDetail:
+    """Cluster ``X`` with HDBSCAN and return the per-point diagnostics the fit ALREADY computed.
+
+    Same partition as :func:`cluster_hdbscan` (same seam, same parameters), plus:
+
+    * ``probabilities`` ``(n,)`` — how strongly each track belongs to its own cluster, ``0.0`` for
+      noise. A track at 0.15 sits on its cluster's fringe; the bare label says nothing about that.
+    * ``glosh`` ``(n,)`` — the density-based local outlier score from the same fit, or ``None``
+      under the sklearn backend, which does not expose it. This is the honest outlier signal for
+      density clusters: :func:`outlier_scores` measures distance to a centroid, which presumes
+      globular clusters — the very assumption HDBSCAN exists to avoid — so the two disagree
+      exactly on the elongated or nested shapes HDBSCAN is chosen for.
+    * ``backend`` — which implementation ran, since the two give close but not identical
+      partitions.
+
+    Both arrays come free: the clusterer computes them during ``fit`` and they were being
+    discarded. Fewer than 2 samples yields all-noise, zero probabilities and ``glosh = None``.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n = X.shape[0]
+    if n < 2:
+        return {
+            "labels": np.full(n, -1, dtype=int),
+            "probabilities": np.zeros(n, dtype=np.float32),
+            "glosh": None,
+            "backend": "none_tiny_input",
+        }
+    clusterer, backend = _fit_hdbscan(X, config)
+    raw_glosh = getattr(clusterer, "outlier_scores_", None)
+    # sklearn's HDBSCAN carries an `outlier_scores_` attribute that is NOT the GLOSH array, so
+    # check the shape rather than mere presence before reporting it as one.
+    glosh = (
+        np.asarray(raw_glosh, dtype=np.float32)
+        if isinstance(raw_glosh, np.ndarray) and raw_glosh.shape == (n,)
+        else None
+    )
+    return {
+        "labels": np.asarray(clusterer.labels_, dtype=int),
+        "probabilities": np.asarray(clusterer.probabilities_, dtype=np.float32),
+        "glosh": glosh,
+        "backend": backend,
+    }
+
+
+def density_validity_index(
+    X: np.ndarray,
+    labels: np.ndarray,
+    *,
+    metric: str = "euclidean",
+    sample_size: int | None = None,
+    random_state: int | None = None,
+) -> float | None:
+    """DBCV — the density-based cluster-validity index, in ``[-1, 1]``. Higher is better.
+
+    The right internal index for a density-based partition, and the one :func:`cluster_metrics`
+    cannot give: silhouette rewards compact, roughly spherical clusters, so it penalises exactly
+    the elongated and nested shapes HDBSCAN is chosen to find. DBCV instead scores each cluster by
+    its internal density against the sparsest region separating it from its neighbours, so a long
+    thin but genuinely dense cluster scores well.
+
+    Computed over non-noise points only. Returns ``None`` when it cannot be measured — fewer than
+    2 clusters, fewer than 2 non-noise points, or the standalone ``hdbscan`` package absent (this
+    index is not in scikit-learn). Never raises.
+
+    **Memory envelope.** DBCV materializes a dense pairwise distance matrix per cluster, so a
+    single dominant cluster of ``m`` tracks costs ``m²`` float64 — around 512 MB at m = 8000.
+    Pass ``sample_size`` (with ``random_state`` to keep it reproducible) to cap that, and prefer
+    running it on the reduced clustering space rather than the full-width embeddings.
+    """
+    X = np.asarray(X, dtype=np.float64)  # the backend computes in float64 regardless
+    labels = np.asarray(labels, dtype=int)
+    mask = labels != -1
+    if int(mask.sum()) < 2 or len(set(labels[mask].tolist())) < 2:
+        return None
+
+    idx = np.flatnonzero(mask)
+    if sample_size is not None and 0 < int(sample_size) < idx.size:
+        rng = np.random.default_rng(random_state)
+        idx = np.sort(rng.choice(idx, size=int(sample_size), replace=False))
+        if len(set(labels[idx].tolist())) < 2:
+            return None  # the subsample collapsed onto one cluster — no separation to score
+
     try:
-        import hdbscan as _hdbscan
-
-        clusterer = _hdbscan.HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=config.hdbscan_min_samples,
-        )
+        from hdbscan.validity import validity_index
     except ImportError:
-        from sklearn.cluster import HDBSCAN
-
-        # The two backends give close but NOT identical partitions — say which one ran.
-        logger.info("hdbscan package unavailable; falling back to sklearn.cluster.HDBSCAN")
-        clusterer = HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=config.hdbscan_min_samples,
-        )
-    labels = clusterer.fit_predict(X)
-    return np.asarray(labels, dtype=int)
+        logger.info("DBCV needs the standalone hdbscan package (scikit-learn has no equivalent)")
+        return None
+    try:
+        return float(validity_index(X[idx], labels[idx], metric=metric))
+    except (ValueError, IndexError, MemoryError) as exc:
+        # Degenerate geometry (a cluster whose points coincide) makes the internal MST undefined;
+        # a validity number is diagnostic, so an absent one beats a raised one.
+        logger.info("DBCV could not be computed (%s)", exc)
+        return None
 
 
 def cluster_kmeans(X: np.ndarray, n_clusters: int, config: Config) -> np.ndarray:
