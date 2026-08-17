@@ -26,6 +26,7 @@ from moodengine._typing import (
     CoverageEntropyResult,
     Reducer2D,
     StabilityMetrics,
+    StructureVerdict,
     SubClusterResult,
 )
 from moodengine._validation import ensure_finite_2d
@@ -33,6 +34,12 @@ from moodengine.config import Config
 from moodengine.exceptions import MissingDependencyError
 
 logger = logging.getLogger(__name__)
+
+# Row cap for the original-space silhouette stamped onto every `run_clustering` result. Same
+# trade-off (and same value) as `select_kmeans_k`: the pass is O(n²·d) and costs minutes at 10k
+# tracks in 768 dims, while the verdict it feeds is a coarse three-band read that sampling does
+# not move. Seeded from `config.seed`, so the number stays reproducible.
+_SILHOUETTE_SAMPLE_CAP: int = 2000
 
 
 def reduce_umap(X: np.ndarray, n_components: int, config: Config) -> tuple[np.ndarray, object]:
@@ -461,7 +468,10 @@ def select_kmeans_k(
             # deterministic.
             scores[k] = float(
                 silhouette_score(
-                    X, labels, sample_size=min(n_samples, 2000), random_state=config.seed
+                    X,
+                    labels,
+                    sample_size=min(n_samples, _SILHOUETTE_SAMPLE_CAP),
+                    random_state=config.seed,
                 )
             )
         except Exception:
@@ -609,6 +619,14 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
     ``ValueError`` naming the offending rows, instead of a deep UMAP/sklearn
     error later).
 
+    **Reading the two silhouettes.** ``metrics['silhouette']`` scores the partition inside the
+    space it was produced in — the UMAP layout on the normal path, named by
+    ``metrics['silhouette_space']``. That space was fit to separate these very points, so the
+    number is circular: on 600 rows of structureless noise it reads ≈0.27 while HDBSCAN reports 19
+    clusters. ``metrics['silhouette_original']`` scores the SAME labels in the space the embeddings
+    actually live in (≈0.01 on that same noise), and ``metrics['structure']`` reads it as
+    ``'clustered'`` / ``'weak'`` / ``'none_detected'``. Act on those two, not on the first.
+
     Returns ``{'labels': (n,), 'coords2d': (n, 2), 'metrics': dict,
     'method': method}``.
     """
@@ -641,6 +659,32 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
     metrics = cluster_metrics(cluster_input, labels)
     metrics["reduction"] = "none_tiny_input" if tiny else "umap"
 
+    # Score the SAME labels in the original space too. `metrics["silhouette"]` is computed in
+    # whichever space the clustering ran in, which on the normal path is the UMAP layout — a space
+    # fit to separate these very points, so the number is circular and reads as real structure even
+    # on pure noise. The original-space score is the one a reader can act on, so it ships on every
+    # result rather than only inside `compare_spaces`, which was its sole caller.
+    metrics["silhouette_space"] = "original" if tiny else "reduced"
+    # Always computed through silhouette_original, INCLUDING on the tiny path where the two spaces
+    # coincide. Reusing metrics["silhouette"] there would look free but silently change the metric:
+    # cluster_metrics scores with sklearn's default euclidean, while structure_verdict's bands were
+    # calibrated on cosine. The verdict has to read the same quantity on every path.
+    metrics["silhouette_original"] = silhouette_original(
+        X, labels, sample_size=_SILHOUETTE_SAMPLE_CAP, random_state=config.seed
+    )
+    metrics["structure"] = structure_verdict(metrics["silhouette_original"])
+    if metrics["structure"] == "none_detected":
+        sil = metrics["silhouette"]
+        logger.warning(
+            "No substantial structure in the original space (silhouette_original=%.3f): the %d "
+            "cluster(s) reported here are largely an artifact of the %s reduction, and its own "
+            "silhouette (%s) is not evidence to the contrary.",
+            metrics["silhouette_original"],
+            metrics["n_clusters"],
+            "umap" if not tiny else "identity",
+            "n/a" if sil is None else f"{sil:.3f}",
+        )
+
     return {
         "labels": np.asarray(labels, dtype=int),
         "coords2d": np.asarray(coords2d, dtype=np.float32),
@@ -649,12 +693,22 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
     }
 
 
-def silhouette_original(X: np.ndarray, labels: np.ndarray, metric: str = "cosine") -> float | None:
+def silhouette_original(
+    X: np.ndarray,
+    labels: np.ndarray,
+    metric: str = "cosine",
+    *,
+    sample_size: int | None = None,
+    random_state: int | None = None,
+) -> float | None:
     """Silhouette score on the ORIGINAL (pre-UMAP) embedding space.
 
     Computed over non-noise points only (label != -1) using ``metric`` (cosine
     by default). Requires >= 2 distinct non-noise clusters and >= 2 non-noise
     samples, else returns ``None``. Never raises on degenerate input.
+
+    ``sample_size`` caps the O(n²·d) pairwise pass the way :func:`select_kmeans_k` already does;
+    pass ``random_state`` alongside it to keep the estimate deterministic.
     """
     X = np.asarray(X, dtype=np.float32)
     labels = np.asarray(labels, dtype=int)
@@ -663,10 +717,42 @@ def silhouette_original(X: np.ndarray, labels: np.ndarray, metric: str = "cosine
     lab_nn = labels[mask]
     if lab_nn.size < 2 or len(set(lab_nn.tolist())) < 2:
         return None
+    kwargs: dict[str, object] = {}
+    if sample_size is not None and int(sample_size) < lab_nn.size:
+        kwargs = {"sample_size": int(sample_size), "random_state": random_state}
     try:
-        return float(silhouette_score(X_nn, lab_nn, metric=metric))
+        return float(silhouette_score(X_nn, lab_nn, metric=metric, **kwargs))
     except Exception:  # never raise on degenerate input
         return None
+
+
+# Bands for :func:`structure_verdict`, on the ORIGINAL-space cosine silhouette. The upper bound is
+# Kaufman & Rousseeuw's (1990) classic reading — at or below ~0.25 a partition shows "no
+# substantial structure". The lower bound is measured on this pipeline: 600 rows of structureless
+# isotropic noise score 0.011 in the original space (while the UMAP-space silhouette reads 0.275),
+# and six planted blobs score 0.038 at a separation too small to resolve, 0.184 at the first
+# separation HDBSCAN recovers cleanly. So 0.05 sits in the gap between "nothing is there" and
+# "something diffuse is there", and only that degenerate end warns — a music library legitimately
+# sits in the weak band, and a flag that cried wolf there would be ignored where it matters.
+_STRUCTURE_NONE_MAX: float = 0.05
+_STRUCTURE_WEAK_MAX: float = 0.25
+
+
+def structure_verdict(silhouette_orig: float | None) -> StructureVerdict | None:
+    """Read an original-space silhouette as ``'none_detected'`` / ``'weak'`` / ``'clustered'``.
+
+    The reduced-space silhouette cannot answer this question: measured on this pipeline it reads
+    0.275 on pure noise and saturates near 0.96 well before the clusters are actually separable,
+    because UMAP is fit to make exactly that partition look good. ``None`` in (fewer than two
+    clusters, or undefined) gives ``None`` out — an absence of measurement, never a verdict.
+    """
+    if silhouette_orig is None or not np.isfinite(silhouette_orig):
+        return None
+    if silhouette_orig <= _STRUCTURE_NONE_MAX:
+        return "none_detected"
+    if silhouette_orig <= _STRUCTURE_WEAK_MAX:
+        return "weak"
+    return "clustered"
 
 
 def cluster_medoids(X: np.ndarray, labels: np.ndarray) -> dict[int, int]:

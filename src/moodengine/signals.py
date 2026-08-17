@@ -4,8 +4,9 @@ Pure numpy + librosa, torch-free and deterministic (no unseeded RNG). Given an a
 waveform, :func:`extract_signals` returns a :class:`SignalSet`:
 
   * **Tempo** via ``librosa.beat.beat_track`` (onset-envelope + dynamic-programming beat tracking):
-    a global BPM (octave-folded into a musical range), a real confidence (onset-autocorrelation peak
-    at the beat lag), a stability flag (regularity of the inter-beat interval) and the beat grid.
+    a global BPM (octave-folded into a musical range), a real confidence (mean-centered
+    onset-autocorrelation at the beat lag), a stability flag (that confidence plus a regular
+    inter-beat interval) and the beat grid.
   * **Key** via **Krumhansl-Schmuckler**: the mean chromagram correlated against the 24 rotated
     major/minor key profiles → tonic + mode → **Camelot** code (``8B`` = C major, ``8A`` = A minor).
 
@@ -34,6 +35,11 @@ _CHROMA_SR: int = 22_050  # key estimation resamples here (chroma_cqt's natural 
 _TEMPO_LO: float = 70.0
 _TEMPO_HI: float = 180.0
 _STABILITY_CV: float = 0.10  # inter-beat-interval coefficient-of-variation threshold for "stable"
+# Confidence a beat grid must clear before "stable" means anything (see _tempo_stability). Placed
+# in the empty band of a measured battery: click tracks, clean or noisy, score >= 0.70, while
+# white noise, a noisy drone and heavily-jittered clicks all score <= 0.11. Nothing observed lands
+# between, so the exact value inside that gap is not load-bearing.
+_STABILITY_MIN_CONFIDENCE: float = 0.20
 
 _PITCH_CLASSES: tuple[str, ...] = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
@@ -63,8 +69,11 @@ _MAJOR_CAMELOT_NUM: dict[int, int] = {
 class TempoEstimate:
     """Real tempo readout. ``bpm`` is octave-folded into ``[70, 180)``, or ``None`` when tempo
     could not be measured (signal too short, no valid raw tempo) — a successful estimate never
-    carries ``None``, and a failed one has ``confidence == 0.0``. ``confidence`` and ``stability``
-    are genuine measurements; ``beat_times`` is the beat grid in seconds."""
+    carries ``None``, and a failed one has ``confidence == 0.0``. ``confidence`` is the
+    mean-centered onset autocorrelation at the beat lag, so it reads near 0 on material with no
+    real pulse (ambient, drone, noise) even when ``bpm`` still names a number — read it before
+    trusting the BPM. ``stability`` requires that confidence AND a regular beat grid.
+    ``beat_times`` is the beat grid in seconds."""
 
     bpm: float | None
     confidence: float
@@ -109,12 +118,24 @@ def _fold_octave(bpm: float, lo: float = _TEMPO_LO, hi: float = _TEMPO_HI) -> fl
 
 
 def _tempo_confidence(onset_env: np.ndarray, sr: int, raw_bpm: float) -> float:
-    """Onset-autocorrelation peak at the (raw, un-folded) beat lag, in [0, 1]. Real sharpness."""
+    """Onset-autocorrelation peak at the (raw, un-folded) beat lag, in [0, 1]. Real sharpness.
+
+    The envelope is MEAN-CENTERED first, and that subtraction is the whole measurement.
+    ``librosa.autocorrelate`` does not center, and ``onset_strength`` is non-negative with a large
+    DC term, so on the raw envelope ``ac[lag] / ac[0]`` reduces to ``(m² + cov) / (m² + σ²)`` — a
+    ratio dominated by the mean, not by periodicity. Un-centered, white noise scored 0.94 (above a
+    perfect 120 BPM click track at 0.73) while reporting a fabricated 126.7 BPM: the metric ranked
+    its own meaningless readouts highest, which is worse than not reporting one. Centering makes
+    ``ac[0]`` the variance, so the ratio is the true autocorrelation coefficient and white noise
+    scores 0.00. Negative correlation (anti-phase at the tested lag) clips to 0 — it is evidence
+    against this beat period, not evidence of one.
+    """
     if raw_bpm <= 0 or onset_env.size < 4:
         return 0.0
-    ac = librosa.autocorrelate(onset_env, max_size=onset_env.size)
+    centered = np.asarray(onset_env, dtype=np.float32) - float(np.mean(onset_env))
+    ac = librosa.autocorrelate(centered, max_size=centered.size)
     ac0 = float(ac[0])
-    if ac0 <= 0:
+    if ac0 <= 0:  # a constant envelope (silence, pure sustained tone) has no variance to correlate
         return 0.0
     ac = ac / ac0  # lag-0 == 1
     lag = int(round((60.0 / raw_bpm) * sr / _HOP_LENGTH))  # one beat period, in onset frames
@@ -123,9 +144,23 @@ def _tempo_confidence(onset_env: np.ndarray, sr: int, raw_bpm: float) -> float:
     return float(np.clip(ac[lag], 0.0, 1.0))
 
 
-def _tempo_stability(beat_times: list[float], cv_threshold: float = _STABILITY_CV) -> bool:
-    """True when the inter-beat interval is regular (coeff. of variation below ``cv_threshold``)."""
-    if len(beat_times) < 3:
+def _tempo_stability(
+    beat_times: list[float],
+    confidence: float,
+    cv_threshold: float = _STABILITY_CV,
+    confidence_floor: float = _STABILITY_MIN_CONFIDENCE,
+) -> bool:
+    """True when the beat grid is regular AND that grid is backed by real periodicity.
+
+    Grid regularity alone cannot answer this. ``beat_track``'s dynamic program carries a
+    ``tightness`` prior that pulls toward an evenly-spaced grid, so it emits a near-uniform one
+    whatever the audio is: measured across a battery of synthetic signals, EVERY analysable input
+    — white noise and a stationary drone included — cleared the ``cv_threshold`` test, making the
+    flag true by construction rather than by measurement. So the interval regularity is now
+    necessary but not sufficient; the beat period must also be visible in the onset
+    autocorrelation (see :func:`_tempo_confidence`).
+    """
+    if len(beat_times) < 3 or not np.isfinite(confidence) or confidence < confidence_floor:
         return False
     ibi = np.diff(np.asarray(beat_times, dtype=float))
     mean = float(ibi.mean())
@@ -163,10 +198,11 @@ def estimate_tempo(y: np.ndarray, sr: int) -> TempoEstimate:
     # Prefer the beat-grid mean IBI (accurate to the metronome) over beat_track's prior-biased
     # tempo scalar; fall back to that scalar when there are too few beats to measure an interval.
     raw_bpm = _bpm_from_beats(beat_times) or float(np.atleast_1d(tempo)[0])
+    confidence = _tempo_confidence(onset_env, sr, raw_bpm)
     return TempoEstimate(
         bpm=_fold_octave(raw_bpm),
-        confidence=_tempo_confidence(onset_env, sr, raw_bpm),
-        stability=_tempo_stability(beat_times),
+        confidence=confidence,
+        stability=_tempo_stability(beat_times, confidence),
         beat_times=beat_times,
     )
 

@@ -10,21 +10,42 @@ cold-start has exactly no effect. Every entry point guards empty matrices rather
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from numpy.typing import NDArray
 
 from moodengine._math import l2_normalize as _l2_normalize
 from moodengine._validation import ensure_finite_2d
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BETA: float = 5.0
 DEFAULT_ALPHA: float = 1.0
 
 _EPS: float = 1e-8
 _LOGIT_CLAMP: float = 6.0  # finite saturated logit for a degenerate (single-class) OvR column
+# Regularization grid swept per mood when `C is None`. Spans the range the frozen-feature
+# linear-probe protocol sweeps; 17 points at ~1 decade every 2 steps is dense enough to find the
+# validation curve's plateau, and the whole sweep is milliseconds at these sample sizes.
+#
+# DESCENDING on purpose. Well-separated moods score a perfect average precision at every C, and
+# scikit-learn's search resolves a tie by keeping the FIRST candidate — so an ascending grid hands
+# back the most-regularized fit of the plateau. Measured on 4 separable moods that meant ‖W‖ ≈
+# 0.005 and logits inside ±0.005: the ranking was still perfect, but these logits are added to the
+# zero-shot prior before the softmax, so a column that small contributes nothing and the
+# personalization silently does not happen. Ties must therefore break toward the LARGEST C.
+_PROBE_C_GRID: tuple[float, ...] = tuple(float(c) for c in np.logspace(4, -4, 17))
+_PROBE_MAX_FOLDS: int = 5
+# Fraction of the MLP's training rows held out to early-stop on. Small heads on a few dozen rows
+# reach zero training loss long before the epoch budget runs out; without a held-out signal the
+# extra epochs are pure memorization.
+_MLP_VAL_FRACTION: float = 0.2
+_MLP_PATIENCE: int = 30
 
 
 def tip_adapter_affinities(
@@ -134,7 +155,14 @@ class ProbeHead:
     ``(n_moods,)`` (``hidden`` is ``None``); ``method='mlp'`` carries a one-hidden-layer forward pass
     in ``hidden = (W1 (d,h), b1 (h,), W2 (h,n_moods), b2 (n_moods,))`` and leaves ``W``/``b`` zeroed
     (unused). Pure data — no I/O, no algorithm; :func:`predict_probe` reads it,
-    :func:`probe_state` / :func:`save_probe` persist it."""
+    :func:`probe_state` / :func:`save_probe` persist it.
+
+    ``cv_score`` ``(n_moods,)`` float32 is the held-out average precision each mood's column
+    reached while fitting, or ``nan`` where it could not be estimated (a degenerate column, or too
+    few positives to stratify a split). It exists so a caller can REFUSE to blend a column that did
+    not beat chance: a head fit on a handful of examples reaches training accuracy 1.0 while
+    generalizing at chance, and without this field nothing in the result says so. The reference
+    point is that mood's positive rate — average precision scores against exactly that."""
 
     mood_names: list[str]
     W: np.ndarray  # (n_moods, d) OvR linear weights; float32
@@ -142,6 +170,7 @@ class ProbeHead:
     method: str  # "linear" | "mlp"
     hidden: tuple[np.ndarray, ...] | None  # (W1, b1, W2, b2) for "mlp", else None
     dim: int  # d — input-width guard for predict_probe
+    cv_score: NDArray[np.float32]  # (n_moods,) held-out AP per mood; nan where unmeasurable
 
 
 def fit_linear_probe(
@@ -150,7 +179,7 @@ def fit_linear_probe(
     mood_names: list[str],
     *,
     method: str = "linear",
-    C: float = 1.0,
+    C: float | None = None,
     seed: int = 0,
 ) -> ProbeHead:
     """Fit a One-vs-Rest multi-label classifier on frozen CLAP embeddings — the linear probe.
@@ -164,14 +193,24 @@ def fit_linear_probe(
     beyond the gold set.
 
     ``X`` ``(n, d)`` are L2-normalized frozen CLAP embeddings; ``Y`` ``(n, n_moods)`` are multi-hot
-    OvR targets in ``{0,1}`` aligned to ``mood_names``. ``C`` is the inverse L2-regularization
-    strength; ``seed`` fixes the (torch) MLP init. Returns a :class:`ProbeHead` whose logits align to
-    ``mood_names``.
+    OvR targets in ``{0,1}`` aligned to ``mood_names``. ``seed`` fixes the (torch) MLP init. Returns
+    a :class:`ProbeHead` whose logits align to ``mood_names``.
 
-    ``linear`` is fit with ``sklearn.linear_model.LogisticRegression`` (OvR, per mood; cross-platform
-    wheels, deterministic — no ``random_state`` needed for the ``lbfgs`` solver) — no torch. A
-    degenerate column (a mood present in every / no training row) gets a constant saturated bias
-    (``±_LOGIT_CLAMP``) instead of a fit. ``mlp`` imports ``torch`` LAZILY inside its branch only.
+    ``C`` is the inverse L2-regularization strength. The default ``None`` SWEEPS it per mood by
+    stratified cross-validation on average precision and records the winning fold score in
+    ``ProbeHead.cv_score``; pass a float to pin one value and skip the sweep (``cv_score`` is then
+    ``nan`` — nothing was held out to measure). Sweeping is the default because a single fixed ``C``
+    on a few dozen 512-d frozen embeddings memorizes the training set, and no field of the result
+    said so. Every column is class-balanced, which is what stops a mood held by a handful of tracks
+    from getting an intercept no input can overcome.
+
+    ``linear`` is fit with ``sklearn.linear_model.LogisticRegression`` /
+    ``LogisticRegressionCV`` (OvR, per mood; cross-platform wheels, deterministic — the ``lbfgs``
+    solver needs no ``random_state``, and the fold shuffle is seeded) — no torch. A degenerate
+    column (a mood present in every / no training row) gets a constant saturated bias
+    (``±_LOGIT_CLAMP``) instead of a fit; a column with fewer than 2 positives (or 2 negatives)
+    cannot be split, so it is fit unswept at ``C=1.0``, logged, and left with ``cv_score = nan``.
+    ``mlp`` imports ``torch`` LAZILY inside its branch only.
     Raises ``ValueError`` on ``n < 2``, ``n_moods < 2``, mis-shaped inputs, or a ``mood_names`` length
     mismatch. Inputs are never mutated."""
     Y = np.asarray(Y, dtype=np.float32)
@@ -189,22 +228,35 @@ def fit_linear_probe(
     if len(mood_names) != n_moods:
         raise ValueError("mood_names must align with Y columns")
     if method == "mlp":
-        return _fit_probe_mlp(X, Y, list(mood_names), C=float(C), seed=int(seed))
+        return _fit_probe_mlp(X, Y, list(mood_names), C=C, seed=int(seed))
     if method != "linear":
         raise ValueError(f"unknown method {method!r} (expected 'linear' | 'mlp')")
-    return _fit_probe_linear(X, Y, list(mood_names), C=float(C))
+    return _fit_probe_linear(X, Y, list(mood_names), C=C)
 
 
 def _fit_probe_linear(
-    X: np.ndarray, Y: np.ndarray, mood_names: list[str], *, C: float
+    X: np.ndarray, Y: np.ndarray, mood_names: list[str], *, C: float | None
 ) -> ProbeHead:
-    """OvR logistic regression per mood (numpy-in/out; torch-free)."""
+    """OvR logistic regression per mood (numpy-in/out; torch-free).
+
+    Two departures from a plain per-column ``LogisticRegression(C=1.0)``, both aimed at the same
+    failure: on a few dozen 512-d frozen embeddings that fit reaches training accuracy 1.0 at
+    cross-validated accuracy ~0.35, and a mood holding 6 of 48 rows gets an intercept so negative
+    that no point on the unit sphere can reach a positive logit — so teaching a rare mood makes
+    the engine LESS likely to say it. ``class_weight='balanced'`` removes the majority's grip on
+    the intercept, and sweeping ``C`` by stratified cross-validation on average precision picks
+    the regularization strength instead of assuming one. Both are what the frozen-feature
+    linear-probe protocol does; only the model class had been borrowed.
+    """
     from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold
 
     n, d = X.shape
     n_moods = len(mood_names)
     W = np.zeros((n_moods, d), dtype=np.float32)
     b = np.zeros((n_moods,), dtype=np.float32)
+    cv_score = np.full((n_moods,), np.nan, dtype=np.float32)
+
     for j in range(n_moods):
         yj = (Y[:, j] > 0.5).astype(np.int64)
         pos = int(yj.sum())
@@ -214,12 +266,54 @@ def _fit_probe_linear(
         if pos == n:  # mood always positive -> constant "yes" logit
             b[j] = np.float32(_LOGIT_CLAMP)
             continue
-        clf = LogisticRegression(C=C, max_iter=1000, solver="lbfgs")
-        clf.fit(X, yj)
+
+        # Stratified folds need both classes on both sides of every split, so the fold count is
+        # bounded by the SMALLER class. Below 2 there is no honest split to make.
+        n_folds = min(_PROBE_MAX_FOLDS, pos, n - pos)
+        if C is None and n_folds >= 2:
+            # GridSearchCV rather than LogisticRegressionCV: the latter reports its fold scores
+            # through `scores_`/`Cs_`/`C_`, attributes sklearn is actively reshaping, whereas
+            # `best_score_` is the stable, documented way to read "mean held-out score at the
+            # selected parameter" — and it is exactly the number cv_score promises.
+            search = GridSearchCV(
+                LogisticRegression(max_iter=1000, solver="lbfgs", class_weight="balanced"),
+                param_grid={"C": list(_PROBE_C_GRID)},
+                cv=StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=0),
+                scoring="average_precision",
+                refit=True,
+            )
+            search.fit(X, yj)
+            clf = search.best_estimator_
+            cv_score[j] = np.float32(search.best_score_)
+        else:
+            if C is None:
+                # Too few positives to split. Fit anyway (the column still carries a usable
+                # ranking) but leave cv_score as nan so the caller can see it is unvalidated.
+                logger.info(
+                    "Mood %r has %d positive example(s) in %d rows — too few to cross-validate; "
+                    "fitting at C=1.0 and leaving cv_score=nan.",
+                    mood_names[j],
+                    pos,
+                    n,
+                )
+            clf = LogisticRegression(
+                C=1.0 if C is None else float(C),
+                max_iter=1000,
+                solver="lbfgs",
+                class_weight="balanced",
+            )
+            clf.fit(X, yj)
         W[j] = clf.coef_[0].astype(np.float32)
         b[j] = np.float32(clf.intercept_[0])
+
     return ProbeHead(
-        mood_names=list(mood_names), W=W, b=b, method="linear", hidden=None, dim=int(d)
+        mood_names=list(mood_names),
+        W=W,
+        b=b,
+        method="linear",
+        hidden=None,
+        dim=int(d),
+        cv_score=cv_score,
     )
 
 
@@ -228,14 +322,28 @@ def _fit_probe_mlp(
     Y: np.ndarray,
     mood_names: list[str],
     *,
-    C: float,
+    C: float | None,
     seed: int,
     hidden_dim: int = 128,
     epochs: int = 300,
     lr: float = 1e-2,
 ) -> ProbeHead:
     """One-hidden-layer MLP head via torch (imported lazily — the ONLY torch use in this module).
-    The fitted weights are returned as numpy so :func:`predict_probe` stays torch-free at inference."""
+    The fitted weights are returned as numpy so :func:`predict_probe` stays torch-free at inference.
+
+    Trained with **AdamW**, not Adam: the ``weight_decay`` here is the head's only regularizer, and
+    Adam folds it into the gradient where the adaptive per-parameter scaling then rescales it away
+    — decoupled decay (AdamW) is the pairing that makes the ``1/C`` strength mean what it says.
+
+    A random 20 % slice is held out to early-stop on — NOT stratified: ``Y`` is multi-label, so
+    there is no single class to stratify by, and a rare mood can land wholly inside or outside the
+    holdout (scoring ``nan`` there). Without a holdout the epoch budget is spent long after the
+    training loss hits zero, which on a few dozen rows is pure memorization; the held-out BCE
+    drives the early stop, the best-validation weights are restored at the end, and ``cv_score``
+    then reports average precision per mood on that same holdout. A holdout needs at least one
+    validation row and two training rows, so it is active from ``n == 3``; below that the full
+    budget runs on every row and ``cv_score`` stays ``nan``.
+    """
     import torch
 
     torch.manual_seed(int(seed))
@@ -243,20 +351,58 @@ def _fit_probe_mlp(
     n_moods = len(mood_names)
     Xt = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
     Yt = torch.from_numpy(np.ascontiguousarray(Y, dtype=np.float32))
+
+    n_val = int(round(n * _MLP_VAL_FRACTION))
+    holdout = n_val >= 1 and n - n_val >= 2
+    if holdout:
+        perm = np.random.default_rng(int(seed)).permutation(n)
+        val_idx = np.asarray(perm[:n_val], dtype=np.int64)
+        tr_idx = np.asarray(perm[n_val:], dtype=np.int64)
+    else:
+        val_idx = np.empty((0,), dtype=np.int64)
+        tr_idx = np.arange(n, dtype=np.int64)
+    Xtr, Ytr = Xt[tr_idx], Yt[tr_idx]
+
     model = torch.nn.Sequential(
         torch.nn.Linear(d, hidden_dim),
         torch.nn.ReLU(),
         torch.nn.Linear(hidden_dim, n_moods),
     )
-    weight_decay = 1.0 / (2.0 * max(C, _EPS) * n)  # L2 ∝ 1/C
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    c_eff = 1.0 if C is None else float(C)
+    weight_decay = 1.0 / (2.0 * max(c_eff, _EPS) * max(len(tr_idx), 1))  # L2 ∝ 1/C
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    model.train()
+
+    best_val = float("inf")
+    best_state: dict | None = None
+    since_improved = 0
     for _ in range(int(epochs)):
+        model.train()
         opt.zero_grad()
-        loss_fn(model(Xt), Yt).backward()
+        loss_fn(model(Xtr), Ytr).backward()
         opt.step()
+        if not holdout:
+            continue
+        model.eval()
+        with torch.no_grad():
+            val_loss = float(loss_fn(model(Xt[val_idx]), Yt[val_idx]))
+        if val_loss < best_val - 1e-6:
+            best_val, since_improved = val_loss, 0
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:
+            since_improved += 1
+            if since_improved >= _MLP_PATIENCE:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
     model.eval()
+    cv_score = np.full((n_moods,), np.nan, dtype=np.float32)
+    if holdout:
+        with torch.no_grad():
+            val_logits = model(Xt[val_idx]).numpy()
+        cv_score = _per_mood_average_precision(val_logits, Y[val_idx])
+
     lin1, lin2 = model[0], model[2]
     hidden = (
         lin1.weight.detach().numpy().T.astype(np.float32),  # W1 (d, h)
@@ -273,7 +419,23 @@ def _fit_probe_mlp(
         method="mlp",
         hidden=hidden,
         dim=int(d),
+        cv_score=cv_score,
     )
+
+
+def _per_mood_average_precision(logits: np.ndarray, Y: np.ndarray) -> NDArray[np.float32]:
+    """Per-column held-out average precision — ``nan`` for a column with no positive or no negative
+    in the holdout, where AP is undefined rather than zero."""
+    from sklearn.metrics import average_precision_score
+
+    scores = np.asarray(logits, dtype=np.float64)
+    targets = (np.asarray(Y, dtype=np.float32) > 0.5).astype(np.int64)
+    out = np.full((targets.shape[1],), np.nan, dtype=np.float32)
+    for j in range(targets.shape[1]):
+        col = targets[:, j]
+        if 0 < int(col.sum()) < col.size:
+            out[j] = np.float32(average_precision_score(col, scores[:, j]))
+    return out
 
 
 def predict_probe(head: ProbeHead, X: np.ndarray) -> np.ndarray:
@@ -511,6 +673,10 @@ def probe_state(head: ProbeHead) -> dict[str, np.ndarray]:
     * ``"has_hidden"`` — 0-d bool, whether the four MLP arrays follow.
     * ``"hidden0"`` .. ``"hidden3"`` — float32 ``W1 (dim, h)``, ``b1 (h,)``, ``W2 (h, n_moods)``,
       ``b2 (n_moods,)``, in that order; present only when ``head.hidden`` is not ``None``.
+    * ``"cv_score"`` — ``(n_moods,)`` float32 held-out average precision per mood, ``nan`` where
+      unmeasurable. OPTIONAL on read: a state written before this key existed loads with all-``nan``
+      rather than failing, because "no validation score was recorded" is exactly what such a head
+      carries — the schema tag stays ``/1`` for that reason.
 
     The head is never mutated. Round-trip law: ``probe_from_state(probe_state(h))`` equals ``h``
     field for field, arrays byte-identical."""
@@ -522,6 +688,7 @@ def probe_state(head: ProbeHead) -> dict[str, np.ndarray]:
         "method": np.array(head.method),
         "dim": np.array(head.dim, dtype=np.int64),
         "has_hidden": np.array(head.hidden is not None),
+        "cv_score": np.ascontiguousarray(head.cv_score, dtype=np.float32),
     }
 
     if head.hidden is not None:
@@ -613,7 +780,27 @@ def probe_from_state(state: Mapping[str, np.ndarray]) -> ProbeHead:
             f"W has {W.shape[1]} columns but dim is {dim} (expected one column per input feature)"
         )
 
-    return ProbeHead(mood_names=mood_names, W=W, b=b, method=method, hidden=hidden, dim=dim)
+    # Optional by design (see probe_state): a pre-cv_score state is not corrupt, it simply never
+    # measured one, and all-nan says that faithfully. A present-but-mis-sized array IS corrupt.
+    if "cv_score" in state:
+        cv_score = np.asarray(state["cv_score"], dtype=np.float32).reshape(-1)
+        if cv_score.shape != (len(mood_names),):
+            raise ValueError(
+                f"cv_score has shape {cv_score.shape} but mood_names lists {len(mood_names)} moods "
+                "(expected one held-out score per mood)"
+            )
+    else:
+        cv_score = np.full((len(mood_names),), np.nan, dtype=np.float32)
+
+    return ProbeHead(
+        mood_names=mood_names,
+        W=W,
+        b=b,
+        method=method,
+        hidden=hidden,
+        dim=dim,
+        cv_score=cv_score,
+    )
 
 
 def projection_state(proj: Projection) -> dict[str, np.ndarray]:

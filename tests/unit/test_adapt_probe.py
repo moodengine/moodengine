@@ -66,6 +66,116 @@ def test_linear_probe_fits_separable_data():
     assert_that(_macro_f1(Y, logits)).is_greater_than(0.9)  # generalizes the zero-shot prior
 
 
+def _imbalanced_dataset(counts, d=512, noise=0.6, seed=0):
+    """Single-label data with a deliberately RARE last class, at CLAP's real width.
+
+    The dimensionality matters: the rare-mood collapse this guards against does not appear on
+    low-dimensional, cleanly-separated toy data — it needs the wide, overlapping geometry of frozen
+    512-d embeddings, which is the regime the probe actually runs in.
+    """
+    rng = np.random.default_rng(seed)
+    centers = _l2(rng.standard_normal((len(counts), d)))
+    X_rows, y_idx = [], []
+    for j, count in enumerate(counts):
+        X_rows.append(centers[j] + noise * rng.standard_normal((count, d)))
+        y_idx.extend([j] * count)
+    X = _l2(np.vstack(X_rows))
+    y_idx = np.array(y_idx)
+    Y = np.zeros((X.shape[0], len(counts)), dtype=np.float32)
+    Y[np.arange(X.shape[0]), y_idx] = 1.0
+    return X, Y, [f"m{j}" for j in range(len(counts))], y_idx
+
+
+def test_linear_probe_rare_mood_can_still_win_the_argmax():
+    """Teaching a rare mood must not SUPPRESS it. Fitting each One-vs-Rest column unweighted gave
+    the 6-of-48 mood an intercept around -2.0 against a weight norm of ~2, i.e. a maximum
+    achievable logit below zero — it was never the argmax, not even on its own tracks (0/6), so
+    the personalization did the opposite of what the user asked. Class balancing removes the
+    majority's grip on that intercept."""
+    X, Y, moods, _ = _imbalanced_dataset([14, 14, 14, 6])
+    rare = len(moods) - 1
+    rare_rows = slice(14 * 3, None)
+
+    logits = predict_probe(fit_linear_probe(X, Y, moods, method="linear"), X)
+
+    wins = int((logits.argmax(axis=1)[rare_rows] == rare).sum())
+    assert_that(wins).is_equal_to(6)  # every one of its own tracks, not zero
+
+
+def test_linear_probe_keeps_a_usable_logit_scale_on_separable_data():
+    """A tie-break trap, not a hypothetical: every ``C`` scores a perfect average precision on
+    well-separated moods, and sklearn resolves a tie by keeping the FIRST grid candidate. With an
+    ascending grid that is the most-regularized fit — weights shrank to ‖W‖ ≈ 0.005 and every
+    logit landed inside ±0.005. The ranking stayed perfect, so an argmax-only assertion passes
+    while the probe is in fact inert: these logits are ADDED to the zero-shot prior, and a column
+    that small changes nothing. Assert the scale, not just the order."""
+    X, Y, moods = _separable_dataset(seed=1)
+
+    head = fit_linear_probe(X, Y, moods, method="linear")
+
+    assert_that(float(np.linalg.norm(head.W, axis=1).mean())).is_greater_than(1.0)
+    assert_that(_macro_f1(Y, predict_probe(head, X))).is_greater_than(0.9)
+
+
+def test_linear_probe_reports_held_out_score_per_mood():
+    """The head used to report nothing about its own generalization, so a memorizing fit was
+    indistinguishable from a good one. ``cv_score`` is that missing number."""
+    X, Y, moods = _separable_dataset(seed=1)
+
+    head = fit_linear_probe(X, Y, moods, method="linear")
+
+    assert_that(head.cv_score.shape).is_equal_to((len(moods),))
+    assert_that(head.cv_score.dtype).is_equal_to(np.float32)
+    assert_that(bool(np.all(np.isfinite(head.cv_score)))).is_true()
+    assert_that(float(head.cv_score.min())).is_greater_than(0.9)  # separable data: near-perfect AP
+
+
+def test_linear_probe_pinned_C_skips_the_sweep_and_reports_no_score():
+    """An explicit ``C`` is an opt-out of validation, so there is no held-out number to report —
+    ``nan`` says that, rather than a fabricated score."""
+    X, Y, moods = _separable_dataset(seed=1)
+
+    head = fit_linear_probe(X, Y, moods, method="linear", C=1.0)
+
+    assert_that(bool(np.all(np.isnan(head.cv_score)))).is_true()
+
+
+def test_linear_probe_single_positive_column_is_fit_but_unscored():
+    """One positive example cannot be stratified across folds. The column is still fit (its
+    ranking is usable) but must carry ``nan`` rather than an unvalidated score."""
+    X, Y, moods = _separable_dataset(n_per=10, seed=4)
+    Y[:, 0] = 0.0
+    Y[0, 0] = 1.0  # exactly one positive for mood 0
+
+    head = fit_linear_probe(X, Y, moods, method="linear")
+
+    assert_that(bool(np.isnan(head.cv_score[0]))).is_true()
+    assert_that(bool(np.any(head.W[0] != 0.0))).is_true()  # fit happened anyway
+
+
+def test_probe_state_without_cv_score_loads_as_unmeasured():
+    """A head persisted before ``cv_score`` existed is not corrupt — it genuinely carries no
+    validation score, and all-nan is the faithful reading. Dropping the key must not raise."""
+    X, Y, moods = _separable_dataset(seed=1)
+    state = dict(probe_state(fit_linear_probe(X, Y, moods, method="linear")))
+    del state["cv_score"]
+
+    restored = probe_from_state(state)
+
+    assert_that(restored.cv_score.shape).is_equal_to((len(moods),))
+    assert_that(bool(np.all(np.isnan(restored.cv_score)))).is_true()
+
+
+def test_probe_state_mis_sized_cv_score_raises():
+    """Present but wrong-length IS corrupt, unlike absent — it must fail loudly at load."""
+    X, Y, moods = _separable_dataset(seed=1)
+    state = dict(probe_state(fit_linear_probe(X, Y, moods, method="linear")))
+    state["cv_score"] = state["cv_score"][:-1]
+
+    with pytest.raises(ValueError, match=r"cv_score has shape.*one held-out score per mood"):
+        probe_from_state(state)
+
+
 def test_linear_probe_is_deterministic():
     X, Y, moods = _separable_dataset(seed=2)
     a = fit_linear_probe(X, Y, moods, method="linear", seed=7)
@@ -117,6 +227,44 @@ def test_mlp_probe_fits_and_predicts_torch_free_inference():
     logits = predict_probe(head, X)  # pure numpy forward pass (no torch)
     assert_that(logits.shape).is_equal_to(Y.shape)
     assert_that(_macro_f1(Y, logits)).is_greater_than(0.9)
+
+
+def test_mlp_probe_reports_held_out_score_when_a_holdout_exists():
+    """The MLP head gained the same honesty contract as the linear one: a slice is held out to
+    early-stop on, and ``cv_score`` reports average precision there. Untested, three claims in its
+    docstring had already drifted from the code."""
+    pytest.importorskip("torch")
+    X, Y, moods = _separable_dataset(n_per=10, seed=8)  # 40 rows -> an 8-row holdout
+
+    head = fit_linear_probe(X, Y, moods, method="mlp", seed=0)
+
+    assert_that(head.cv_score.shape).is_equal_to((len(moods),))
+    assert_that(head.cv_score.dtype).is_equal_to(np.float32)
+    assert_that(bool(np.any(np.isfinite(head.cv_score)))).is_true()
+
+
+def test_mlp_probe_without_room_for_a_holdout_reports_no_score():
+    """A holdout needs one validation row AND two training rows, so below 3 rows there is nothing
+    to hold out — ``nan`` says so rather than reporting a training-set number as validation."""
+    pytest.importorskip("torch")
+    X = _l2(np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32))
+    Y = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+    head = fit_linear_probe(X, Y, ["a", "b"], method="mlp", seed=0)
+
+    assert_that(bool(np.all(np.isnan(head.cv_score)))).is_true()
+
+
+def test_mlp_probe_early_stop_beats_the_full_budget_on_memorizable_data():
+    """Early stopping must actually bite: restoring the best-validation weights has to generalize
+    at least as well as running every epoch, which on a few dozen rows is pure memorization."""
+    pytest.importorskip("torch")
+    X, Y, moods = _separable_dataset(n_per=12, seed=9)
+    train, test = slice(None, 36), slice(36, None)
+
+    head = fit_linear_probe(X[train], Y[train], moods, method="mlp", seed=0)
+
+    assert_that(_macro_f1(Y[test], predict_probe(head, X[test]))).is_greater_than(0.9)
 
 
 def test_probe_state_round_trip_linear_is_byte_identical():
@@ -242,6 +390,7 @@ def test_probe_from_state_mlp_hidden_shape_mismatch_raises():
             np.zeros(n_moods, dtype=np.float32),
         ),
         dim=d,
+        cv_score=np.full(n_moods, np.nan, dtype=np.float32),
     )
     state = probe_state(head)
     state["hidden2"] = state["hidden2"][:, :-1]  # W2 loses one mood column

@@ -91,13 +91,31 @@ def test_clustering_result_keys_match_the_typeddict() -> None:
     assert_that(set(result["metrics"])).is_equal_to(set(ClusterMetrics.__annotations__))
 
 
-def test_cluster_metrics_keys_match_the_typeddict_minus_the_run_only_key() -> None:
+#: Keys ``cluster_metrics`` cannot set on its own: each needs to compare the reduced and the
+#: original space, which only ``run_clustering`` sees. All ``NotRequired`` in the TypedDict.
+_RUN_CLUSTERING_ONLY_KEYS = frozenset(
+    {"reduction", "silhouette_space", "silhouette_original", "structure"}
+)
+
+
+def test_cluster_metrics_keys_match_the_typeddict_minus_the_run_only_keys() -> None:
     X = np.eye(4, dtype=np.float32)
 
     metrics = cluster_metrics(X, np.array([0, 0, 1, 1]))
 
-    # ``reduction`` is NotRequired: stamped by run_clustering, absent here.
-    assert_that(set(metrics)).is_equal_to(set(ClusterMetrics.__annotations__) - {"reduction"})
+    assert_that(set(metrics)).is_equal_to(
+        set(ClusterMetrics.__annotations__) - _RUN_CLUSTERING_ONLY_KEYS
+    )
+
+
+def test_run_clustering_stamps_every_cluster_metrics_key() -> None:
+    """The other half of the contract: what ``cluster_metrics`` cannot fill, ``run_clustering``
+    must — otherwise a consumer reading ``structure`` off a real result gets a KeyError."""
+    X = np.eye(6, dtype=np.float32)
+
+    metrics = run_clustering(X, "kmeans", default_config())["metrics"]
+
+    assert_that(set(metrics)).is_equal_to(set(ClusterMetrics.__annotations__))
 
 
 def test_coverage_entropy_keys_match_the_typeddict() -> None:

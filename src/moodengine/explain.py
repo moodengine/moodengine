@@ -26,6 +26,7 @@ Everything is deterministic and torch-free; the surrogate uses ``sklearn`` (cros
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from math import factorial
 from typing import Callable, Protocol
@@ -33,6 +34,8 @@ from typing import Callable, Protocol
 import numpy as np
 
 from moodengine.exceptions import MissingDependencyError
+
+logger = logging.getLogger(__name__)
 
 _EPS: float = 1e-8
 _MAX_PLAYERS: int = 8  # 2ⁿ coalition evals — the exact-Shapley guard-rail
@@ -96,34 +99,67 @@ class SignalSurrogate:
     columns align to, the ``mood_names`` it can predict (⊆ the caller's mood vocabulary — the classes
     actually present in the training reads), the library-median ``baseline`` (reference point for
     interventional Shapley + counterfactual distance), and the **measured** ``fidelity`` (accuracy vs
-    the true read). Pure data — :func:`surrogate_shap` / :func:`counterfactual` read it."""
+    the true read).
+
+    ``fidelity`` NEVER travels alone: ``fidelity_folds`` says how it was measured, and ``0`` means
+    resubstitution — the surrogate was scored on the rows it was fit on. A depth-limited tree
+    scores near the ceiling that way, so displaying such a number as "cross-validated accuracy"
+    presents a poor surrogate as a faithful one. Follow the ``(value, support)`` convention the
+    evaluation module uses: read the pair, or neither.
+
+    Pure data — :func:`surrogate_shap` / :func:`counterfactual` read it."""
 
     kind: str  # 'tree' | 'linear'
     model: SupportsPredictProba  # sklearn DecisionTreeClassifier | LogisticRegression (picklable)
     feature_names: list[str]  # e.g. ['bpm', 'tempo_stability', 'energy', 'valence', 'key']
     mood_names: list[str]  # classes the surrogate can predict (⊆ config.moods)
     baseline: np.ndarray  # (n_features,) library medians
-    fidelity: float  # cross-validated accuracy vs the true read, in [0, 1]
+    fidelity: float  # accuracy vs the true read, in [0, 1] — read WITH fidelity_folds
+    # Defaulted so a hand-built surrogate stays constructible: 0 already means "not
+    # validated", which is exactly what an unstated fold count is.
+    fidelity_folds: int = 0  # stratified folds behind `fidelity`; 0 == resubstitution/unknown
 
 
-def _cv_accuracy(model, S: np.ndarray, y: np.ndarray, *, seed: int) -> float:
+def _cv_accuracy(model, S: np.ndarray, y: np.ndarray, *, seed: int) -> tuple[float, int]:
     """Cross-validated accuracy of ``model`` predicting ``y`` from ``S`` — the honest fidelity number.
 
-    Uses stratified k-fold (``k = min(5, smallest-class-count, n)``); falls back to resubstitution
-    accuracy when there are too few per-class samples to fold honestly (documented, still measured)."""
+    Returns ``(accuracy, n_folds)``, where ``n_folds == 0`` marks a RESUBSTITUTION score: the model
+    was scored on the rows it was fit on, which for a depth-limited tree over a real vocabulary sits
+    near the ceiling and is not evidence of anything. Callers must surface that distinction — the
+    number and its fold count travel together.
+
+    The fold count is derived from the classes that can actually be folded (≥ 2 members), not from
+    the global smallest class. Deriving it globally meant a single mood appearing exactly ONCE in
+    the whole library forced ``k = 1`` and silently downgraded the entire estimate to
+    resubstitution: on a 180-row, 3-mood weak-signal set, appending one row of a fourth mood moved
+    the reported fidelity from 0.361 to 0.608 without the surrogate getting any better. Rows of an
+    unfoldable class are dropped from the estimate instead — they cannot be held out and predicted
+    honestly — so the score describes the part of the vocabulary it can describe."""
     from sklearn.base import clone
 
     counts = np.bincount(y)
-    min_class = int(counts[counts > 0].min())
-    k = min(5, min_class, len(y))
-    if k < 2:
+    foldable = np.flatnonzero(counts >= 2)
+    mask = np.isin(y, foldable)
+    k = min(5, int(counts[foldable].min())) if foldable.size >= 2 else 1
+
+    if k < 2 or int(np.unique(y[mask]).size) < 2:
         m = clone(model)
         m.fit(S, y)
-        return float((m.predict(S) == y).mean())
+        return float((m.predict(S) == y).mean()), 0
+
     from sklearn.model_selection import StratifiedKFold, cross_val_score
 
+    dropped = int((~mask).sum())
+    if dropped:
+        logger.info(
+            "fidelity: %d row(s) across %d mood(s) occur fewer than twice and cannot be held out; "
+            "excluding them from the estimate (the surrogate is still fit on every row).",
+            dropped,
+            int(np.setdiff1d(np.unique(y), foldable).size),
+        )
     cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=int(seed))
-    return float(cross_val_score(model, S, y, cv=cv, scoring="accuracy").mean())
+    score = cross_val_score(model, S[mask], y[mask], cv=cv, scoring="accuracy").mean()
+    return float(score), int(k)
 
 
 def fit_signal_surrogate(
@@ -140,8 +176,11 @@ def fit_signal_surrogate(
 
     ``S`` ``(n, n_features)`` are per-track interpretable musical signals; ``y`` ``(n,)`` are the
     indices (into ``mood_names``) of the **true engine read** (``top_mood``) — so the surrogate learns
-    to *mimic* the read from signals, and its cross-validated accuracy (``fidelity``) says how faithful
-    that view is. ``kind='tree'`` fits a depth-limited ``DecisionTreeClassifier`` (the interpretable
+    to *mimic* the read from signals, and its held-out accuracy (``fidelity``, measured over
+    ``fidelity_folds`` stratified folds — ``0`` meaning it fell back to resubstitution and is NOT
+    validated) says how faithful that view is. Rows whose mood occurs fewer than twice are excluded
+    from that ESTIMATE only — they cannot be held out and predicted — so ``fidelity`` describes the
+    foldable part of the vocabulary while the surrogate itself is fit on every row. ``kind='tree'`` fits a depth-limited ``DecisionTreeClassifier`` (the interpretable
     default); ``'linear'`` a multinomial ``LogisticRegression``. The stored ``mood_names`` are the
     classes actually present in ``y`` (⊆ the passed vocabulary — mood-first by construction, since the
     caller only ever passes musical ``feature_names`` and mood classes). ``baseline`` is the
@@ -176,7 +215,7 @@ def fit_signal_surrogate(
     else:
         raise ValueError(f"unknown kind {kind!r} (expected 'tree' | 'linear')")
 
-    fidelity = _cv_accuracy(model, S, y, seed=int(seed))
+    fidelity, fidelity_folds = _cv_accuracy(model, S, y, seed=int(seed))
     model.fit(S, y)
     baseline = np.median(S, axis=0).astype(np.float64)
     # model.classes_ is sorted ascending == `present`; map back to names, keeping column alignment.
@@ -188,6 +227,7 @@ def fit_signal_surrogate(
         mood_names=learned_names,
         baseline=baseline,
         fidelity=float(fidelity),
+        fidelity_folds=int(fidelity_folds),
     )
 
 

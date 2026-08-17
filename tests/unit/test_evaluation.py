@@ -16,6 +16,7 @@ from assertpy import assert_that
 from moodengine.evaluation import (
     average_precision,
     axis_ranking_auc,
+    ccc_components,
     concordance_correlation_coefficient,
     evaluate_against_gold,
     evaluate_text_queries,
@@ -289,6 +290,43 @@ def test_ccc_penalizes_scale_mismatch_below_pearson() -> None:
 
     assert_that(ccc).is_greater_than(0.0)
     assert_that(ccc).is_less_than(0.95)
+
+
+def test_ccc_components_multiply_back_to_the_ccc() -> None:
+    """Lin's decomposition is an identity, not an approximation: ``CCC == rho * c_b`` exactly.
+    Pinned so the two halves can never drift from the scalar they explain."""
+    rng = np.random.default_rng(0)
+    gold = rng.random(200)
+    pred = 0.3 * gold + 0.4 + 0.05 * rng.standard_normal(200)  # rescaled AND shifted
+
+    rho, c_b, support = ccc_components(pred, gold)
+    ccc, _ = concordance_correlation_coefficient(pred, gold)
+
+    assert_that(rho * c_b).is_close_to(ccc, tolerance=1e-12)
+    assert_that(support).is_equal_to(200)
+
+
+def test_ccc_components_isolate_scale_error_from_ranking_quality() -> None:
+    """The reason the split is reported: a squashed prediction ranks the gold values almost
+    perfectly (high rho) while scoring a poor CCC purely through c_b. Without the split, that
+    reads as a quality regression — which is exactly how a softmax temperature masquerades as
+    one."""
+    gold = np.linspace(0.0, 1.0, 100)
+    squashed = 0.2 * gold + 0.4  # same order, a fifth of the spread
+
+    rho, c_b, _ = ccc_components(squashed, gold)
+
+    assert_that(rho).is_close_to(1.0, tolerance=1e-9)  # ordering is perfect
+    assert_that(c_b).is_less_than(0.5)  # the loss is entirely scale
+
+
+def test_ccc_components_constant_series_is_nan() -> None:
+    """A constant series has no correlation to decompose — absence, not a fabricated 0."""
+    rho, c_b, support = ccc_components(np.full(8, 0.4), np.linspace(0, 1, 8))
+
+    assert_that(rho).is_nan()
+    assert_that(c_b).is_nan()
+    assert_that(support).is_equal_to(8)
 
 
 def test_ccc_constant_series_is_nan() -> None:

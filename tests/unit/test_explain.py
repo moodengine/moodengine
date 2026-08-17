@@ -87,6 +87,45 @@ def test_surrogate_fits_and_measures_fidelity():
     assert_that(surr.fidelity).is_greater_than(0.9)  # measured CV accuracy, never hard-coded
 
 
+def _weak_signal_set(n_per: int = 60, n_features: int = 4, seed: int = 0):
+    """Three moods with a signal too weak to mimic well — the regime where the difference between
+    a held-out score and a resubstitution score is large enough to matter."""
+    rng = np.random.default_rng(seed)
+    S = rng.standard_normal((3 * n_per, n_features))
+    y = np.repeat([0, 1, 2], n_per)
+    S[:, 0] += y * 0.6
+    return S, y, [f"f{i}" for i in range(n_features)], ["a", "b", "c", "d"]
+
+
+def test_surrogate_fidelity_unmoved_by_a_single_example_of_a_fourth_mood():
+    """The defect: folds were derived from the GLOBAL smallest class, so one mood occurring exactly
+    once anywhere in the library collapsed ``k`` to 1 and silently downgraded the whole estimate to
+    resubstitution — appending one row moved the reported fidelity from 0.361 to 0.608 while the
+    surrogate got no better. Deriving folds from the foldable classes makes that row irrelevant."""
+    S, y, feats, moods = _weak_signal_set(seed=0)
+    S_plus = np.vstack([S, np.random.default_rng(1).standard_normal((1, S.shape[1]))])
+    y_plus = np.append(y, 3)  # exactly one example of a fourth mood
+
+    base = fit_signal_surrogate(S, y, feats, moods, kind="tree")
+    plus = fit_signal_surrogate(S_plus, y_plus, feats, moods, kind="tree")
+
+    assert_that(plus.fidelity).is_close_to(base.fidelity, tolerance=0.02)
+    assert_that(plus.fidelity_folds).is_equal_to(base.fidelity_folds)
+    assert_that(plus.fidelity_folds).is_greater_than(0)  # still validated, not resubstitution
+
+
+def test_surrogate_reports_zero_folds_when_it_falls_back_to_resubstitution():
+    """When no class can be folded the score IS resubstitution. It is still reported — but
+    ``fidelity_folds == 0`` is the flag that stops a caller reading it as validated."""
+    S = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=float)
+    y = np.array([0, 1])  # one example each: nothing to hold out
+
+    surr = fit_signal_surrogate(S, y, ["f0", "f1", "f2"], ["a", "b"], kind="tree")
+
+    assert_that(surr.fidelity_folds).is_equal_to(0)
+    assert_that(surr.fidelity).is_between(0.0, 1.0)
+
+
 def test_surrogate_is_deterministic():
     S, y, feats, moods = _separable_signals(seed=2)
     a = fit_signal_surrogate(S, y, feats, moods, kind="tree", seed=7)
