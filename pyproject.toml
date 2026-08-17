@@ -72,6 +72,14 @@ pacmap = [
 explain = [
     "shap>=0.46",                 # first release with numpy 2-compatible wheels
 ]
+# MuQ-MuLan backbone (embedder name "mulan") — an ALTERNATIVE audio-text model to CLAP, not a
+# replacement. Opt-in: needs [models] as well (it is a torch model), and pulls x-clip -> torchvision.
+# The muq distribution ships an sdist only and declares every dependency unpinned, so the floors
+# that actually hold come from [models]. Weights are CC-BY-NC-4.0 (the code is MIT).
+#   pip install "moodengine[models,muq] @ git+https://github.com/moodengine/moodengine"
+muq = [
+    "muq>=0.1.0",
+]
 [project.urls]
 Homepage = "https://github.com/moodengine/moodengine"
 Repository = "https://github.com/moodengine/moodengine"
@@ -182,6 +190,7 @@ module = [
     "torch",
     "torch.*",
     "huggingface_hub",
+    "muq",
 ]
 ignore_missing_imports = true
 

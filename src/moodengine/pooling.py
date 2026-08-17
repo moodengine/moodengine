@@ -148,4 +148,5 @@ def pool_clap(segments: list[np.ndarray], config: Config) -> np.ndarray:
 
 
 # A registry so the pipeline can pick the pooler by embedder name:
-POOLERS = {"mert": pool_mert, "clap": pool_clap}
+# `mulan` is clip-level like `clap` (one vector per segment), so it shares pool_clap.
+POOLERS = {"mert": pool_mert, "clap": pool_clap, "mulan": pool_clap}

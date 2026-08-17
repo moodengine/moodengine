@@ -105,6 +105,10 @@ class Config:
     # model to a reviewed snapshot (MERT runs remote code — see embeddings.mert);
     # custom models fall back to the hub's latest unless a revision is given here.
     mert_revision: str | None = None
+    # MuQ-MuLan: the alternative audio-text backbone (embedder name "mulan"). 24 kHz like MERT,
+    # NOT CLAP's 48 kHz. Weights are CC-BY-NC-4.0 — see embeddings/mulan.py.
+    mulan_model_name: str = "OpenMuQ/MuQ-MuLan-large"
+    mulan_sample_rate: int = 24_000
     clap_enable_fusion: bool = False
     clap_amodel: str = "HTSAT-base"
     # None -> let laion-clap download its default (music) checkpoint.
