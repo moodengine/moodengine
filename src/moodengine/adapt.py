@@ -363,11 +363,13 @@ def _fit_probe_mlp(
         tr_idx = np.arange(n, dtype=np.int64)
     Xtr, Ytr = Xt[tr_idx], Yt[tr_idx]
 
-    model = torch.nn.Sequential(
-        torch.nn.Linear(d, hidden_dim),
-        torch.nn.ReLU(),
-        torch.nn.Linear(hidden_dim, n_moods),
-    )
+    # Hold the two Linear layers as named locals rather than indexing the Sequential afterwards:
+    # `Sequential.__getitem__` is typed as returning a bare `Module`, so `model[0].weight` is a
+    # `Tensor | Module` union that a type checker cannot resolve — invisible while torch is absent
+    # (the import is stubbed away) and four errors the moment it is installed.
+    lin1 = torch.nn.Linear(d, hidden_dim)
+    lin2 = torch.nn.Linear(hidden_dim, n_moods)
+    model = torch.nn.Sequential(lin1, torch.nn.ReLU(), lin2)
     c_eff = 1.0 if C is None else float(C)
     weight_decay = 1.0 / (2.0 * max(c_eff, _EPS) * max(len(tr_idx), 1))  # L2 ∝ 1/C
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -403,7 +405,6 @@ def _fit_probe_mlp(
             val_logits = model(Xt[val_idx]).numpy()
         cv_score = _per_mood_average_precision(val_logits, Y[val_idx])
 
-    lin1, lin2 = model[0], model[2]
     hidden = (
         lin1.weight.detach().numpy().T.astype(np.float32),  # W1 (d, h)
         lin1.bias.detach().numpy().astype(np.float32),  # b1 (h,)

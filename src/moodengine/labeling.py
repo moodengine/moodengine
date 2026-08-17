@@ -44,9 +44,26 @@ logger = logging.getLogger(__name__)
 # temperature its own contrastive objective was trained at.
 DEFAULT_TEMPERATURE: float = 0.05
 
-# Mood name -> list of natural-language prompts (ensembled). A broad, musically
-# varied vocabulary so the ranking can separate distinct emotional textures
-# rather than collapsing everything onto one dominant word.
+# --- prompt vocabulary -------------------------------------------------------------------------
+# Mood name -> list of natural-language prompts, averaged into one direction per mood by
+# `build_label_matrix`. Hand-written, multi-adjective, three per mood.
+#
+# That shape looks wrong against the published zero-shot recipes, which cross class words with
+# many caption templates (CLIP's uses 80) on the theory that averaging over phrasings cancels the
+# phrasing and leaves the concept. It was tested here rather than assumed: a 4-descriptor x
+# 6-template cross product, 24 prompts per mood, measured against this exact table on the LAION
+# music checkpoint. It lost on every axis.
+#
+#   direction separability   raw pairwise cosine 0.840 vs 0.568 (worse — the six shared carrier
+#                            phrases dominate the embedding), and after removing that shared
+#                            component the two are equivalent (-0.0566 vs -0.0573) with a LOWER
+#                            effective rank, 11 of 18 dims against 12
+#   labels on 60 real tracks 15 distinct top moods vs 16, top mood share 0.15 vs 0.13,
+#                            top1-top2 margin 0.054 vs 0.096, mean entropy 2.662 vs 2.360
+#
+# So the templates cost more (a shared carrier direction every mood inherits) than the larger
+# ensemble buys. Keep the hand-written table, and re-measure with
+# `label_direction_redundancy` + `labeling_quality_metrics` before changing it again.
 DEFAULT_MOOD_PROMPTS: dict[str, list[str]] = {
     "energetic": [
         "an energetic high-energy upbeat song",
@@ -120,7 +137,7 @@ DEFAULT_MOOD_PROMPTS: dict[str, list[str]] = {
     ],
     "uplifting": [
         "an uplifting inspiring hopeful track",
-        "an euphoric soaring positive song",
+        "a euphoric soaring positive song",
         "music that feels uplifting and motivating",
     ],
     "tense": [
@@ -139,6 +156,33 @@ DEFAULT_MOOD_PROMPTS: dict[str, list[str]] = {
         "cheeky cartoonish playful music",
     ],
 }
+
+
+def build_prompt_table(
+    descriptors: dict[str, tuple[str, ...]], templates: tuple[str, ...]
+) -> dict[str, list[str]]:
+    """Cross every label's descriptors with every caption template -> a prompt table.
+
+    Returns ``{label: [prompt, ...]}``, ``len(descriptors[label]) * len(templates)`` prompts per
+    label in a stable descriptor-major order, shaped for :func:`build_label_matrix`. Each template
+    must contain exactly one ``{}`` slot. Pure; the inputs are never mutated.
+
+    For building a vocabulary of your own without hand-writing every combination. Note that this
+    construction is NOT how :data:`DEFAULT_MOOD_PROMPTS` is built, and deliberately so — sharing
+    caption templates across labels gives every label direction a common component, which measured
+    worse here on both separability and label quality (see the note above that table). Check yours
+    with :func:`label_direction_redundancy` rather than assuming a bigger ensemble is better.
+    """
+    for template in templates:
+        if template.count("{}") != 1:
+            raise ValueError(
+                f"template {template!r} must contain exactly one '{{}}' slot for the descriptor"
+            )
+    return {
+        label: [template.format(word) for word in words for template in templates]
+        for label, words in descriptors.items()
+    }
+
 
 # Two-pole attribute axes. Each pole is ensembled like the moods above; the score
 # is the softmax probability of the positive pole -> a [0, 1] coordinate.
@@ -354,6 +398,48 @@ def _resolve_label_matrix(
             "or a precomputed label_matrix=(mood_names, matrix) from build_label_matrix"
         )
     return build_label_matrix(clap_embedder, prompts)
+
+
+def label_direction_redundancy(
+    mood_names: list[str], label_matrix: np.ndarray, *, top_k: int = 10
+) -> dict:
+    """How distinguishable the label DIRECTIONS are from each other — the blind spot in
+    :func:`labeling_quality_metrics`.
+
+    That function measures the diversity of the assignments a vocabulary produced; this measures
+    whether the vocabulary could produce diverse assignments at all. Two moods whose ensembled
+    directions sit at cosine 0.97 cannot be told apart by any input, so every track that leans
+    toward one leans equally toward the other, and which of them wins the argmax is decided by
+    noise. That is invisible downstream: the labels look confident and vary across tracks.
+
+    ``label_matrix`` ``(n_moods, d)`` is the L2-normalized output of :func:`build_label_matrix`,
+    ``mood_names`` labels its rows. Returns ``{"mean_cosine", "max_cosine", "most_similar_pairs",
+    "n_moods"}`` over the STRICT upper triangle — no self-pairs, no mirrored duplicates —
+    with ``most_similar_pairs`` the ``top_k`` ``(mood_a, mood_b, cosine)`` triples in descending
+    cosine. Rows are re-normalized defensively so the values are true cosines on any input.
+
+    Read it when adding or renaming a mood: a new entry that lands near an existing direction adds
+    a word to the output without adding a distinction. Pure numpy; fewer than 2 moods yields zeroed
+    metrics and an empty pair list rather than raising.
+    """
+    M = np.asarray(label_matrix, dtype=np.float32)
+    n = M.shape[0] if M.ndim == 2 else 0
+    if n < 2 or len(mood_names) < n:
+        return {"mean_cosine": 0.0, "max_cosine": 0.0, "most_similar_pairs": [], "n_moods": int(n)}
+
+    sims = l2_normalize(M, axis=1) @ l2_normalize(M, axis=1).T
+    iu = np.triu_indices(n, k=1)  # strict upper triangle: each unordered pair exactly once
+    pair_cos = sims[iu]
+    order = np.argsort(-pair_cos, kind="stable")[: max(int(top_k), 0)]
+    return {
+        "mean_cosine": float(pair_cos.mean()),
+        "max_cosine": float(pair_cos.max()),
+        "most_similar_pairs": [
+            (mood_names[int(iu[0][o])], mood_names[int(iu[1][o])], float(pair_cos[o]))
+            for o in order
+        ],
+        "n_moods": int(n),
+    }
 
 
 def compose_mood_vector(

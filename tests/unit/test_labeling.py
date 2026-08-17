@@ -23,8 +23,10 @@ from moodengine.labeling import (
     MoodScores,
     attribute_scores,
     build_label_matrix,
+    build_prompt_table,
     cluster_mood_profiles,
     compose_mood_vector,
+    label_direction_redundancy,
     label_prior,
     label_tracks,
     labeling_quality_metrics,
@@ -426,6 +428,74 @@ def test_name_clusters_tie_breaks_to_first_seen() -> None:
     top_moods = ["groovy", "tense"]  # 1-1 tie -> first-seen 'groovy'
     named = name_clusters(labels, top_moods)
     assert_that(named[0]).is_equal_to("groovy")
+
+
+def test_label_direction_redundancy_flags_a_duplicated_direction() -> None:
+    """The blind spot it closes: two moods whose ensembled directions are nearly identical cannot
+    be told apart by ANY input, so which one wins the argmax is decided by noise — while
+    `labeling_quality_metrics` still reports confident, varied labels."""
+    base = l2_normalize(
+        np.random.default_rng(0).standard_normal((3, 32)).astype(np.float32), axis=1
+    )
+    near_duplicate = l2_normalize((base[0] + 0.02 * base[1]).astype(np.float32), axis=0)
+    matrix = np.vstack([base, near_duplicate[None, :]]).astype(np.float32)
+    names = ["a", "b", "c", "a_twin"]
+
+    report = label_direction_redundancy(names, matrix)
+
+    assert_that(report["n_moods"]).is_equal_to(4)
+    assert_that(report["max_cosine"]).is_greater_than(0.95)
+    worst_pair = set(report["most_similar_pairs"][0][:2])
+    assert_that(worst_pair).is_equal_to({"a", "a_twin"})
+
+
+def test_label_direction_redundancy_orthogonal_vocabulary_is_clean() -> None:
+    """A perfectly separable vocabulary reports zero mutual cosine — the metric must not
+    manufacture redundancy where there is none."""
+    report = label_direction_redundancy(["a", "b", "c", "d"], np.eye(4, dtype=np.float32))
+
+    assert_that(report["mean_cosine"]).is_close_to(0.0, tolerance=1e-6)
+    assert_that(report["max_cosine"]).is_close_to(0.0, tolerance=1e-6)
+
+
+def test_label_direction_redundancy_pairs_are_unordered_and_unique() -> None:
+    """Strict upper triangle: no self-pairs, and no (b, a) mirror of an (a, b) already reported."""
+    rng = np.random.default_rng(1)
+    matrix = l2_normalize(rng.standard_normal((5, 16)).astype(np.float32), axis=1)
+    names = [f"m{i}" for i in range(5)]
+
+    pairs = label_direction_redundancy(names, matrix, top_k=99)["most_similar_pairs"]
+
+    assert_that(len(pairs)).is_equal_to(10)  # C(5, 2), the full upper triangle
+    unordered = {frozenset((a, b)) for a, b, _ in pairs}
+    assert_that(len(unordered)).is_equal_to(10)
+    assert_that(any(a == b for a, b, _ in pairs)).is_false()
+
+
+def test_label_direction_redundancy_degenerate_input_is_zeroed() -> None:
+    """Fewer than two moods has no pair to score — zeros and an empty list, never a raise."""
+    report = label_direction_redundancy(["only"], np.eye(1, dtype=np.float32))
+
+    assert_that(report["most_similar_pairs"]).is_equal_to([])
+    assert_that(report["max_cosine"]).is_equal_to(0.0)
+
+
+def test_build_prompt_table_is_a_full_cross_product() -> None:
+    """Descriptor-major order, one prompt per (descriptor, template) pair."""
+    table = build_prompt_table({"calm": ("calm", "gentle")}, ("a {} song", "{} music"))
+
+    assert_that(table["calm"]).is_equal_to(
+        ["a calm song", "calm music", "a gentle song", "gentle music"]
+    )
+
+
+def test_build_prompt_table_rejects_a_template_without_exactly_one_slot() -> None:
+    """A template with no slot silently drops the descriptor; one with two raises deep inside
+    ``str.format``. Name the offending template instead."""
+    with pytest.raises(ValueError, match=r"must contain exactly one"):
+        build_prompt_table({"calm": ("calm",)}, ("a song with no slot",))
+    with pytest.raises(ValueError, match=r"must contain exactly one"):
+        build_prompt_table({"calm": ("calm",)}, ("a {} {} song",))
 
 
 # --------------------------------------------------------------------------- #
