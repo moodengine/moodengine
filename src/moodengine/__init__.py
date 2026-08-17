@@ -2,7 +2,8 @@
 
 A pure, stateless engine: audio -> embeddings (MERT / CLAP) -> clustering ->
 zero-shot mood labels + energy/valence axes -> search & evaluation. The deep
-learning backbones are an optional extra (``pip install "moodengine[models]"``);
+learning backbones are an optional extra (``moodengine[models]``, installed from
+the GitHub repository — see the README);
 everything else (clustering, labeling, search, eval, viz on precomputed
 embeddings) runs on the lightweight core. Importing this package is torch-free —
 the embedders import torch lazily inside :func:`get_embedder`.

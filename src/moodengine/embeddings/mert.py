@@ -87,7 +87,7 @@ class MERTEmbedder(Embedder):
             raise ModelLoadError(
                 f"could not load MERT model {config.mert_model_name!r} "
                 f"(revision {revision or 'latest'}): {exc}. If you are offline, pre-download it "
-                f"with `huggingface-cli download {config.mert_model_name}` (HF_HOME chooses the "
+                f"with `hf download {config.mert_model_name}` (HF_HOME chooses the "
                 f"cache location; HF_HUB_OFFLINE=1 forces cache-only resolution)."
             ) from exc
         self.model.to(self.device).eval()

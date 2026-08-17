@@ -15,6 +15,12 @@ generic numeric code already handles; wrapping those would only break it.
 
 from __future__ import annotations
 
+# moodengine is distributed from its GitHub repository only — it is published to no
+# package index — so a bare ``moodengine[extra]`` requirement resolves to nothing and an
+# install hint that omits this URL cannot succeed. The PEP 508 direct-reference form it
+# builds is understood by pip and ``uv pip`` alike, so one hint serves both toolchains.
+_REPOSITORY = "git+https://github.com/moodengine/moodengine"
+
 
 class MoodengineError(Exception):
     """Root of every moodengine-specific failure."""
@@ -34,13 +40,14 @@ class MissingDependencyError(MoodengineError, ImportError):
     """A feature needs an optional backend that is not installed.
 
     ``feature`` names what was attempted, ``package`` the distribution that is
-    missing and ``extra`` the pip extra that provides it; the message spells out
-    the exact install command. Inherits ``ImportError`` so callers that caught
-    the previous bare ``ImportError`` keep working.
+    missing and ``extra`` the optional-dependency group that provides it; the
+    message spells out an install command that actually resolves, repository URL
+    included. Inherits ``ImportError`` so callers that caught the previous bare
+    ``ImportError`` keep working.
     """
 
     def __init__(self, feature: str, package: str, extra: str, hint: str = "") -> None:
-        message = f'{feature} requires {package}: pip install "moodengine[{extra}]"'
+        message = f'{feature} requires {package}: pip install "moodengine[{extra}] @ {_REPOSITORY}"'
         if hint:
             message = f"{message} ({hint})"
         super().__init__(message)
@@ -55,6 +62,7 @@ class ModelLoadError(MoodengineError, RuntimeError):
     The underlying huggingface/torch errors surface deep stack traces that never
     say which artifact was being fetched, so raise sites build a message that
     names the exact model/repo and how to pre-download it (e.g. with
-    ``huggingface-cli download <repo>``; ``HF_HOME`` chooses the cache location
+    ``hf download <repo>`` — the ``huggingface-cli`` entry point still exists on
+    huggingface_hub 1.x but is deprecated; ``HF_HOME`` chooses the cache location
     and ``HF_HUB_OFFLINE=1`` forces cache-only resolution).
     """

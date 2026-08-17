@@ -103,7 +103,7 @@ class CLAPEmbedder(Embedder):
             raise ModelLoadError(
                 f"could not load the CLAP checkpoint for amodel={config.clap_amodel!r} "
                 f"(clap_checkpoint={config.clap_checkpoint!r}): {exc}. If you are offline, "
-                f"pre-download the default music checkpoint with `huggingface-cli download "
+                f"pre-download the default music checkpoint with `hf download "
                 f"lukewys/laion_clap music_audioset_epoch_15_esc_90.14.pt` (HF_HOME chooses the "
                 f"cache location; HF_HUB_OFFLINE=1 forces cache-only resolution)."
             ) from exc

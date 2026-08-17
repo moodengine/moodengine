@@ -33,10 +33,18 @@ def test_subclasses_keep_their_pre_hierarchy_stdlib_bases() -> None:
 
 
 def test_missing_dependency_message_spells_out_the_install_command() -> None:
-    """The message names the feature, the package and the exact pip extra."""
+    """The message names the feature, the package and an install that resolves.
+
+    The repository URL is part of the contract, not decoration: moodengine is on no
+    package index, so a hint of the form ``pip install "moodengine[ot]"`` would send
+    the reader to a command that cannot succeed.
+    """
     err = MissingDependencyError("ot_morph", "POT", "ot")
 
-    assert_that(str(err)).is_equal_to('ot_morph requires POT: pip install "moodengine[ot]"')
+    assert_that(str(err)).is_equal_to(
+        "ot_morph requires POT: pip install "
+        '"moodengine[ot] @ git+https://github.com/moodengine/moodengine"'
+    )
     assert_that(err.feature).is_equal_to("ot_morph")
     assert_that(err.package).is_equal_to("POT")
     assert_that(err.extra).is_equal_to("ot")
@@ -47,7 +55,7 @@ def test_missing_dependency_optional_hint_is_appended() -> None:
     err = MissingDependencyError("backend='treeshap'", "shap", "explain", hint="use 'exact'")
 
     assert_that(str(err)).ends_with("(use 'exact')")
-    assert_that(str(err)).contains('pip install "moodengine[explain]"')
+    assert_that(str(err)).contains('"moodengine[explain] @ git+https://github.com/')
 
 
 def test_hierarchy_is_importable_from_the_package_root() -> None:
@@ -71,7 +79,7 @@ def test_projection_unavailable_joins_the_hierarchy() -> None:
     assert_that(err).is_instance_of(MissingDependencyError)
     assert_that(err).is_instance_of(RuntimeError)
     assert_that(err.method).is_equal_to("pacmap")
-    assert_that(str(err)).contains('pip install "moodengine[pacmap]"')
+    assert_that(str(err)).contains('"moodengine[pacmap] @ git+https://github.com/')
 
 
 def test_catching_the_root_catches_a_raised_subclass() -> None:
