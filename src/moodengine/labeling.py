@@ -184,6 +184,127 @@ def build_prompt_table(
     }
 
 
+# --- affect grounding ---------------------------------------------------------------------------
+# Where each mood sits on Russell's circumplex — the two-dimensional model (valence x arousal) that
+# affective science uses to place emotion words — expressed on the SAME [0, 1] scale as
+# `attribute_scores`, so a predicted mood and a measured axis are directly comparable.
+#
+# `kind` records something the vocabulary was mixing silently. Nine entries are affect words, whose
+# circumplex position is what the word means. The rest are TEXTURE words — genre or production
+# descriptors that carry a loose affective connotation but are not primarily emotions; "jazzy" is
+# not a feeling. Their coordinates are the typical affect of music so described, which is a weaker
+# claim, so `mood_affect_consistency` reports the two groups separately rather than pooling them.
+#
+# Measured against DEAM's human ratings over 400 songs, the engine's own labels order by gold
+# arousal about as this table predicts at the extremes — energetic highest at 0.672, dreamy and
+# romantic lowest around 0.32 — with two clear disagreements: tracks the engine calls `tense` have
+# the LOWEST gold arousal of any mood (0.319) where the circumplex puts tense high, and
+# `aggressive` lands mid-range (0.528) rather than near the top. Those are the disagreements this
+# table exists to surface; do not silently "fix" them by moving the coordinates to match.
+MOOD_AFFECT: dict[str, tuple[float, float, str]] = {
+    # mood: (valence, arousal, kind)
+    "energetic": (0.60, 0.90, "affect"),
+    "calm": (0.60, 0.15, "affect"),
+    "melancholic": (0.20, 0.30, "affect"),
+    "happy": (0.90, 0.70, "affect"),
+    "dark": (0.15, 0.40, "affect"),
+    "aggressive": (0.20, 0.95, "affect"),
+    "romantic": (0.80, 0.35, "affect"),
+    "tense": (0.20, 0.75, "affect"),
+    "uplifting": (0.90, 0.75, "affect"),
+    "playful": (0.85, 0.65, "affect"),
+    "nostalgic": (0.50, 0.30, "affect"),
+    "epic": (0.70, 0.85, "texture"),
+    "dreamy": (0.60, 0.20, "texture"),
+    "groovy": (0.75, 0.70, "texture"),
+    "funky": (0.80, 0.75, "texture"),
+    "jazzy": (0.65, 0.45, "texture"),
+    "hypnotic": (0.50, 0.50, "texture"),
+    "spacey": (0.50, 0.25, "texture"),
+}
+
+#: How far a track's measured axis may sit from its mood's expected coordinate before the pair is
+#: called incoherent. 0.35 on a [0, 1] axis is deliberately loose: the goal is to catch
+#: "top_mood='calm' with energy 0.9", not to police ordinary spread.
+MOOD_AFFECT_TOLERANCE: float = 0.35
+
+
+def mood_affect_consistency(
+    label_df: pd.DataFrame,
+    affect: dict[str, tuple[float, float, str]] = MOOD_AFFECT,
+    tolerance: float = MOOD_AFFECT_TOLERANCE,
+) -> dict:
+    """Does the discrete mood agree with the continuous axes? Nothing checked this before.
+
+    The two outputs are computed from the same CLAP embeddings by independent prompt sets, so
+    ``top_mood="calm"`` alongside ``energy=0.9`` is possible and was never flagged. This scores
+    that agreement.
+
+    ``label_df`` needs ``top_mood`` plus ``energy`` / ``valence`` columns — the shape
+    :func:`moodengine.pipeline.run_pipeline_core` produces by joining :func:`label_tracks` with
+    :func:`attribute_scores`. Returns ``{"arousal_pearson", "valence_pearson", "incoherent_share",
+    "worst_moods", "n_scored", "n_affect", "n_texture"}``, where the two correlations are between
+    each track's EXPECTED coordinate (looked up from its mood) and its MEASURED axis, and
+    ``worst_moods`` lists the moods with the largest mean gap, descending.
+
+    Affect words and texture words are counted separately (``n_affect`` / ``n_texture``) because
+    the claim differs: a texture word's coordinate describes the typical affect of music so
+    described, not the meaning of the word. Moods missing from ``affect`` are skipped, not guessed.
+    Pure; robust to an empty frame.
+    """
+    empty = {
+        "arousal_pearson": float("nan"),
+        "valence_pearson": float("nan"),
+        "incoherent_share": 0.0,
+        "worst_moods": [],
+        "n_scored": 0,
+        "n_affect": 0,
+        "n_texture": 0,
+    }
+    needed = {"top_mood", "energy", "valence"}
+    if not needed <= set(label_df.columns) or len(label_df) == 0:
+        return empty
+
+    moods = [str(m) for m in label_df["top_mood"]]
+    measured_a = np.asarray(label_df["energy"], dtype=np.float64)
+    measured_v = np.asarray(label_df["valence"], dtype=np.float64)
+    keep = np.array(
+        [
+            m in affect and np.isfinite(a) and np.isfinite(v)
+            for m, a, v in zip(moods, measured_a, measured_v)
+        ]
+    )
+    if not bool(keep.any()):
+        return empty
+
+    kept_moods = [m for m, k in zip(moods, keep) if k]
+    expected_v = np.array([affect[m][0] for m in kept_moods], dtype=np.float64)
+    expected_a = np.array([affect[m][1] for m in kept_moods], dtype=np.float64)
+    got_a, got_v = measured_a[keep], measured_v[keep]
+
+    def _r(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or float(x.std()) == 0.0 or float(y.std()) == 0.0:
+            return float("nan")
+        return float(np.corrcoef(x, y)[0, 1])
+
+    gap = np.maximum(np.abs(expected_a - got_a), np.abs(expected_v - got_v))
+    per_mood: dict[str, list[float]] = {}
+    for m, g in zip(kept_moods, gap):
+        per_mood.setdefault(m, []).append(float(g))
+
+    return {
+        "arousal_pearson": _r(expected_a, got_a),
+        "valence_pearson": _r(expected_v, got_v),
+        "incoherent_share": float(np.mean(gap > float(tolerance))),
+        "worst_moods": sorted(
+            ((m, float(np.mean(g))) for m, g in per_mood.items()), key=lambda t: -t[1]
+        )[:5],
+        "n_scored": int(keep.sum()),
+        "n_affect": sum(1 for m in kept_moods if affect[m][2] == "affect"),
+        "n_texture": sum(1 for m in kept_moods if affect[m][2] == "texture"),
+    }
+
+
 # Two-pole attribute axes. Each pole is ensembled like the moods above; the score
 # is the softmax probability of the positive pole -> a [0, 1] coordinate.
 ENERGY_PROMPTS: dict[str, list[str]] = {

@@ -88,6 +88,7 @@ from moodengine.cluster import (
 # --- zero-shot labeling + attributes ---
 from moodengine.labeling import (
     DEFAULT_MOOD_PROMPTS,
+    MOOD_AFFECT,
     DEFAULT_TEMPERATURE,
     ENERGY_PROMPTS,
     VALENCE_PROMPTS,
@@ -101,6 +102,7 @@ from moodengine.labeling import (
     label_prior,
     label_tracks,
     labeling_quality_metrics,
+    mood_affect_consistency,
     name_clusters,
     recenter_similarities,
     score_axis,
@@ -326,8 +328,10 @@ __all__ = [
     "MoodScores",
     "softmax",
     "labeling_quality_metrics",
+    "mood_affect_consistency",
     "l2_normalize",
     "DEFAULT_MOOD_PROMPTS",
+    "MOOD_AFFECT",
     "DEFAULT_TEMPERATURE",
     "ENERGY_PROMPTS",
     "VALENCE_PROMPTS",
