@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 from assertpy import assert_that
 
-from moodengine.journey import path_between
+from moodengine import journey
+from moodengine.journey import journey_tracks, path_between, smooth_order
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -166,3 +167,107 @@ def test_ot_morph_raises_importerror_without_pot(monkeypatch) -> None:
     X = np.eye(8, dtype=np.float32)
     with pytest.raises(ImportError, match=r"ot_morph requires POT"):
         ot_morph(a, a, X, [f"t{i}" for i in range(8)], n=4)
+
+
+def _path_cost(X, order):
+    Y = X[list(order)]
+    return float(sum(1.0 - float(Y[i] @ Y[i + 1]) for i in range(len(order) - 1)))
+
+
+def test_journey_tracks_returns_indices_like_the_other_mode() -> None:
+    """The asymmetry this closes: `ot_morph` returned row indices while `path_between` returned
+    waypoint VECTORS and stopped, so the SLERP mode produced no playlist at all — the module
+    docstring described waypoint→track selection but nothing implemented it."""
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((40, 16)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    picks = journey_tracks(X, X[0], X[-1], n=8)
+
+    assert_that(picks).is_length(8)
+    assert_that(len(set(picks))).is_equal_to(8)  # a journey must not stall on one track
+    assert_that(all(isinstance(i, int) and 0 <= i < 40 for i in picks)).is_true()
+
+
+def test_journey_tracks_starts_at_the_a_pole() -> None:
+    """Every pick sits ON the geodesic, so the first waypoint is the A direction itself and the
+    nearest track to it opens the journey."""
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((30, 8)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    picks = journey_tracks(X, X[3], X[20], n=5)
+
+    assert_that(picks[0]).is_equal_to(3)
+
+
+def test_journey_tracks_pool_smaller_than_requested_is_truncated() -> None:
+    """Fewer tracks than waypoints returns what exists rather than repeating picks."""
+    X = np.eye(3, dtype=np.float32)
+
+    assert_that(journey_tracks(X, X[0], X[2], n=10)).is_length(3)
+    assert_that(journey_tracks(np.empty((0, 4), dtype=np.float32), X[0], X[2], n=5)).is_empty()
+
+
+def test_journey_tracks_rejects_an_unknown_mode() -> None:
+    X = np.eye(4, dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"unknown journey mode 'nope'"):
+        journey_tracks(X, X[0], X[1], n=2, mode="nope")
+
+
+def test_smooth_order_is_exactly_optimal_below_the_dp_cutoff() -> None:
+    """Held-Karp is exact, so below the cutoff the result must equal a brute-force minimum — the
+    only assertion that distinguishes a correct DP from a plausible heuristic."""
+    import itertools
+
+    rng = np.random.default_rng(2)
+    X = rng.standard_normal((8, 6)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    order = smooth_order(X)
+    brute = min(itertools.permutations(range(8)), key=lambda t: _path_cost(X, t))
+
+    assert_that(_path_cost(X, order)).is_close_to(_path_cost(X, brute), tolerance=1e-9)
+    assert_that(sorted(order)).is_equal_to(list(range(8)))  # a permutation, nothing dropped
+
+
+def test_smooth_order_beats_the_input_order() -> None:
+    """The objective, stated: consecutive tracks end up more similar than they started."""
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((20, 12)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    order = smooth_order(X)
+
+    assert_that(_path_cost(X, order)).is_less_than(_path_cost(X, range(20)))
+
+
+def test_smooth_order_two_opt_never_degrades_its_seed() -> None:
+    """Above the exact cutoff the answer is a heuristic, so the guarantee that remains is
+    monotonicity: 2-opt only accepts a reversal that lowers the cost, so it can never return
+    something worse than the nearest-neighbour tour it started from."""
+    rng = np.random.default_rng(4)
+    X = rng.standard_normal((25, 10)).astype(np.float32)  # > the 12-track exact cutoff
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    order = smooth_order(X)
+    greedy = journey._nn_tour((1.0 - X @ X.T).astype(np.float64), order[0])
+
+    assert_that(_path_cost(X, order)).is_less_than_or_equal_to(_path_cost(X, greedy) + 1e-9)
+
+
+def test_smooth_order_honours_a_pinned_start() -> None:
+    """A caller with an opening track in mind must get it, in both the exact and heuristic paths."""
+    rng = np.random.default_rng(5)
+    X = rng.standard_normal((16, 8)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    assert_that(smooth_order(X[:9], start=4)[0]).is_equal_to(4)  # exact path
+    assert_that(smooth_order(X, start=7)[0]).is_equal_to(7)  # 2-opt path
+
+
+def test_smooth_order_degenerate_inputs_are_returned_as_is() -> None:
+    """Nothing to reorder below three tracks — an identity, never a raise."""
+    assert_that(smooth_order(np.empty((0, 4), dtype=np.float32))).is_empty()
+    assert_that(smooth_order(np.eye(2, dtype=np.float32))).is_equal_to([0, 1])

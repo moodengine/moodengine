@@ -120,7 +120,7 @@ from moodengine.mood_arc import (
 )
 
 # --- ambient journey (SLERP geodesic + opt-in optimal transport; torch-free) ---
-from moodengine.journey import ot_morph, path_between
+from moodengine.journey import journey_tracks, ot_morph, path_between, smooth_order
 
 # --- search (text->audio, audio->audio) ---
 from moodengine.search import (
@@ -342,6 +342,8 @@ __all__ = [
     "segment_bounds",
     # ambient journey
     "path_between",
+    "smooth_order",
+    "journey_tracks",
     "ot_morph",
     # search
     "similarity_matrix",
