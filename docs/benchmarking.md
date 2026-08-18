@@ -68,18 +68,26 @@ label noise.
 
 ### What this has already settled
 
-Measured on 150 DEAM songs (`--seed 0`), zero-shot, CLAP against MuQ-MuLan:
+Zero-shot, CLAP against MuQ-MuLan, paired Pearson difference on the same songs:
 
-| axis | CLAP | MuQ-MuLan | paired Δ (95 % CI) |
-| --- | --- | --- | --- |
-| energy  | 0.513 | **0.600** | +0.087 [−0.015, +0.196] |
-| valence | **0.483** | 0.387 | −0.096 [−0.238, +0.045] |
+| n | energy Δ (95 % CI) | valence Δ (95 % CI) |
+| --- | --- | --- |
+| 150 | +0.087 [−0.015, +0.196] — in the noise | −0.096 [−0.238, +0.045] — in the noise |
+| **400** | **+0.073 [+0.013, +0.136]** — real | **−0.097 [−0.182, −0.030]** — real |
 
-MuQ-MuLan reads arousal better and valence worse, and **neither difference clears the
-noise floor at this sample size**. That is worth stating plainly, because MuQ-MuLan looks
-clearly ahead on the separability diagnostics (`label_direction_redundancy` reports mean
-mutual cosine 0.400 against CLAP's 0.568) — and separability is not accuracy. Keep both
-backbones and measure on your own library.
+**Neither backbone dominates.** MuQ-MuLan reads arousal significantly better and valence
+significantly worse, and the split is by axis rather than a sampling artifact — at n=150
+both intervals straddled zero, at n=400 both exclude it in opposite directions. Pick by
+which axis your application leans on, or keep both.
+
+Two things this pair of rows demonstrates about the protocol itself. The n=150 row is why
+an interval is mandatory: the point estimates there (+0.087, −0.096) look decisive and are
+not. And the sample size needed to resolve a ~0.08 difference on this data is somewhere
+between 150 and 400 songs — worth knowing before trusting a quick `--limit 100` run.
+
+It also shows why separability is not accuracy. MuQ-MuLan is clearly ahead on
+`label_direction_redundancy` (mean mutual cosine 0.400 against CLAP's 0.568) yet loses
+half the accuracy comparison.
 
 ### A gap that remains
 
