@@ -102,3 +102,38 @@ and not the paired comparisons (both arms inherit the same inflation).
 correlation on CPU. The cap of 12 ten-second segments never bites on DEAM's 45-second
 clips, so this benchmark exercises temporal *pooling* but not the long-track segment
 *selection* policy — that behaviour is pinned by the `io_audio` unit tests instead.
+
+## Text -> playlist retrieval
+
+`scripts/bench_text_retrieval.py` measures the headline capability — type a mood, get
+tracks — which had no measurement at all: `evaluate_text_queries` shipped with zero callers,
+so a regression from a prompt, pooling or recentering change would have been invisible.
+
+```bash
+uv run --extra models python scripts/bench_text_retrieval.py \
+    --data-dir ~/moodengine-bench/deam --limit 400 --embedder clap
+```
+
+**Relevance comes from DEAM's human ratings, not from the engine.** Scoring against the
+engine's own mood labels would grade the labeller with its own answers. Instead each of four
+pole queries takes as relevant the top (or bottom) quartile of songs by *annotator*
+arousal/valence, while the ranking comes from the text encoder alone. `--quantile` sets that
+cut, and it is also the random-ranking floor: at the default 0.25 a coin flip scores
+P@10 = 0.25, so read that first.
+
+Measured on 400 songs, `k=10`:
+
+| query | CLAP P@10 | MuQ-MuLan P@10 |
+| --- | --- | --- |
+| high-energy, intense, driving | 0.700 | 0.600 |
+| calm, quiet, low-energy | 0.700 | 0.500 |
+| **happy, cheerful, positive** | **0.300** | **0.100** |
+| sad, gloomy, negative | 0.700 | 0.600 |
+| **macro P@10** | **0.600** [0.425, 0.750] | 0.450 [0.312, 0.625] |
+| macro MAP | **0.448** [0.405, 0.497] | 0.420 [0.382, 0.449] |
+
+Two things worth acting on. **Positive valence is the stack's weak spot**: "happy" retrieves
+at 0.300 against a 0.250 floor for CLAP, and at 0.100 — *below* chance, i.e. anti-correlated
+— for MuQ-MuLan, while every other pole clears 0.500. And **CLAP wins retrieval** even though
+MuQ-MuLan wins arousal regression, which is the third independent measurement agreeing that
+neither backbone dominates.
