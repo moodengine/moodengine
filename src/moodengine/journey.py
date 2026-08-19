@@ -227,8 +227,9 @@ def journey_tracks(
 
 
 #: Above this many tracks the exact ordering is abandoned for 2-opt. Held-Karp is O(2^n · n²), so
-#: 12 costs about 590k operations (sub-millisecond) while 16 would cost ~17M — the wall is steep
-#: and close, which is why the cutoff is a constant rather than a knob.
+#: 12 costs about 590k state transitions — measured at ~80 ms free-start on Apple Silicon, since
+#: the DP is a plain Python loop — while 16 would cost ~17M and land in the tens of seconds. The
+#: wall is steep and close, which is why the cutoff is a constant rather than a knob.
 _EXACT_ORDER_MAX: int = 12
 
 
@@ -241,68 +242,83 @@ def smooth_order(X: np.ndarray, start: int | None = None) -> list[int]:
     cosine distance along the sequence — the open-path travelling-salesman objective, no return to
     the start.
 
-    Exact below :data:`_EXACT_ORDER_MAX` tracks via Held-Karp dynamic programming over subsets
-    (``O(2^n · n²)``, sub-millisecond at 12); above it, a nearest-neighbour tour refined by 2-opt
-    until no swap improves, which is not optimal but is the standard practical answer and stays
-    milliseconds at playlist sizes.
+    Exact up to :data:`_EXACT_ORDER_MAX` tracks via Held-Karp dynamic programming over subsets
+    (``O(2^n · n²)``, ~80 ms at 12 — the DP is a Python loop, not a numpy kernel); above it, a
+    nearest-neighbour tour refined by 2-opt until no swap improves, which is not optimal but is the
+    standard practical answer and stays milliseconds at playlist sizes.
 
     ``X`` ``(n, d)`` are track embeddings, re-L2-normalized defensively. ``start`` pins the opening
-    track (a row index) when the caller has one in mind; ``None`` lets the optimizer choose. Returns
-    a permutation of ``range(n)``. Guards ``n <= 2`` (nothing to reorder). Deterministic; ties
-    resolve to the lowest index. Pure numpy.
+    track (a row index) when the caller has one in mind; ``None`` lets the optimizer choose, at no
+    asymptotic cost — every origin is seeded into the same DP pass. A ``start`` outside
+    ``[0, n)`` raises ``ValueError`` rather than being reinterpreted.
+
+    Returns a permutation of ``range(n)``. ``n <= 2`` has nothing to reorder, but a pinned
+    ``start`` still decides which of two tracks opens. An empty input returns ``[]`` before
+    ``start`` is validated, so sizing a degenerate call never raises. Deterministic. Pure numpy.
     """
     Xn = l2_normalize(np.asarray(X, dtype=np.float32), axis=1)
     n = Xn.shape[0] if Xn.ndim == 2 else 0
     if n == 0:
         return []
+    if start is not None and not 0 <= int(start) < n:
+        # Refused rather than reinterpreted. An out-of-range index used to mean "choose freely"
+        # below the exact cutoff and "pin row 0" above it, so one typo produced two different
+        # playlists depending on how many tracks were passed.
+        raise ValueError(f"start must be a row index in [0, {n}); got {start}")
     if n <= 2:
-        return list(range(n))
+        # Nothing to optimize, but `start` still decides which of the two opens.
+        return [int(start), 1 - int(start)] if n == 2 and start is not None else list(range(n))
 
     cost = (1.0 - Xn @ Xn.T).astype(np.float64)  # cosine distance
     np.fill_diagonal(cost, 0.0)
-    starts = [int(start)] if start is not None and 0 <= int(start) < n else list(range(n))
 
     if n <= _EXACT_ORDER_MAX:
-        return _held_karp_path(cost, starts)
-    return _two_opt_path(cost, starts[0] if start is not None else _cheapest_nn_start(cost))
+        return _held_karp_path(cost, [int(start)] if start is not None else list(range(n)))
+    return _two_opt_path(cost, int(start) if start is not None else _cheapest_nn_start(cost))
 
 
 def _held_karp_path(cost: np.ndarray, starts: list[int]) -> list[int]:
-    """Exact minimum-cost open Hamiltonian path by subset DP, over the allowed start nodes."""
+    """Exact minimum-cost open Hamiltonian path by subset DP, over the allowed start nodes.
+
+    ONE pass however many origins are allowed: each is seeded as its own singleton state, so the
+    DP explores all of them at once and the stated ``O(2^n · n²)`` holds. Re-running the whole DP
+    per origin multiplied that by ``n`` on the DEFAULT free-start path — measured at 0.43 s versus
+    0.036 s pinned, for 12 tracks.
+    """
     n = cost.shape[0]
-    best_tour, best_cost = list(range(n)), float("inf")
     full = 1 << n
+    # dp[mask][j] = cheapest path visiting exactly `mask`, opening at any allowed start, ending at
+    # `j`. A state is reachable only from a seeded singleton, so `parent == -1` still terminates
+    # the reconstruction at whichever origin won.
+    dp = np.full((full, n), np.inf)
+    parent = np.full((full, n), -1, dtype=np.int32)
     for origin in starts:
-        # dp[mask][j] = cheapest path visiting `mask`, starting at `origin`, ending at `j`.
-        dp = np.full((full, n), np.inf)
-        parent = np.full((full, n), -1, dtype=np.int32)
         dp[1 << origin, origin] = 0.0
-        for mask in range(full):
-            if not (mask >> origin) & 1:
+
+    for mask in range(full):
+        for j in range(n):
+            here = dp[mask, j]
+            if not np.isfinite(here) or not (mask >> j) & 1:
                 continue
-            for j in range(n):
-                here = dp[mask, j]
-                if not np.isfinite(here) or not (mask >> j) & 1:
+            for nxt in range(n):
+                if (mask >> nxt) & 1:
                     continue
-                for nxt in range(n):
-                    if (mask >> nxt) & 1:
-                        continue
-                    nmask = mask | (1 << nxt)
-                    cand = here + cost[j, nxt]
-                    if cand < dp[nmask, nxt]:
-                        dp[nmask, nxt] = cand
-                        parent[nmask, nxt] = j
-        end = int(np.argmin(dp[full - 1]))
-        if dp[full - 1, end] < best_cost:
-            best_cost = float(dp[full - 1, end])
-            tour, mask, node = [], full - 1, end
-            while node != -1:
-                tour.append(node)
-                prev = int(parent[mask, node])
-                mask ^= 1 << node
-                node = prev
-            best_tour = tour[::-1]
-    return [int(i) for i in best_tour]
+                nmask = mask | (1 << nxt)
+                cand = here + cost[j, nxt]
+                if cand < dp[nmask, nxt]:
+                    dp[nmask, nxt] = cand
+                    parent[nmask, nxt] = j
+
+    end = int(np.argmin(dp[full - 1]))
+    if not np.isfinite(dp[full - 1, end]):  # pragma: no cover — unreachable for a finite cost
+        return list(range(n))
+    tour, mask, node = [], full - 1, end
+    while node != -1:
+        tour.append(node)
+        prev = int(parent[mask, node])
+        mask ^= 1 << node
+        node = prev
+    return [int(i) for i in tour[::-1]]
 
 
 def _cheapest_nn_start(cost: np.ndarray) -> int:

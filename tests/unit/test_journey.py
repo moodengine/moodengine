@@ -267,7 +267,63 @@ def test_smooth_order_honours_a_pinned_start() -> None:
     assert_that(smooth_order(X, start=7)[0]).is_equal_to(7)  # 2-opt path
 
 
+def test_smooth_order_pinned_start_is_optimal_among_paths_opening_there() -> None:
+    """Pinning must constrain the search, not weaken it: the answer is still the exact minimum
+    over every path that opens at `start`. Guards the single-pass DP — seeding one origin instead
+    of all of them has to keep Held-Karp exact."""
+    import itertools
+
+    rng = np.random.default_rng(6)
+    X = rng.standard_normal((8, 6)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    rest = [i for i in range(8) if i != 5]
+
+    order = smooth_order(X, start=5)
+    brute = min(([5, *p] for p in itertools.permutations(rest)), key=lambda t: _path_cost(X, t))
+
+    assert_that(_path_cost(X, order)).is_close_to(_path_cost(X, brute), tolerance=1e-9)
+
+
+def test_smooth_order_free_start_costs_one_dp_pass_not_n(monkeypatch) -> None:
+    """Every allowed origin is seeded into ONE subset DP. Re-running the whole DP per origin
+    multiplied the documented `O(2^n * n^2)` by n on the DEFAULT free-start path."""
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((9, 5)).astype(np.float32)
+    calls: list[int] = []
+    real = journey._held_karp_path
+    monkeypatch.setattr(
+        journey, "_held_karp_path", lambda c, st: (calls.append(len(st)), real(c, st))[1]
+    )
+
+    smooth_order(X)
+
+    assert_that(calls).is_equal_to([9])  # nine origins, one call
+
+
+def test_smooth_order_rejects_a_start_outside_the_row_range() -> None:
+    """Refused, not reinterpreted. Out of range used to mean "choose freely" below the exact
+    cutoff and "pin row 0" above it, so one typo gave two different playlists by input size."""
+    X = np.eye(6, dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"start must be a row index in \[0, 6\); got 99"):
+        smooth_order(X, start=99)
+    with pytest.raises(ValueError, match=r"start must be a row index in \[0, 6\); got -1"):
+        smooth_order(X, start=-1)
+
+
+def test_smooth_order_two_tracks_still_honour_a_pinned_start() -> None:
+    """`n <= 2` has nothing to optimize, but which of the two OPENS is still the caller's call —
+    the early return used to discard `start` before reading it."""
+    X = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+    assert_that(smooth_order(X, start=1)).is_equal_to([1, 0])
+    assert_that(smooth_order(X, start=0)).is_equal_to([0, 1])
+    assert_that(smooth_order(X)).is_equal_to([0, 1])
+
+
 def test_smooth_order_degenerate_inputs_are_returned_as_is() -> None:
     """Nothing to reorder below three tracks — an identity, never a raise."""
     assert_that(smooth_order(np.empty((0, 4), dtype=np.float32))).is_empty()
+    # An empty input returns before `start` is validated: sizing a degenerate call never raises.
+    assert_that(smooth_order(np.empty((0, 4), dtype=np.float32), start=0)).is_empty()
     assert_that(smooth_order(np.eye(2, dtype=np.float32))).is_equal_to([0, 1])
