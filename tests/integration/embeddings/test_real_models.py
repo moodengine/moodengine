@@ -1,13 +1,15 @@
-"""Integration test against the REAL MERT/CLAP models (torch required).
+"""Integration test against the REAL MERT / CLAP / MuQ-MuLan models (torch required).
 
 Opt-in only: marked ``model`` and deselected by default (see pyproject addopts
 ``-m 'not model'``). Run explicitly with::
 
-    pytest -m model
+    uv run --extra models --extra muq pytest -m model
 
-Needs the ``models`` extra (``uv sync --extra models``) and the checkpoints downloaded
-(MERT-v1-95M + the CLAP music checkpoint). Validates that the real embedders
-honor the Embedder contract end-to-end.
+Needs the ``models`` extra for MERT and CLAP and the ``muq`` extra on top of it for
+MuQ-MuLan, plus the checkpoints downloaded (MERT-v1-95M, the CLAP music checkpoint,
+and the three hub repos MuQ-MuLan pulls). The MuQ-MuLan tests ``importorskip`` when
+``muq`` is absent, so a run without that extra reports green while testing nothing —
+install both. Validates that the real embedders honor the Embedder contract end-to-end.
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ def test_real_mulan_rejects_off_rate_audio(synth_clip):
     cfg = default_config()
     embedder = mulan.MuLanEmbedder(cfg)
 
-    with pytest.raises(ValueError, match=r"received audio at 48000 Hz but expects 24000 Hz"):
+    with pytest.raises(ValueError, match=r"received audio at 48000 Hz .* declares 24000 Hz"):
         embedder.extract(synth_clip("tone", seconds=1.0, sr=48_000), 48_000)
 
 
@@ -110,6 +112,31 @@ def test_real_clap_batched_extract_matches_the_per_segment_path(synth_clip):
 
     one_at_a_time = np.vstack([clap.extract(s, cfg.clap_sample_rate) for s in segments])
     batched = np.vstack(clap.extract_batch(segments, cfg.clap_sample_rate))
+
+    np.testing.assert_allclose(batched, one_at_a_time, atol=2e-6)
+
+
+def test_real_clap_batched_extract_rejects_off_rate_audio(synth_clip):
+    """The batched path applies the SAME checkpoint-rate guard as `extract`. It used to ignore its
+    own `sr` argument entirely — and since the pipeline probes for `extract_batch` and takes it
+    whenever present, that made the guard unreachable on the only path that embeds a library."""
+    cfg = default_config()
+    clap = get_embedder("clap", cfg)
+
+    with pytest.raises(ValueError, match="declares"):
+        clap.extract_batch([synth_clip("tone", seconds=1.0, sr=16_000)], 16_000)
+
+
+def test_real_clap_batched_extract_pads_a_sub_floor_segment_like_extract(synth_clip):
+    """`segment_waveform` returns a trailing window below the ~10 ms floor on very short files.
+    `extract` pads it; the batched path must too, or the base contract ("overriding must not
+    change the numbers") breaks on exactly the input that motivated the ragged grouping."""
+    cfg = default_config()
+    clap = get_embedder("clap", cfg)
+    sub_floor = np.zeros(3, dtype=np.float32)  # far below sample_rate // 100
+
+    one_at_a_time = clap.extract(sub_floor, cfg.clap_sample_rate)
+    batched = clap.extract_batch([sub_floor], cfg.clap_sample_rate)[0]
 
     np.testing.assert_allclose(batched, one_at_a_time, atol=2e-6)
 

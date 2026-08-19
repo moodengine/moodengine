@@ -70,6 +70,10 @@ class MuLanEmbedder(Embedder):
         Constructing this downloads roughly 5 GB across THREE hub repos, not one: the MuLan
         weights (~2.65 GB), plus the MuQ audio tower and ``xlm-roberta-base`` that its constructor
         builds before the MuLan state dict overwrites them. Budget for that on a cold start.
+
+        ``config.mulan_revision`` pins the hub snapshot; ``None`` (the default) takes the latest.
+        Whatever it resolves to also enters the embedding cache key, so moving it mints new keys
+        rather than serving the previous snapshot's vectors.
         """
         self.config = config
         self.sample_rate = config.mulan_sample_rate
@@ -80,7 +84,9 @@ class MuLanEmbedder(Embedder):
             self.device,
         )
         try:
-            self.model = MuQMuLan.from_pretrained(config.mulan_model_name)
+            self.model = MuQMuLan.from_pretrained(
+                config.mulan_model_name, revision=config.mulan_revision
+            )
             self.model = self.model.to(self.device).eval()
         except Exception as exc:  # noqa: BLE001 — hub/torch errors never name the artifact
             # A network failure surfaces upstream as `__init__() missing 1 required positional
@@ -96,19 +102,37 @@ class MuLanEmbedder(Embedder):
             ) from exc
         logger.info("MuQ-MuLan ready on %s", self.device)
 
+    def _model_sample_rate(self) -> int | None:
+        """The rate the LOADED checkpoint declares, or ``None`` if it cannot be read.
+
+        Checked against this rather than against ``config.mulan_sample_rate``: the pipeline calls
+        ``extract(seg, sr=embedder.sample_rate)``, which echoes the config, so comparing the two
+        would agree even when the config itself is wrong — the same reasoning as the MERT and CLAP
+        embedders. ``MuQMuLan`` exposes ``.sr`` directly and repeats it under ``.config.mulan.sr``;
+        both are read defensively (``None`` skips the check) because neither is a published API and
+        a missing attribute must not stop a correctly-configured run.
+        """
+        rate = getattr(self.model, "sr", None)
+        if not isinstance(rate, (int, float)):
+            mulan_cfg = getattr(getattr(self.model, "config", None), "mulan", None)
+            rate = mulan_cfg.get("sr") if isinstance(mulan_cfg, dict) else None
+        return int(rate) if isinstance(rate, (int, float)) else None
+
     def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
         """Embed one mono float32 waveform into a clip-level vector.
 
-        Returns a 1-D ``(512,)`` float32 array, L2-normalized. ``sr`` must equal
-        ``self.sample_rate`` (24 kHz); a mismatch raises ``ValueError`` instead of being silently
+        Returns a 1-D ``(512,)`` float32 array, L2-normalized. ``sr`` must match the rate the
+        LOADED model declares (24 kHz); a mismatch raises ``ValueError`` instead of being silently
         relabeled, because off-rate audio time/pitch-warps every embedding. Inputs shorter than
         one internal clip are wrap-padded by the model itself, so no floor is applied here.
         """
-        if int(sr) != int(self.sample_rate):
+        expected = self._model_sample_rate()
+        if expected is not None and int(sr) != expected:
             raise ValueError(
-                f"MuQ-MuLan received audio at {int(sr)} Hz but expects {int(self.sample_rate)} Hz; "
-                f"set config.mulan_sample_rate={int(self.sample_rate)} so audio is decoded at the "
-                "model's rate (off-rate audio silently warps every embedding)."
+                f"MuQ-MuLan received audio at {int(sr)} Hz but the loaded checkpoint "
+                f"({self.config.mulan_model_name!r}) declares {expected} Hz; set "
+                f"config.mulan_sample_rate={expected} so audio is decoded at the model's rate "
+                "(off-rate audio silently warps every embedding)."
             )
         wav = np.asarray(waveform, dtype=np.float32).reshape(-1)
         with torch.inference_mode():

@@ -255,8 +255,10 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # `muq` too, or the three real MuQ-MuLan tests importorskip on every run and the
+      # only job that could catch a MuLan regression silently reports green.
       - name: Install with model backbones
-        run: uv sync --locked --extra models
+        run: uv sync --locked --extra models --extra muq
 
       - name: Tests (real models)
         run: uv run pytest -m model

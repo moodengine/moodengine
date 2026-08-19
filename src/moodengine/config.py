@@ -31,9 +31,34 @@ AUDIO_EXTENSIONS: tuple[str, ...] = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".
 # depends on ambient process state, is persisted under a cache key that cannot encode the draw, and
 # differs on a `force=True` recompute. The 10 s default lands on exactly 480000 samples at 48 kHz
 # and so takes the deterministic branch — safe by arithmetic coincidence, not by design, which is
-# why it is enforced rather than merely documented. Enforced in `CLAPEmbedder.__init__` (the only
-# place it applies) rather than in `Config`, which cannot know whether CLAP will be used at all.
+# why it is enforced rather than merely documented. Enforced by `ensure_clap_fusion_supported`
+# below rather than in `Config.__post_init__`, which cannot know whether CLAP will be used at all.
 CLAP_FUSION_SAMPLE_LIMIT: int = 480_000
+
+
+def ensure_clap_fusion_supported(config: "Config") -> None:
+    """Raise ``ValueError`` when this config would push CLAP past :data:`CLAP_FUSION_SAMPLE_LIMIT`.
+
+    Pure arithmetic on two config fields — no torch, no weights — which is what lets the check run
+    at both entry points that matter. ``CLAPEmbedder.__init__`` calls it for anyone constructing
+    the embedder directly, and the pipeline's lazy proxy calls it at CONSTRUCTION, before any
+    per-file loop that skips-and-continues could turn a refusal into a warning, and regardless of
+    how much of the run is served from cache. A configuration error must not depend on cache state.
+
+    No-op for every other embedder: a MERT-only run at 15 s segments is perfectly valid, which is
+    exactly why this cannot live in ``Config.__post_init__``.
+    """
+    samples = config.segment_seconds * config.clap_sample_rate
+    if samples > CLAP_FUSION_SAMPLE_LIMIT:
+        raise ValueError(
+            f"segment_seconds={config.segment_seconds} at clap_sample_rate="
+            f"{config.clap_sample_rate} gives {samples:.0f} samples per segment, above the "
+            f"{CLAP_FUSION_SAMPLE_LIMIT} at which laion-clap truncates by drawing chunks from "
+            "the unseeded global numpy RNG. Embeddings past that point are not reproducible "
+            "and would be cached as if they were, so this refuses rather than producing them. "
+            f"Use segment_seconds <= {CLAP_FUSION_SAMPLE_LIMIT / config.clap_sample_rate:g} "
+            "for CLAP (MERT has no such limit)."
+        )
 
 
 def default_cache_dir() -> Path:
@@ -115,6 +140,11 @@ class Config:
     # MuQ-MuLan: the alternative audio-text backbone (embedder name "mulan"). 24 kHz like MERT,
     # NOT CLAP's 48 kHz. Weights are CC-BY-NC-4.0 — see embeddings/mulan.py.
     mulan_model_name: str = "OpenMuQ/MuQ-MuLan-large"
+    # Hub revision (branch/tag/SHA) for mulan_model_name, mirroring mert_revision. None takes the
+    # hub's latest, which means the weights behind a cached vector are not pinned; set it to a SHA
+    # for a reproducible run. Whatever it resolves to also enters the embedding cache key, so a
+    # revision change mints new keys instead of serving another snapshot's vectors.
+    mulan_revision: str | None = None
     mulan_sample_rate: int = 24_000
     clap_enable_fusion: bool = False
     clap_amodel: str = "HTSAT-base"

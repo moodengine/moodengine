@@ -19,8 +19,9 @@ import pandas as pd
 import pytest
 from assertpy import assert_that
 
+import moodengine.io_audio as _io
 import moodengine.pipeline as pipeline
-from moodengine.config import default_config
+from moodengine.config import default_config, ensure_clap_fusion_supported
 from moodengine.exceptions import MissingDependencyError
 
 DIM = 8  # audio + text embedding dimensionality used by the fake embedder.
@@ -111,6 +112,109 @@ def test_get_embedder_without_models_extra_raises_missing_dependency(name: str) 
     # MissingDependencyError naming the extra, not a bare ModuleNotFoundError.
     with pytest.raises(MissingDependencyError, match=r"moodengine\[models\]"):
         _real_get_embedder(name, default_config())
+
+
+# --------------------------------------------------------------------------- #
+# CLAP fusion refusal — a config that would cache irreproducible vectors
+# --------------------------------------------------------------------------- #
+
+
+def test_clap_fusion_limit_accepts_the_default_segment_length() -> None:
+    """The 10 s default lands on exactly the limit at 48 kHz, so it must pass."""
+    ensure_clap_fusion_supported(default_config())
+
+
+@pytest.mark.parametrize("segment_seconds", [10.01, 15.0, 30.0])
+def test_clap_fusion_limit_refuses_segments_past_the_truncation_point(segment_seconds) -> None:
+    """Past the limit laion-clap picks which chunks to keep from the GLOBAL unseeded numpy RNG,
+    so the vector is not reproducible and would be cached as if it were."""
+    config = dataclasses.replace(default_config(), segment_seconds=segment_seconds)
+
+    with pytest.raises(ValueError, match="unseeded global numpy RNG"):
+        ensure_clap_fusion_supported(config)
+
+
+def test_lazy_embedder_refuses_the_clap_fusion_config_at_construction() -> None:
+    """Eagerly, before any weight is touched: deferring the load moved the refusal inside
+    `extract_embeddings`' per-file `except`, which turned it into one warning per file and an
+    empty result matrix. It must not depend on how much of the run is served from cache either."""
+    config = dataclasses.replace(default_config(), segment_seconds=15.0)
+
+    with pytest.raises(ValueError, match="segment_seconds=15.0"):
+        pipeline.LazyEmbedder("clap", config)
+
+
+def test_lazy_embedder_allows_long_segments_for_mert() -> None:
+    """The limit is a property of laion-clap, not of the configuration — a MERT-only run at 15 s
+    segments is perfectly valid and must not be blocked by CLAP's constraint."""
+    config = dataclasses.replace(default_config(), segment_seconds=15.0)
+
+    embedder = pipeline.LazyEmbedder("mert", config)
+
+    assert_that(embedder.loaded).is_false()
+    assert_that(embedder.sample_rate).is_equal_to(config.mert_sample_rate)
+
+
+def test_extract_embeddings_propagates_the_fusion_refusal_instead_of_skipping(
+    tmp_path, monkeypatch
+) -> None:
+    """A configuration error is not a property of one file. Skipping it logged one identical
+    warning per track and returned an empty matrix that reads exactly like "no audio found"."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.wav").write_bytes(b"")
+    monkeypatch.setattr(_io, "discover_audio_files", lambda *_a, **_k: [raw / "a.wav"])
+    config = dataclasses.replace(
+        default_config(), raw_dir=raw, cache_dir=tmp_path / "cache", segment_seconds=15.0
+    )
+
+    with pytest.raises(ValueError, match="unseeded global numpy RNG"):
+        pipeline.extract_embeddings(config, "clap")
+
+
+def test_extract_embeddings_reraises_a_missing_dependency_instead_of_skipping_every_file(
+    tmp_path, monkeypatch
+) -> None:
+    """Same reasoning for a missing backbone: the run cannot embed ANY file, so it fails once
+    rather than emitting the same warning per track."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.wav").write_bytes(b"")
+    monkeypatch.setattr(_io, "discover_audio_files", lambda *_a, **_k: [raw / "a.wav"])
+    monkeypatch.setattr(_io, "load_audio", lambda *_a, **_k: np.zeros(24_000, dtype=np.float32))
+
+    def _absent(_name, _config):
+        raise MissingDependencyError("MuQ-MuLan embedding", "torch + muq", "models,muq")
+
+    monkeypatch.setattr(pipeline, "get_embedder", _absent)
+    config = dataclasses.replace(default_config(), raw_dir=raw, cache_dir=tmp_path / "cache")
+
+    with pytest.raises(MissingDependencyError, match=r"moodengine\[models,muq\]"):
+        pipeline.extract_embeddings(config, "mulan")
+
+
+def test_cache_extra_encodes_the_decode_rate_for_an_embedder_with_no_legacy_cache() -> None:
+    """MuQ-MuLan has no pre-1.0 cache, so its rate must always reach the key. Defaulting the
+    "legacy" rate to the CURRENT one made that comparison a tautology, and a config sitting on the
+    legacy defaults everywhere else produced a key that did not encode the rate at all."""
+    config = dataclasses.replace(default_config(), segment_selection="head")
+
+    at_24k = pipeline._embedding_cache_extra(_FakeEmbedder("mulan", 24_000), config)
+    at_16k = pipeline._embedding_cache_extra(_FakeEmbedder("mulan", 16_000), config)
+
+    assert_that(at_24k).contains("_cfg-")
+    assert_that(at_24k).is_not_equal_to(at_16k)
+
+
+def test_cache_extra_encodes_the_mulan_hub_revision() -> None:
+    """The weights behind a cached vector are part of what produced it, and an unpinned hub
+    reference can move underneath the cache — exactly why MERT pins its revision in the key."""
+    base = default_config()
+    emb = _FakeEmbedder("mulan", 24_000)
+
+    assert_that(pipeline._embedding_cache_extra(emb, base)).is_not_equal_to(
+        pipeline._embedding_cache_extra(emb, dataclasses.replace(base, mulan_revision="abc1234"))
+    )
 
 
 _BASE_COLUMNS = ["filename", "path", "cluster", "x", "y", "is_medoid", "outlier_score"]
