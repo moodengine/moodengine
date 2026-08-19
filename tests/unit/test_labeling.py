@@ -28,6 +28,8 @@ from moodengine.labeling import (
     compose_mood_vector,
     label_direction_redundancy,
     MOOD_AFFECT,
+    attribute_priors,
+    axis_prior,
     label_prior,
     label_tracks,
     labeling_quality_metrics,
@@ -638,6 +640,73 @@ def test_label_prior_makes_a_track_label_independent_of_its_batch() -> None:
     )
 
     np.testing.assert_array_equal(alone, full[:5])
+
+
+def test_attribute_priors_make_a_track_axis_score_independent_of_its_batch(fake_clap) -> None:
+    """The energy/valence counterpart of the mood prior. Without the pair, these two shipped
+    columns were the only ones a later single-track re-score could not reproduce — and that path
+    also sits below ``recenter_similarities``' ``min_n``, so it skipped centering entirely."""
+    rng = np.random.default_rng(11)
+    corpus = l2_normalize(rng.standard_normal((40, 8)).astype(np.float32), axis=1)
+    energy_prior, valence_prior = attribute_priors(corpus, fake_clap)
+
+    full = attribute_scores(
+        corpus, fake_clap, energy_prior=energy_prior, valence_prior=valence_prior
+    )
+    alone = pd.concat(
+        [
+            attribute_scores(
+                corpus[i : i + 1],
+                fake_clap,
+                energy_prior=energy_prior,
+                valence_prior=valence_prior,
+            )
+            for i in range(5)
+        ],
+        ignore_index=True,
+    )
+
+    np.testing.assert_allclose(alone["energy"], full["energy"][:5], atol=1e-6)
+    np.testing.assert_allclose(alone["valence"], full["valence"][:5], atol=1e-6)
+
+
+def test_attribute_scores_without_priors_couple_a_single_track_to_its_batch(fake_clap) -> None:
+    """The counterpart, so the test above is proving something: with no prior a lone track falls
+    below ``min_n`` and is not centered at all, which moves its score. Read at a temperature that
+    does not saturate the two-pole softmax — at the default the probability pins to 1.0 and hides
+    an offset that is still there."""
+    rng = np.random.default_rng(11)
+    corpus = l2_normalize(rng.standard_normal((40, 8)).astype(np.float32), axis=1)
+
+    full = attribute_scores(corpus, fake_clap, temperature=1.0)
+    alone = attribute_scores(corpus[:1], fake_clap, temperature=1.0)
+
+    assert_that(float(alone["energy"].iloc[0])).is_not_close_to(
+        float(full["energy"].iloc[0]), tolerance=1e-4
+    )
+
+
+def test_axis_prior_is_the_per_pole_mean_cosine(fake_clap) -> None:
+    """``axis_prior`` is ``label_prior`` for a two-pole axis: the column means of the corpus's
+    similarities to the two poles."""
+    rng = np.random.default_rng(12)
+    corpus = l2_normalize(rng.standard_normal((30, 8)).astype(np.float32), axis=1)
+    _, matrix = build_label_matrix(fake_clap, ENERGY_PROMPTS)
+
+    prior = axis_prior(corpus, fake_clap, ENERGY_PROMPTS)
+
+    assert_that(prior.shape).is_equal_to((2,))
+    assert_that(prior.dtype).is_equal_to(np.float32)
+    np.testing.assert_allclose(prior, (corpus @ matrix.T).mean(axis=0), atol=1e-6)
+
+
+def test_axis_prior_accepts_a_single_row(fake_clap) -> None:
+    """A 1-D input is promoted to one row rather than raising — same contract as ``score_axis``."""
+    row = l2_normalize(np.random.default_rng(13).standard_normal(8).astype(np.float32), axis=0)
+
+    prior = axis_prior(row, fake_clap, VALENCE_PROMPTS)
+
+    assert_that(prior.shape).is_equal_to((2,))
 
 
 def test_batch_mean_recentering_does_couple_labels_to_the_batch() -> None:
