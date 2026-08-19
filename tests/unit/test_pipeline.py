@@ -440,6 +440,70 @@ def test_write_cluster_report_standalone(tmp_config):
     assert_that(text).contains("a.wav")  # example filename listed
 
 
+def test_write_cluster_report_surfaces_the_original_space_silhouette_and_verdict(tmp_config):
+    """The report labels the space its headline silhouette was scored in and prints the
+    original-space score beside it, so a persisted file cannot certify UMAP's own artifact."""
+    df = pd.DataFrame({"filename": ["a.wav"], "cluster": [0]})
+    metrics = {
+        "n_clusters": 3,
+        "noise_ratio": 0.0,
+        "silhouette": 0.275,
+        "silhouette_space": "reduced",
+        "silhouette_original": 0.011,
+        "structure": "weak",
+    }
+    out_path = tmp_config.output_dir / "report.md"
+    tmp_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    text = pipeline.write_cluster_report(
+        df, {}, metrics, tmp_config, "hdbscan", out_path=out_path
+    ).read_text(encoding="utf-8")
+
+    assert_that(text).contains("**Silhouette:** 0.275 (reduced space)")
+    assert_that(text).contains("**Silhouette (original space):** 0.011")
+    assert_that(text).contains("**Structure:** weak")
+
+
+def test_write_cluster_report_warns_in_the_file_when_no_structure_is_detected(tmp_config):
+    """A `none_detected` verdict opens the report with an explicit warning. The log line
+    run_clustering emits is gone by the time someone reads the file; this one is not."""
+    df = pd.DataFrame({"filename": ["a.wav"], "cluster": [0]})
+    metrics = {
+        "n_clusters": 19,
+        "noise_ratio": 0.1,
+        "silhouette": 0.275,
+        "silhouette_space": "reduced",
+        "silhouette_original": 0.011,
+        "structure": "none_detected",
+    }
+    out_path = tmp_config.output_dir / "report.md"
+    tmp_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    text = pipeline.write_cluster_report(
+        df, {}, metrics, tmp_config, "hdbscan", out_path=out_path
+    ).read_text(encoding="utf-8")
+
+    assert_that(text).contains("No substantial structure")
+    assert_that(text).contains("artifact of the dimensionality reduction")
+
+
+def test_write_cluster_report_omits_the_honesty_fields_when_absent(tmp_config):
+    """Bare `cluster_metrics` output (no run_clustering stamps) still renders a valid report:
+    the extra lines are read with `.get`, never required."""
+    df = pd.DataFrame({"filename": ["a.wav"], "cluster": [0]})
+    metrics = {"n_clusters": 1, "noise_ratio": 0.0, "silhouette": 0.5}
+    out_path = tmp_config.output_dir / "report.md"
+    tmp_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    text = pipeline.write_cluster_report(
+        df, {}, metrics, tmp_config, "kmeans", out_path=out_path
+    ).read_text(encoding="utf-8")
+
+    assert_that(text).contains("**Silhouette:** 0.500")
+    assert_that(text).does_not_contain("original space")
+    assert_that(text).does_not_contain("**Structure:**")
+
+
 def test_write_cluster_report_tolerates_missing_optionals(tmp_config):
     """The report does not crash when profiles/optional columns are absent."""
     df = pd.DataFrame({"filename": ["x.wav", "y.wav"], "cluster": [0, -1]})

@@ -80,7 +80,20 @@ def main(
     typer.echo(f"Clusters (excl. noise): {metrics['n_clusters']}")
     typer.echo(f"Noise ratio: {metrics['noise_ratio']:.3f}")
     typer.echo(f"Cluster sizes: {metrics['cluster_sizes']}")
-    typer.echo(f"Silhouette: {metrics['silhouette']}")
+    # Both silhouettes, always, and the verdict that reads the second one. The headline score is
+    # computed inside the space the clustering ran in — the UMAP layout by default, which was fit
+    # to separate these very points — so printing it alone reports structure the engine may have
+    # already judged absent.
+    space = metrics.get("silhouette_space")
+    typer.echo(f"Silhouette: {metrics['silhouette']}" + (f" ({space} space)" if space else ""))
+    typer.echo(f"Silhouette (original space): {metrics.get('silhouette_original')}")
+    structure = metrics.get("structure")
+    typer.echo(f"Structure: {structure}")
+    if structure == "none_detected":
+        typer.echo(
+            "  ^ the clusters above are largely an artifact of the reduction; the first "
+            "silhouette is not evidence to the contrary."
+        )
     typer.echo(f"Wrote {out_path}")
 
 
