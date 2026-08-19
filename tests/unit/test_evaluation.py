@@ -292,6 +292,80 @@ def test_ccc_penalizes_scale_mismatch_below_pearson() -> None:
     assert_that(ccc).is_less_than(0.95)
 
 
+def _load_retrieval_bench():
+    import importlib.util
+    import pathlib as _pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        "_ret",
+        _pathlib.Path(__file__).resolve().parents[2] / "scripts" / "bench_text_retrieval.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_retrieval_relevance_comes_from_the_gold_axis_not_the_engine() -> None:
+    """The non-circular half of the benchmark: a song is relevant to "high energy" because HUMAN
+    annotators rated it aroused, never because the engine labelled it so. Scoring against the
+    engine's own labels would grade the labeller with its own answers."""
+    bench = _load_retrieval_bench()
+    # (path, arousal, valence) with arousal ascending, so the top quartile is unambiguous.
+    sel = [(f"{i}.mp3", i / 99.0, 0.5) for i in range(100)]
+
+    relevant = bench._relevant_sets(sel, quantile=0.25)
+
+    high = relevant["a high-energy, intense, driving track"]
+    low = relevant["a calm, quiet, low-energy track"]
+    assert_that(min(high)).is_greater_than_or_equal_to(74)  # only the most-aroused quartile
+    assert_that(max(low)).is_less_than_or_equal_to(25)
+    assert_that(high & low).is_empty()  # the poles cannot both claim a song
+
+
+def test_retrieval_relevant_sets_track_the_quantile_they_are_asked_for() -> None:
+    """The relevant-set size IS the random-ranking floor, so it has to follow `--quantile` — a
+    reported floor that did not match the sets would misstate what beating chance means."""
+    bench = _load_retrieval_bench()
+    sel = [(f"{i}.mp3", i / 199.0, i / 199.0) for i in range(200)]
+
+    tight = bench._relevant_sets(sel, quantile=0.10)
+    loose = bench._relevant_sets(sel, quantile=0.40)
+
+    assert_that(len(tight["a high-energy, intense, driving track"])).is_close_to(20, tolerance=2)
+    assert_that(len(loose["a high-energy, intense, driving track"])).is_close_to(80, tolerance=2)
+
+
+def test_retrieval_perfect_ranking_beats_the_random_floor() -> None:
+    """End-to-end through the real `evaluate_text_queries`: an embedder whose text vector points
+    exactly at the high-arousal songs must score far above the quantile floor. Without this the
+    benchmark could report a number with nothing establishing what a good one looks like."""
+    bench = _load_retrieval_bench()
+    n = 100
+    sel = [(f"{i}.mp3", i / (n - 1), 0.5) for i in range(n)]
+    # One dimension carries arousal; the query vector points straight down it.
+    X = np.zeros((n, 2), dtype=np.float32)
+    X[:, 0] = np.linspace(0.0, 1.0, n)
+    X[:, 1] = 1.0
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    class _Oracle:
+        def embed_text(self, prompts):
+            return np.array([[1.0, 0.0]], dtype=np.float32)
+
+    scores = evaluate_text_queries(
+        {
+            "a high-energy, intense, driving track": bench._relevant_sets(sel, 0.25)[
+                "a high-energy, intense, driving track"
+            ]
+        },
+        X,
+        _Oracle(),
+        k=10,
+    )
+
+    assert_that(scores["macro_precision_at_k"]).is_equal_to(1.0)  # vs a 0.25 random floor
+
+
 def test_ccc_components_multiply_back_to_the_ccc() -> None:
     """Lin's decomposition is an identity, not an approximation: ``CCC == rho * c_b`` exactly.
     Pinned so the two halves can never drift from the scalar they explain."""
