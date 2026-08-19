@@ -189,7 +189,7 @@ def build_prompt_table(
 # affective science uses to place emotion words — expressed on the SAME [0, 1] scale as
 # `attribute_scores`, so a predicted mood and a measured axis are directly comparable.
 #
-# `kind` records something the vocabulary was mixing silently. Nine entries are affect words, whose
+# `kind` records something the vocabulary was mixing silently. Eleven entries are affect words, whose
 # circumplex position is what the word means. The rest are TEXTURE words — genre or production
 # descriptors that carry a loose affective connotation but are not primarily emotions; "jazzy" is
 # not a feeling. Their coordinates are the typical affect of music so described, which is a weaker
@@ -683,15 +683,21 @@ def score_axis(
     temperature: float = DEFAULT_TEMPERATURE,
     recenter: bool = True,
     prior: np.ndarray | None = None,
+    label_matrix: tuple[list[str], np.ndarray] | None = None,
 ) -> np.ndarray:
     """Score tracks on a two-pole axis as the softmax prob of the positive pole.
 
     ``axis_prompts`` must have exactly two entries ``{negative_pole, positive_pole}``
     (insertion order = [negative, positive]). When ``recenter``, the two pole similarities are
     centered via :func:`recenter_similarities` first — against ``prior`` (a ``(2,)`` offset from
-    :func:`label_prior`, applying at any ``n``) when given, else this batch's own means for
+    :func:`axis_prior`, applying at any ``n``) when given, else this batch's own means for
     ``n >= 5``. Returns a (n,) array in [0, 1]: 0 = fully negative pole, 1 = fully
     positive pole.
+
+    ``label_matrix`` reuses an already-built ``(names, (2, d))`` pair from
+    :func:`build_label_matrix` instead of paying the text-encoder forward again — the same escape
+    hatch :func:`label_tracks` offers, and what lets a caller derive the prior and the scores from
+    ONE build.
     """
     poles = list(axis_prompts.keys())
     if len(poles) != 2:
@@ -699,11 +705,58 @@ def score_axis(
     X = np.asarray(audio_embs, dtype=np.float32)
     if X.ndim == 1:
         X = X[None, :]
-    _, matrix = build_label_matrix(clap_embedder, axis_prompts)  # (2, d): [neg, pos]
+    if label_matrix is None:
+        label_matrix = build_label_matrix(clap_embedder, axis_prompts)
+    matrix = np.asarray(label_matrix[1], dtype=np.float32)  # (2, d): [neg, pos]
     sims = X @ matrix.T  # (n, 2)
     sims = recenter_similarities(sims, enable=recenter, prior=prior)
     probs = softmax(sims, temperature=temperature, axis=1)
     return probs[:, 1].astype(np.float32)  # P(positive pole)
+
+
+def axis_prior(
+    audio_embs: np.ndarray,
+    clap_embedder: SupportsEmbedText,
+    axis_prompts: dict[str, list[str]],
+    label_matrix: tuple[list[str], np.ndarray] | None = None,
+) -> NDArray[np.float32]:
+    """The FIXED ``(2,)`` offset :func:`score_axis` should subtract for one two-pole axis.
+
+    The axis counterpart of :func:`label_prior`: scores ``audio_embs`` — the REFERENCE corpus,
+    typically the whole library — against the axis vocabulary and returns the per-pole mean cosine.
+    Persist it and pass it back as ``prior=``, or a later call re-estimates the offset from
+    whatever rows it was handed and can place the same track differently on the axis.
+
+    ``label_matrix`` reuses an already-built pair, so the prior and the scores it feeds can come
+    from one text-encoder forward.
+    """
+    X = np.asarray(audio_embs, dtype=np.float32)
+    if X.ndim == 1:
+        X = X[None, :]
+    if label_matrix is None:
+        label_matrix = build_label_matrix(clap_embedder, axis_prompts)
+    return label_prior(X @ np.asarray(label_matrix[1], dtype=np.float32).T)
+
+
+def attribute_priors(
+    audio_embs: np.ndarray,
+    clap_embedder: SupportsEmbedText,
+    energy_matrix: tuple[list[str], np.ndarray] | None = None,
+    valence_matrix: tuple[list[str], np.ndarray] | None = None,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """``(energy_prior, valence_prior)`` for :func:`attribute_scores` over a reference corpus.
+
+    Two separate ``(2,)`` offsets because each axis is built from its own two-pole vocabulary and
+    carries its own modality-gap bias. Feed the pair straight into ``attribute_scores(...,
+    energy_prior=..., valence_prior=...)`` and keep it alongside the mood prior from
+    :func:`label_prior`: the three together are what make a single-track re-score reproduce the
+    numbers a whole-library run produced. Pass the same matrices to both calls to build each axis
+    vocabulary once.
+    """
+    return (
+        axis_prior(audio_embs, clap_embedder, ENERGY_PROMPTS, label_matrix=energy_matrix),
+        axis_prior(audio_embs, clap_embedder, VALENCE_PROMPTS, label_matrix=valence_matrix),
+    )
 
 
 def attribute_scores(
@@ -713,6 +766,8 @@ def attribute_scores(
     recenter: bool = True,
     energy_prior: np.ndarray | None = None,
     valence_prior: np.ndarray | None = None,
+    energy_matrix: tuple[list[str], np.ndarray] | None = None,
+    valence_matrix: tuple[list[str], np.ndarray] | None = None,
 ) -> pd.DataFrame:
     """Per-track interpretable attributes from two-pole axes.
 
@@ -721,7 +776,11 @@ def attribute_scores(
     is forwarded to :func:`score_axis` for both axes, as are the per-axis ``(2,)``
     ``energy_prior`` / ``valence_prior`` reference offsets (see
     :func:`recenter_similarities` for why a fixed prior beats the batch mean). The two axes have
-    separate priors because each is built from its own two-pole vocabulary.
+    separate priors because each is built from its own two-pole vocabulary; :func:`attribute_priors`
+    computes the pair over a reference corpus. Without them the offsets come from whatever batch is
+    in flight (and only for ``n >= 5``), so a track's score depends on what it was scored with.
+    ``energy_matrix`` / ``valence_matrix`` reuse already-built vocabularies, so deriving the priors
+    and the scores costs one text-encoder forward per axis rather than two.
     """
     energy = score_axis(
         audio_embs,
@@ -730,6 +789,7 @@ def attribute_scores(
         temperature,
         recenter=recenter,
         prior=energy_prior,
+        label_matrix=energy_matrix,
     )
     valence = score_axis(
         audio_embs,
@@ -738,6 +798,7 @@ def attribute_scores(
         temperature,
         recenter=recenter,
         prior=valence_prior,
+        label_matrix=valence_matrix,
     )
     return pd.DataFrame({"energy": energy, "valence": valence})
 

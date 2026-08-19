@@ -433,11 +433,13 @@ class PipelineResult:
     (``False`` when labeling was requested but no CLAP embedding succeeded).
 
     ``mood_prior`` is the ``(n_moods,)`` modality-gap offset this run estimated over the whole
-    library and scored against (``None`` when no labelling happened). Keep it and pass it back as
-    ``prior=`` when scoring anything later against the same vocabulary — that is what makes a
-    track's label reproducible outside this batch. Without it, a follow-up call re-estimates the
-    offset from whatever rows it was handed and can name a different mood for a track this run
-    already labelled.
+    library and scored against, and ``energy_prior`` / ``valence_prior`` are the matching ``(2,)``
+    offsets for the two attribute axes (all ``None`` when no labelling happened). Keep the three
+    and pass them back as ``prior=`` / ``energy_prior=`` / ``valence_prior=`` when scoring anything
+    later against the same vocabularies — that is what makes a track's mood, energy and valence
+    reproducible outside this batch. Without them, a follow-up call re-estimates each offset from
+    whatever rows it was handed and can name a different mood, or place the track differently on
+    an axis, than this run already did.
     """
 
     assignments: pd.DataFrame
@@ -450,6 +452,8 @@ class PipelineResult:
     labels_requested: bool
     have_labels: bool
     mood_prior: NDArray[np.float32] | None
+    energy_prior: NDArray[np.float32] | None
+    valence_prior: NDArray[np.float32] | None
 
 
 def run_pipeline_core(
@@ -543,6 +547,8 @@ def run_pipeline_core(
             labels_requested=with_labels,
             have_labels=False,
             mood_prior=None,
+            energy_prior=None,
+            valence_prior=None,
         )
 
     # KMeans auto-k: pick the silhouette-best k and bake it into a copy of config.
@@ -575,6 +581,8 @@ def run_pipeline_core(
     profiles: dict[int, list[tuple[str, float]]] = {}
     have_labels = False
     mood_prior: NDArray[np.float32] | None = None
+    energy_prior: NDArray[np.float32] | None = None
+    valence_prior: NDArray[np.float32] | None = None
 
     if with_labels:
         clap_X, clap_embedder, clap_valid = _clap_embeddings_for(
@@ -617,7 +625,25 @@ def run_pipeline_core(
             ld = _labeling.label_tracks(
                 X_valid, recenter=recenter, label_matrix=mood_lm, prior=mood_prior
             )
-            attr = _labeling.attribute_scores(X_valid, clap_embedder, recenter=recenter)
+            # Same for the two attribute axes. They carry their own modality-gap offsets — a
+            # separate vocabulary each — so `mood_prior` does not cover them, and leaving them on
+            # the batch fallback made `energy` and `valence` the only shipped columns a later
+            # single-track re-score could not reproduce (that path is also below
+            # `recenter_similarities`' min_n, so it would skip centering entirely).
+            energy_lm = _labeling.build_label_matrix(clap_embedder, _labeling.ENERGY_PROMPTS)
+            valence_lm = _labeling.build_label_matrix(clap_embedder, _labeling.VALENCE_PROMPTS)
+            energy_prior, valence_prior = _labeling.attribute_priors(
+                X_valid, clap_embedder, energy_matrix=energy_lm, valence_matrix=valence_lm
+            )
+            attr = _labeling.attribute_scores(
+                X_valid,
+                clap_embedder,
+                recenter=recenter,
+                energy_prior=energy_prior,
+                valence_prior=valence_prior,
+                energy_matrix=energy_lm,
+                valence_matrix=valence_lm,
+            )
 
             # Scatter back into full-length columns; failed rows get the same
             # sentinels as the all-failed path (blank mood, NaN scores, empty lists).
@@ -669,6 +695,8 @@ def run_pipeline_core(
         labels_requested=with_labels,
         have_labels=have_labels,
         mood_prior=mood_prior,
+        energy_prior=energy_prior,
+        valence_prior=valence_prior,
     )
 
 

@@ -23,6 +23,7 @@ import moodengine.io_audio as _io
 import moodengine.pipeline as pipeline
 from moodengine.config import default_config, ensure_clap_fusion_supported
 from moodengine.exceptions import MissingDependencyError
+from moodengine.labeling import attribute_scores
 
 DIM = 8  # audio + text embedding dimensionality used by the fake embedder.
 
@@ -805,6 +806,47 @@ def test_run_pipeline_core_computes_everything_but_writes_nothing(tmp_config, ma
     assert_that(result.profiles).is_not_empty()  # cluster profiles travel with the result
     # The whole point of the split: no artifact dir, no artifact files.
     assert_that(tmp_config.output_dir.exists()).is_false()
+
+
+def test_run_pipeline_core_returns_all_three_recentering_priors(tmp_config, make_audio_library):
+    """Every offset the run scored against travels with the result. The mood prior alone left
+    `energy` and `valence` — two of the three shipped label columns — with no handle at all."""
+    make_audio_library(tmp_config.raw_dir, n=6)
+
+    result = pipeline.run_pipeline_core(
+        tmp_config, embedder_name="clap", method="kmeans", with_labels=True
+    )
+
+    assert_that(result.mood_prior).is_not_none()
+    assert_that(result.energy_prior.shape).is_equal_to((2,))
+    assert_that(result.valence_prior.shape).is_equal_to((2,))
+    assert_that(result.energy_prior.dtype).is_equal_to(np.float32)
+
+
+def test_run_pipeline_core_priors_reproduce_a_single_track_rescore(tmp_config, make_audio_library):
+    """The property the priors exist for: re-scoring ONE track later, with the offsets this run
+    returned, lands on the same energy and valence the run published for it. Without them that
+    call falls below `min_n` and skips centering entirely."""
+    make_audio_library(tmp_config.raw_dir, n=6)
+    result = pipeline.run_pipeline_core(
+        tmp_config, embedder_name="clap", method="kmeans", with_labels=True
+    )
+    files, clap_X = pipeline.extract_embeddings(tmp_config, "clap")
+    row = files.index(Path(result.assignments["path"].iloc[0]))
+
+    rescored = attribute_scores(
+        clap_X[row : row + 1],
+        pipeline.get_embedder("clap", tmp_config),
+        energy_prior=result.energy_prior,
+        valence_prior=result.valence_prior,
+    )
+
+    assert_that(float(rescored["energy"].iloc[0])).is_close_to(
+        float(result.assignments["energy"].iloc[0]), tolerance=1e-6
+    )
+    assert_that(float(rescored["valence"].iloc[0])).is_close_to(
+        float(result.assignments["valence"].iloc[0]), tolerance=1e-6
+    )
 
 
 def test_write_artifacts_persists_the_full_set_and_returns_paths(tmp_config, make_audio_library):
