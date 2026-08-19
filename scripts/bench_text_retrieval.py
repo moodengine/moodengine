@@ -116,6 +116,30 @@ def _relevant_sets(
     return relevant
 
 
+class _MemoizedTextEmbedder:
+    """``embed_text`` memoized per prompt — the bootstrap's only expensive repetition.
+
+    :func:`evaluate_text_queries` embeds each query on every call, which is right for a general
+    caller but is pure waste here: the four queries are fixed by design and the resampling varies
+    only the corpus. Without this the honest resample count was unaffordable, and the CIs were
+    quietly computed from a twentieth of it. Wrapping the embedder rather than pre-embedding keeps
+    the shipped scoring function itself inside the measured path.
+    """
+
+    def __init__(self, embedder) -> None:
+        self._embedder = embedder
+        self._cache: dict[str, np.ndarray] = {}
+
+    def embed_text(self, prompts: list[str]) -> np.ndarray:
+        missing = [p for p in prompts if p not in self._cache]
+        if missing:
+            fresh = np.asarray(self._embedder.embed_text(missing), dtype=np.float32)
+            fresh = fresh.reshape(len(missing), -1)
+            for prompt, row in zip(missing, fresh, strict=True):
+                self._cache[prompt] = row
+        return np.stack([self._cache[p] for p in prompts])
+
+
 def _bootstrap_macro_ci(
     X: np.ndarray,
     embedder,
@@ -131,6 +155,9 @@ def _bootstrap_macro_ci(
     design, while the corpus is the sample. Relevance is recomputed inside each draw, because the
     quantile cut is a property of the resampled corpus — freezing it would leak the full sample
     into every replicate and understate the spread.
+
+    ``resamples`` draws are actually taken. Each re-ranks the corpus against every query, but the
+    query embeddings are memoized, so the per-draw cost is numpy alone.
     """
     n = len(sel)
     if n < 8:
@@ -139,12 +166,13 @@ def _bootstrap_macro_ci(
             "macro_map": (float("nan"),) * 2,
         }
     rng = np.random.default_rng(seed)
+    cached = _MemoizedTextEmbedder(embedder)
     precisions: list[float] = []
     maps: list[float] = []
-    for _ in range(resamples // 20):  # 100 draws: each re-embeds nothing, but re-ranks n songs
+    for _ in range(int(resamples)):
         draw = rng.integers(0, n, size=n)
         sub = [sel[i] for i in draw]
-        scores = evaluate_text_queries(_relevant_sets(sub, quantile), X[draw], embedder, k=k)
+        scores = evaluate_text_queries(_relevant_sets(sub, quantile), X[draw], cached, k=k)
         precisions.append(float(scores["macro_precision_at_k"]))
         maps.append(float(scores["macro_map"]))
     return {

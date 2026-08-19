@@ -366,6 +366,47 @@ def test_retrieval_perfect_ranking_beats_the_random_floor() -> None:
     assert_that(scores["macro_precision_at_k"]).is_equal_to(1.0)  # vs a 0.25 random floor
 
 
+def test_retrieval_bootstrap_takes_the_number_of_draws_it_advertises() -> None:
+    """The CI was computed from `resamples // 20` draws while the constant and the parameter both
+    said 2000, so every published interval came from a twentieth of the stated resampling."""
+    bench = _load_retrieval_bench()
+    n = 40
+    sel = [(f"{i}.mp3", i / (n - 1), 0.5) for i in range(n)]
+    X = np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (n, 1))
+    draws: list[int] = []
+
+    class _CountingOracle:
+        def embed_text(self, prompts):
+            draws.append(len(prompts))
+            return np.zeros((len(prompts), 2), dtype=np.float32)
+
+    bench._bootstrap_macro_ci(X, _CountingOracle(), sel, 0.25, 10, seed=0, resamples=37)
+
+    # 37 draws actually taken; the memoized wrapper embeds each distinct query exactly once.
+    assert_that(len(draws)).is_equal_to(4)
+
+
+def test_retrieval_memoized_embedder_returns_what_the_real_one_would() -> None:
+    """Memoizing is only safe if it is transparent: same rows, same order, including a repeat
+    within one call and a mix of cached and fresh prompts."""
+    bench = _load_retrieval_bench()
+    calls: list[list[str]] = []
+
+    class _Deterministic:
+        def embed_text(self, prompts):
+            calls.append(list(prompts))
+            return np.array([[float(len(p)), 1.0] for p in prompts], dtype=np.float32)
+
+    cached = bench._MemoizedTextEmbedder(_Deterministic())
+
+    first = cached.embed_text(["aa", "bbb"])
+    second = cached.embed_text(["bbb", "aa", "cccc"])
+
+    np.testing.assert_allclose(first, [[2.0, 1.0], [3.0, 1.0]])
+    np.testing.assert_allclose(second, [[3.0, 1.0], [2.0, 1.0], [4.0, 1.0]])
+    assert_that(calls).is_equal_to([["aa", "bbb"], ["cccc"]])  # only the unseen prompt is embedded
+
+
 def test_ccc_components_multiply_back_to_the_ccc() -> None:
     """Lin's decomposition is an identity, not an approximation: ``CCC == rho * c_b`` exactly.
     Pinned so the two halves can never drift from the scalar they explain."""
