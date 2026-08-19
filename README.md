@@ -7,7 +7,7 @@
 **Music mood analysis engine** — turn a folder of audio files into mood-labeled, explorable clusters.
 
 moodengine is a pure, stateless Python library (MIR toolbox) that extracts audio embeddings
-(**MERT**, **CLAP**), pools them to track level, clusters tracks by mood/ambience
+(**MERT**, **CLAP**, **MuQ-MuLan**), pools them to track level, clusters tracks by mood/ambience
 (UMAP + HDBSCAN / KMeans / spherical / Leiden), names the clusters with **zero-shot
 mood labels** (calibrated CLAP text↔audio similarities), and ships the surrounding
 toolbox: text→audio and audio→audio search, evaluation metrics, calibration,
@@ -81,6 +81,7 @@ interpreter. Set `requires-python = ">=3.11,!=3.14.1"` (or Poetry's
 |---|---|---|
 | *(none)* | clustering, labeling math, search, eval, viz on precomputed embeddings | numpy/pandas/sklearn/umap/hdbscan/librosa/plotly |
 | `[models]` | embedding real audio with MERT + CLAP | torch, transformers, laion-clap (~GBs, downloads model checkpoints on first use) |
+| `[muq]` | the MuQ-MuLan audio↔text backbone (`embedder="mulan"`) — an alternative to CLAP, not a replacement | muq (needs `[models]` too; weights are CC-BY-NC-4.0, ~5 GB across three hub repos) |
 | `[ot]` | optimal-transport journey morphing | POT |
 | `[cluster-graph]` | Leiden community detection | leidenalg, python-igraph |
 | `[pacmap]` | PaCMAP 2-D projection (`projection_method="pacmap"`) | pacmap |
@@ -151,7 +152,7 @@ to CPU instead of crashing.
 
 | Module | Purpose |
 |---|---|
-| `embeddings` | `Embedder` interface, MERT (frame-level) + CLAP (clip-level + text) wrappers, on-disk cache |
+| `embeddings` | `Embedder` interface, MERT (frame-level) + CLAP and MuQ-MuLan (clip-level + text) wrappers, on-disk cache |
 | `pooling` | frame/segment → track vectors (mean / mean+std, MERT layer weighting), L2 discipline |
 | `cluster` | UMAP reduction, HDBSCAN/KMeans/spherical/Leiden, auto-k, metrics, bootstrap stability, medoids, sub-clustering |
 | `labeling` | zero-shot mood taxonomy (prompt ensembling, customizable), softmax calibration, similarity recentering, energy/valence axes, cluster mood profiles |
@@ -183,16 +184,19 @@ uv run python scripts/03_label_and_explore.py --embedder clap --method kmeans
 - The `[models]` extra downloads checkpoints from the Hugging Face hub and the
   laion-clap release page on first use.
 - **Offline / air-gapped use**: pre-download the checkpoints once
-  (`hf download m-a-p/MERT-v1-95M` and `hf download
-  lukewys/laion_clap music_audioset_epoch_15_esc_90.14.pt` — `hf` is the
+  (`hf download m-a-p/MERT-v1-95M`, `hf download
+  lukewys/laion_clap music_audioset_epoch_15_esc_90.14.pt`, and `hf download
+  OpenMuQ/MuQ-MuLan-large` — which also pulls the MuQ audio tower and `xlm-roberta-base`
+  on first construction — where `hf` is the
   huggingface_hub 1.x CLI; `huggingface-cli` still runs but is deprecated), point `HF_HOME` at
   the cache location if needed, and set `HF_HUB_OFFLINE=1` to force cache-only
   resolution. A load failure raises `ModelLoadError` naming the exact artifact
   and this remediation.
-- **MERT-v1-95M weights are CC-BY-NC-4.0 (non-commercial)** — a separate grant
-  from this package's own [license](#license). Any commercial use of the weights
-  requires licensing them separately or configuring another model
-  (`Config.mert_model_name`).
+- **MERT-v1-95M and MuQ-MuLan weights are CC-BY-NC-4.0 (non-commercial)** — a separate
+  grant from this package's own [license](#license), and from the `muq` package's own MIT
+  code license. Any commercial use of either set of weights requires licensing them
+  separately or configuring another model (`Config.mert_model_name` /
+  `Config.mulan_model_name`).
 - MERT executes custom modeling code from the hub (`trust_remote_code`); moodengine
   pins the default model to a reviewed revision. Override with `Config.mert_revision`.
 
@@ -213,7 +217,7 @@ git clone https://github.com/moodengine/moodengine && cd moodengine
 uv sync              # light install + dev tooling (pytest, ruff)
 uv run pytest        # default suite — torch-free by contract
 uv run pytest --cov  # same suite + coverage floor (fail_under in pyproject)
-uv run pytest -m model   # opt-in: real MERT/CLAP tests (needs `uv sync --extra models`)
+uv run pytest -m model   # opt-in: real-model tests (needs `uv sync --extra models --extra muq`)
 uv run ruff format . && uv run ruff check .
 uv run mypy && uv run deptry .
 ```
@@ -246,7 +250,7 @@ public issue for anything exploitable.
 
 - All compute functions are pure and re-entrant — safe to call concurrently
   from multiple threads or processes on your own arrays.
-- **Embedder instances (MERT/CLAP) are not thread-safe.** Create one per
+- **Embedder instances (MERT / CLAP / MuQ-MuLan) are not thread-safe.** Create one per
   worker, or serialize calls to a shared instance.
 - The on-disk embedding cache is safe to share across processes: writes are
   atomic (temp file + rename), partial or corrupt entries are treated as cache

@@ -14,8 +14,10 @@ so nothing is approximated or fabricated.
     module owns the algorithm, not the blend.
   * :class:`SignalSurrogate` / :func:`fit_signal_surrogate` — a shallow, interpretable classifier
     (decision tree / logistic) mapping musical **signals → mood**, with its **measured** fidelity
-    (cross-validated accuracy vs the true read). It is explicitly a *correlational* view, not the
-    CLAP mechanism — the caller flags ``is_surrogate`` and shows the fidelity.
+    vs the true read — reported as the pair ``(fidelity, fidelity_folds)``, since ``0`` folds means
+    resubstitution and a depth-limited tree scores near the ceiling that way. It is explicitly a
+    *correlational* view, not the CLAP mechanism — the caller flags ``is_surrogate`` and shows
+    both halves of the pair.
   * :func:`surrogate_shap` — exact interventional Shapley of the signals under the surrogate (default,
     dependency-free), or ``shap.TreeExplainer`` (opt-in, imported lazily) which must concord with it.
   * :func:`counterfactual` — Wachter et al. (2017): the minimal signal perturbation (MAD-weighted,

@@ -162,7 +162,7 @@ def find_neighbours(
 
       * ``spread == 1`` reduces **exactly** to ``find_similar(query_idx, X, filenames, top_k)``
         — the closest ``top_k`` tracks;
-      * larger ``spread`` samples a wider neighbourhood (the "Proche / Équilibré / Large"
+      * larger ``spread`` samples a wider neighbourhood (the "close / balanced / wide"
         diversity control behind radio-by-similarity and the ambience journey), trading raw
         closeness for variety while staying in the same mood region.
 

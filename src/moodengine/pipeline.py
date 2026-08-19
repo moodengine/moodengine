@@ -477,9 +477,11 @@ def run_pipeline_core(
     simply never calls it.
 
     ``embedder_name`` selects the CLUSTERING space: ``'mert'`` (default),
-    ``'clap'`` or ``'fused'`` (block-L2-normalized MERT+CLAP via
+    ``'clap'``, ``'mulan'`` or ``'fused'`` (block-L2-normalized MERT+CLAP via
     :func:`fused_embeddings`). Labels ALWAYS come from CLAP regardless of the
-    clustering space.
+    clustering space — including under ``'mulan'``, which has its own text tower but is
+    not used for labelling here; compare the two text paths with
+    ``scripts/bench_valence_arousal.py --zeroshot-embedder`` instead.
 
     The ``assignments`` columns are ``filename``, ``path``, ``cluster``, ``x``,
     ``y``, ``is_medoid``, ``outlier_score``; with labels the frame also carries
