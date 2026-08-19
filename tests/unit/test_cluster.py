@@ -373,6 +373,96 @@ def test_silhouette_original_sampling_is_seeded_and_deterministic() -> None:
     assert_that(first).is_equal_to(second)
 
 
+def test_cluster_space_original_skips_the_reduction_for_clustering_only() -> None:
+    """`cluster_space` picks where the CLUSTERING runs; the 2-D map is always a UMAP fit, because
+    it exists to be looked at. The default is unchanged, so no existing result moves."""
+    X, _ = _three_blobs(seed=30, per=20)
+    cfg = dataclasses.replace(default_config(), cluster_space="original", kmeans_n_clusters=3)
+
+    out = run_clustering(X, method="kmeans", config=cfg)
+
+    assert_that(out["metrics"]["silhouette_space"]).is_equal_to("original")
+    assert_that(out["metrics"]["reduction"]).is_equal_to("umap")  # the map still gets one
+    assert_that(out["coords2d"].shape).is_equal_to((X.shape[0], 2))
+
+
+def test_spherical_kmeans_warns_on_a_degenerate_cosine_space(caplog) -> None:
+    """A UMAP layout's coordinates sit far from an arbitrary origin, so every pair is nearly
+    parallel — measured mean pairwise cosine ~0.99 against ~0.0 for centred data. Spherical
+    k-means still returns a plausible partition there, decided by float residue rather than by
+    angle, so it has to say so."""
+    rng = np.random.default_rng(0)
+    far_from_origin = (rng.standard_normal((60, 8)) + 100.0).astype(np.float32)
+
+    with caplog.at_level("WARNING"):
+        cluster_spherical_kmeans(far_from_origin, 3, default_config())
+
+    assert_that(caplog.text).contains("nearly parallel")
+
+
+def test_spherical_kmeans_quiet_on_a_real_cosine_space(caplog) -> None:
+    """The counterpart: genuine unit-sphere data must not trip the warning, or it becomes noise."""
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((60, 8)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    with caplog.at_level("WARNING"):
+        cluster_spherical_kmeans(X, 3, default_config())
+
+    assert_that(caplog.text).does_not_contain("nearly parallel")
+
+
+def test_spherical_kmeans_restarts_never_lose_to_a_single_draw() -> None:
+    """`n_init` matches what `cluster_kmeans` already gets from sklearn. The kept partition must be
+    the best by the objective the assignment maximizes — total cosine to one's own centroid — so
+    more restarts can only help."""
+    X, _ = _three_blobs(seed=31, per=25)
+    Xn = X / np.linalg.norm(X, axis=1, keepdims=True)
+
+    def objective(labels):
+        centroids = np.vstack(
+            [
+                Xn[labels == j].mean(axis=0)
+                / max(np.linalg.norm(Xn[labels == j].mean(axis=0)), 1e-8)
+                for j in sorted(set(labels.tolist()))
+            ]
+        )
+        remap = {c: i for i, c in enumerate(sorted(set(labels.tolist())))}
+        return float(np.sum(Xn * centroids[[remap[int(v)] for v in labels]]))
+
+    single = cluster_spherical_kmeans(X, 3, default_config(), n_init=1)
+    many = cluster_spherical_kmeans(X, 3, default_config(), n_init=10)
+
+    assert_that(objective(many)).is_greater_than_or_equal_to(objective(single) - 1e-5)
+
+
+def test_bootstrap_refit_reduction_gap_is_zero_on_real_structure() -> None:
+    """The gap between the two modes is the diagnostic, and it must NOT be a systematic offset:
+    on genuinely separated blobs, re-fitting the projection per replicate changes nothing."""
+    X, _ = _three_blobs(seed=32, per=40)
+    cfg = dataclasses.replace(default_config(), bootstrap_n=5, kmeans_n_clusters=3)
+
+    frozen = bootstrap_stability(X, "kmeans", cfg, n_boot=5)["mean_ari"]
+    refit = bootstrap_stability(X, "kmeans", cfg, n_boot=5, refit_reduction=True)["mean_ari"]
+
+    assert_that(abs(frozen - refit)).is_less_than(0.15)
+
+
+def test_hdbscan_leaf_selection_splits_what_eom_keeps_whole() -> None:
+    """The knob that addresses HDBSCAN's known failure on a homogeneous library — one dominant
+    cluster swallowing the catalogue. `leaf` takes the finest stable clusters where the default
+    `eom` prefers few large ones, and until now neither was reachable from Config."""
+    X, _ = _n_blobs(6, seed=33, per=20)
+    base = dataclasses.replace(default_config(), hdbscan_min_cluster_size=5)
+
+    eom = cluster_hdbscan(X, base)
+    leaf = cluster_hdbscan(X, dataclasses.replace(base, hdbscan_cluster_selection_method="leaf"))
+
+    assert_that(len(set(leaf.tolist()) - {-1})).is_greater_than_or_equal_to(
+        len(set(eom.tolist()) - {-1})
+    )
+
+
 def test_run_clustering_rejects_non_finite_input() -> None:
     """A NaN row must be named at the moodengine boundary — not surface as a deep
     'Input contains NaN' from UMAP/sklearn with no row context."""

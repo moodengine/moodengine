@@ -11,6 +11,7 @@ algorithm allows it.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import get_args
 
 import numpy as np
@@ -190,6 +191,16 @@ def _fit_hdbscan(X: np.ndarray, config: Config):
             _hdbscan.HDBSCAN(
                 min_cluster_size=min_cluster_size,
                 min_samples=config.hdbscan_min_samples,
+                cluster_selection_method=config.hdbscan_cluster_selection_method,
+                cluster_selection_epsilon=float(config.hdbscan_cluster_selection_epsilon),
+                allow_single_cluster=bool(config.hdbscan_allow_single_cluster),
+                # Standalone-only: sklearn's HDBSCAN has no max_cluster_size, so this is the one
+                # knob the two backends do not share.
+                **(
+                    {"max_cluster_size": int(config.hdbscan_max_cluster_size)}
+                    if config.hdbscan_max_cluster_size is not None
+                    else {}
+                ),
             ).fit(X),
             "hdbscan",
         )
@@ -201,6 +212,9 @@ def _fit_hdbscan(X: np.ndarray, config: Config):
             HDBSCAN(
                 min_cluster_size=min_cluster_size,
                 min_samples=config.hdbscan_min_samples,
+                cluster_selection_method=config.hdbscan_cluster_selection_method,
+                cluster_selection_epsilon=float(config.hdbscan_cluster_selection_epsilon),
+                allow_single_cluster=bool(config.hdbscan_allow_single_cluster),
             ).fit(X),
             "sklearn",
         )
@@ -209,8 +223,11 @@ def _fit_hdbscan(X: np.ndarray, config: Config):
 def cluster_hdbscan(X: np.ndarray, config: Config) -> np.ndarray:
     """Cluster ``X`` with HDBSCAN; ``-1`` marks noise.
 
-    Uses ``config.hdbscan_min_cluster_size`` and ``config.hdbscan_min_samples``.
-    Prefers the standalone ``hdbscan`` package and falls back to
+    Uses ``config.hdbscan_min_cluster_size`` / ``_min_samples`` plus the selection knobs
+    ``_cluster_selection_method`` (``'leaf'`` splits the one dominant cluster a homogeneous library
+    tends to produce, where the default ``'eom'`` keeps it whole), ``_cluster_selection_epsilon``,
+    ``_allow_single_cluster`` and — standalone backend only, sklearn has no equivalent —
+    ``_max_cluster_size``. Prefers the standalone ``hdbscan`` package and falls back to
     ``sklearn.cluster.HDBSCAN`` when it is unavailable. Returns integer labels
     of shape (n,). :func:`cluster_hdbscan_detailed` returns the same labels plus the per-point
     confidence and outlier scores the same fit already produced.
@@ -357,8 +374,16 @@ def _kpp_cosine_init(Xn: np.ndarray, k: int, rng: np.random.Generator) -> list[i
     return idx
 
 
+#: Mean pairwise cosine above which a space carries essentially no angular information. A UMAP
+#: layout measures ~0.99 (its coordinates sit far from an arbitrary origin), so cosine there
+#: separates points only through float residue in the 4th decimal. Measured on 600 rows of six
+#: overlapping 128-d gaussians: raw UMAP cosines span [0.966, 1.000] against [-0.322, 1.000] for
+#: the embeddings themselves.
+_DEGENERATE_COSINE_MEAN: float = 0.9
+
+
 def cluster_spherical_kmeans(
-    X: np.ndarray, n_clusters: int, config: Config, max_iter: int = 100
+    X: np.ndarray, n_clusters: int, config: Config, max_iter: int = 100, n_init: int = 10
 ) -> np.ndarray:
     """Spherical k-means: Lloyd's algorithm on COSINE similarity. Returns labels (n,), never ``-1``.
 
@@ -367,31 +392,59 @@ def cluster_spherical_kmeans(
     similarity to unit centroids, and each centroid is the L2-renormalized mean of its members. ``k``
     is clamped to ``max(1, min(n_clusters, n))``; init is deterministic (k-means++ on cosine, seeded
     by ``config.seed``), so identical inputs give identical labels. Assignment is total (every point
-    gets a cluster — no noise label). Pure numpy."""
+    gets a cluster — no noise label). Pure numpy.
+
+    ``n_init`` restarts the whole fit that many times and keeps the best by within-cluster cosine,
+    matching what :func:`cluster_kmeans` already gets from sklearn — a single k-means++ draw was
+    the only reason the two methods differed in robustness.
+
+    **Cosine must mean something in the space you pass.** Called on a UMAP layout it still returns
+    a sensible-looking partition, but the layout's coordinates sit far from an arbitrary origin, so
+    every pair is nearly parallel and the assignment turns on float residue rather than on angle.
+    A warning fires when the mean pairwise cosine clears
+    :data:`_DEGENERATE_COSINE_MEAN`. ``Config.cluster_space="original"`` clusters the embeddings
+    instead, where the angles are real."""
     X = np.asarray(X, dtype=np.float32)
     n = X.shape[0]
     if n == 0:
         return np.zeros((0,), dtype=int)
     k = max(1, min(int(n_clusters), n))
     Xn = l2_normalize(X, axis=1)
-    rng = np.random.default_rng(config.seed)
-    C = Xn[_kpp_cosine_init(Xn, k, rng)].copy()  # (k, d) unit-norm centroids
 
-    labels = np.zeros(n, dtype=int)
-    for _ in range(int(max_iter)):
-        new_labels = np.argmax(Xn @ C.T, axis=1).astype(int)  # cosine assignment
-        if np.array_equal(new_labels, labels):
-            break
-        labels = new_labels
-        for j in range(k):
-            members = Xn[labels == j]
-            if members.shape[0] == 0:
-                continue  # keep the (distinct) init center for an emptied cluster
-            mean = members.mean(axis=0)
-            norm = float(np.linalg.norm(mean))
-            if norm > 0:
-                C[j] = mean / norm
-    return labels
+    # Sampled above ~2k rows: this is a diagnostic, and the full block is O(n²).
+    probe = Xn if n <= 2000 else Xn[np.random.default_rng(config.seed).choice(n, 2000, False)]
+    mean_cos = float((probe @ probe.T).mean())
+    if mean_cos > _DEGENERATE_COSINE_MEAN:
+        logger.warning(
+            "spherical k-means on a space whose mean pairwise cosine is %.3f: every pair is "
+            "nearly parallel, so the assignment turns on float residue rather than on angle. "
+            "Set Config.cluster_space='original' to cluster where the angles are real.",
+            mean_cos,
+        )
+
+    best_labels, best_score = np.zeros(n, dtype=int), -np.inf
+    for restart in range(max(1, int(n_init))):
+        rng = np.random.default_rng(config.seed + restart)
+        C = Xn[_kpp_cosine_init(Xn, k, rng)].copy()  # (k, d) unit-norm centroids
+        labels = np.zeros(n, dtype=int)
+        for _ in range(int(max_iter)):
+            new_labels = np.argmax(Xn @ C.T, axis=1).astype(int)  # cosine assignment
+            if np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+            for j in range(k):
+                members = Xn[labels == j]
+                if members.shape[0] == 0:
+                    continue  # keep the (distinct) init center for an emptied cluster
+                mean = members.mean(axis=0)
+                norm = float(np.linalg.norm(mean))
+                if norm > 0:
+                    C[j] = mean / norm
+        # Objective: total cosine of each point to its own centroid — what the assignment maximizes.
+        score = float(np.sum(Xn * C[labels], dtype=np.float64))
+        if score > best_score:
+            best_labels, best_score = labels, score
+    return best_labels
 
 
 def _knn_igraph(X: np.ndarray, config: Config):
@@ -761,7 +814,15 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
         cluster_input = X
         coords2d = _coords2d_fallback(X, config)
     else:
-        cluster_input, _ = reduce_umap(X, config.umap_n_components_cluster, config)
+        # The 2-D map is always a UMAP fit — it exists to be looked at. What the CLUSTERING runs on
+        # is `config.cluster_space`: "reduced" (the layout, unchanged default) or "original" (the
+        # embeddings). Exposed rather than decided because measurement does not settle which wins —
+        # the reduced space recovers overlapping blobs better in some regimes and worse in others.
+        # It does settle that cosine is degenerate on a layout; see `cluster_spherical_kmeans`.
+        if getattr(config, "cluster_space", "reduced") == "original":
+            cluster_input = X
+        else:
+            cluster_input, _ = reduce_umap(X, config.umap_n_components_cluster, config)
         viz_emb, _ = reduce_umap(X, config.umap_n_components_viz, config)
         coords2d = np.asarray(viz_emb, dtype=np.float32)
         # Guard: ensure exactly 2 viz dims regardless of config override.
@@ -778,7 +839,8 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
     # fit to separate these very points, so the number is circular and reads as real structure even
     # on pure noise. The original-space score is the one a reader can act on, so it ships on every
     # result rather than only inside `compare_spaces`, which was its sole caller.
-    metrics["silhouette_space"] = "original" if tiny else "reduced"
+    clustered_original = tiny or getattr(config, "cluster_space", "reduced") == "original"
+    metrics["silhouette_space"] = "original" if clustered_original else "reduced"
     # Always computed through silhouette_original, INCLUDING on the tiny path where the two spaces
     # coincide. Reusing metrics["silhouette"] there would look free but silently change the metric:
     # cluster_metrics scores with sklearn's default euclidean, while structure_verdict's bands were
@@ -795,7 +857,7 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
             "silhouette (%s) is not evidence to the contrary.",
             metrics["silhouette_original"],
             metrics["n_clusters"],
-            "umap" if not tiny else "identity",
+            "identity" if clustered_original else "umap",
             "n/a" if sil is None else f"{sil:.3f}",
         )
 
@@ -996,6 +1058,7 @@ def bootstrap_stability(
     config: Config,
     n_boot: int | None = None,
     subsample: float = 0.8,
+    refit_reduction: bool = False,
 ) -> StabilityMetrics:
     """Clustering stability via subsample-and-recluster bootstrap, in the deployed space.
 
@@ -1016,6 +1079,18 @@ def bootstrap_stability(
       in BOTH runs, so two HDBSCAN runs that merely agree on which points are noise do not
       inflate ARI. Agreement on the noise / non-noise split itself is reported separately
       as ``mean_noise_agreement`` (always ``1.0`` for methods that never emit ``-1``).
+
+    ``refit_reduction=True`` re-fits UMAP inside every replicate, at a per-replicate seed, instead
+    of subsampling one frozen layout. The frozen mode isolates the clustering's own variance; a
+    project-then-cluster pipeline also ships the reduction's variance, and this measures that too.
+
+    **Read the GAP between the two modes, not either alone** — it is near zero when the structure
+    is real and large when it is not. Measured at ``n_boot=10`` on 600 rows: six well-separated
+    blobs give ``mean_ari`` 1.000 frozen and 1.000 re-fit, a gap of 0.000; structureless noise
+    gives 0.551 frozen — which reads as moderately stable for data with no structure at all —
+    against 0.264 re-fit, a gap of 0.287. So the gap is not a systematic offset to subtract; it is
+    how much of the partition the projection invented. Costs one UMAP fit per replicate (seconds
+    each, single-threaded because the seed is set), so pair it with a small ``n_boot``.
 
     ``n_boot`` defaults to ``config.bootstrap_n``. Returns ``{'mean_ari', 'std_ari',
     'mean_ami', 'mean_noise_agreement', 'n_boot'}``; degenerate inputs yield zeros.
@@ -1038,11 +1113,15 @@ def bootstrap_stability(
     if n < 4 or n_boot < 2:
         return zeros
 
-    # Cluster the same reduced space run_clustering deploys; skip UMAP on tiny inputs.
-    if n < max(config.umap_n_neighbors, 4):
-        space = X
-    else:
-        space, _ = reduce_umap(X, config.umap_n_components_cluster, config)
+    # Cluster the same reduced space run_clustering deploys; skip UMAP on tiny inputs. Under
+    # `refit_reduction` there is no shared layout at all — each replicate builds its own.
+    tiny = n < max(config.umap_n_neighbors, 4)
+    reduce_per_replicate = refit_reduction and not tiny
+    space = (
+        X
+        if (tiny or reduce_per_replicate)
+        else reduce_umap(X, config.umap_n_components_cluster, config)[0]
+    )
 
     size = max(2, int(round(subsample * n)))
     size = min(size, n)
@@ -1051,9 +1130,19 @@ def bootstrap_stability(
     for i in range(int(n_boot)):
         rng = np.random.default_rng(config.seed + i)
         idx = rng.choice(n, size=size, replace=False)
+        if reduce_per_replicate:
+            # A per-replicate seed, or every fit would land on the same layout and the extra cost
+            # would buy nothing.
+            sub_space, _ = reduce_umap(
+                space[idx],
+                config.umap_n_components_cluster,
+                replace(config, seed=config.seed + i),
+            )
+        else:
+            sub_space = space[idx]
         # leiden clamps its kNN degree to the subsample size internally, so
         # every bootstrap graph stays valid.
-        sub_labels = _cluster_with(method, space[idx], config)
+        sub_labels = _cluster_with(method, sub_space, config)
         full = np.full(n, -2, dtype=int)
         full[idx] = sub_labels
         runs.append(full)
