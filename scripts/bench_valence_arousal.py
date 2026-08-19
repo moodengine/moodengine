@@ -353,7 +353,7 @@ def _report_paired(baseline_path: pathlib.Path, current: dict, energy_gold, vale
                 gold,
                 _pearson_stat,
             )
-            verdict = "significatif" if (lo > 0 or hi < 0) else "dans le bruit"
+            verdict = "significant" if (lo > 0 or hi < 0) else "within noise"
             typer.echo(
                 f"  {block:<20} {axis:8s} pearson delta={delta:+.3f} "
                 f"[{lo:+.3f}, {hi:+.3f}]  {verdict}"

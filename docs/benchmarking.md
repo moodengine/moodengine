@@ -14,7 +14,7 @@ averaged human valence and arousal ratings on a 1–9 scale. `fetch_deam.py` dow
 extracts it (~1.35 GB), skipping anything already present:
 
 ```bash
-uv run --extra models python scripts/fetch_deam.py --data-dir ~/moodengine-bench/deam
+uv run python scripts/fetch_deam.py --data-dir ~/moodengine-bench/deam
 ```
 
 It prints the audio directory and the static-annotations CSV to point the runner at.
@@ -22,7 +22,7 @@ It prints the audio directory and the static-annotations CSV to point the runner
 ## Running the benchmark
 
 ```bash
-uv run --extra models python scripts/bench_valence_arousal.py \
+uv run --extra models --extra muq python scripts/bench_valence_arousal.py \
     --data-dir ~/moodengine-bench/deam --mode both --embedder mert --limit 200
 ```
 
@@ -42,8 +42,14 @@ pipeline's `[0, 1]` outputs. Two modes measure different layers of the stack:
 
 Each axis reports Pearson, Spearman and CCC (`moodengine.evaluation.concordance_correlation_coefficient`,
 Lin's concordance correlation, which unlike Pearson penalises scale/offset mismatch and
-is the standard valence/arousal metric). `--out results.json` writes the numbers, so a
-before/after comparison across an engine change is a plain file diff.
+is the standard valence/arousal metric). CCC also arrives split into its two factors,
+`<axis>_ccc_rho` (how well the shapes agree) and `<axis>_ccc_cb` (how much of the loss is
+scale/offset), because they call for opposite responses: a low `rho` means the model does not
+track the axis, while a low `c_b` at a healthy `rho` means it does and only needs rescaling.
+`zeroshot` runs additionally emit a `zeroshot_calibrated` block — the same scores after an affine
+map fitted OUT OF FOLD — which is what separates "the ordering is wrong" from "the ordering is
+right and the range is not". `--out results.json` writes the numbers, so a before/after comparison
+across an engine change is a plain file diff.
 
 ## Reading the numbers honestly
 
@@ -110,7 +116,7 @@ tracks — which had no measurement at all: `evaluate_text_queries` shipped with
 so a regression from a prompt, pooling or recentering change would have been invisible.
 
 ```bash
-uv run --extra models python scripts/bench_text_retrieval.py \
+uv run --extra models --extra muq python scripts/bench_text_retrieval.py \
     --data-dir ~/moodengine-bench/deam --limit 400 --embedder clap
 ```
 
@@ -129,8 +135,8 @@ Measured on 400 songs, `k=10`:
 | calm, quiet, low-energy | 0.700 | 0.500 |
 | **happy, cheerful, positive** | **0.300** | **0.100** |
 | sad, gloomy, negative | 0.700 | 0.600 |
-| **macro P@10** | **0.600** [0.425, 0.750] | 0.450 [0.312, 0.625] |
-| macro MAP | **0.448** [0.405, 0.497] | 0.420 [0.382, 0.449] |
+| **macro P@10** | **0.600** [0.425, 0.750] | 0.450 [0.325, 0.650] |
+| macro MAP | **0.448** [0.408, 0.494] | 0.420 [0.379, 0.460] |
 
 Two things worth acting on. **Positive valence is the stack's weak spot**: "happy" retrieves
 at 0.300 against a 0.250 floor for CLAP, and at 0.100 — *below* chance, i.e. anti-correlated
