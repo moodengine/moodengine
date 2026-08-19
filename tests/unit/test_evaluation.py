@@ -329,6 +329,58 @@ def test_ccc_components_constant_series_is_nan() -> None:
     assert_that(support).is_equal_to(8)
 
 
+def test_bootstrap_ci_brackets_the_point_estimate() -> None:
+    """A percentile bootstrap must contain the statistic it is an interval for — the cheapest
+    sanity check that the resampling preserves the pairing rather than shuffling one side."""
+    import importlib.util
+    import pathlib as _pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        "_bench",
+        _pathlib.Path(__file__).resolve().parents[2] / "scripts" / "bench_valence_arousal.py",
+    )
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+
+    rng = np.random.default_rng(0)
+    gold = rng.random(200)
+    pred = 0.7 * gold + 0.3 * rng.random(200)
+
+    point = bench._pearson_stat(pred, gold)
+    lo, hi = bench._bootstrap_ci(pred, gold, bench._pearson_stat, seed=1)
+
+    assert_that(lo).is_less_than(point)
+    assert_that(hi).is_greater_than(point)
+
+
+def test_paired_delta_ci_is_tighter_than_the_marginal_intervals() -> None:
+    """The reason the comparison is paired. Two arms scored on the SAME songs share their audio
+    and labels, so their errors are correlated and the interval on the difference is far tighter
+    than the overlap of two marginal intervals implies — which is what turns 'it moved' into
+    'it improved'."""
+    import importlib.util
+    import pathlib as _pathlib
+
+    spec = importlib.util.spec_from_file_location(
+        "_bench",
+        _pathlib.Path(__file__).resolve().parents[2] / "scripts" / "bench_valence_arousal.py",
+    )
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+
+    rng = np.random.default_rng(0)
+    gold = rng.random(200)
+    shared_error = 0.35 * rng.random(200)  # both arms see the same hard songs
+    arm_a = 0.6 * gold + shared_error + 0.02 * rng.random(200)
+    arm_b = 0.6 * gold + shared_error
+
+    lo_a, hi_a = bench._bootstrap_ci(arm_a, gold, bench._pearson_stat, seed=1)
+    delta, lo_d, hi_d = bench._paired_delta_ci(arm_a, arm_b, gold, bench._pearson_stat, seed=1)
+
+    assert_that(hi_d - lo_d).is_less_than(hi_a - lo_a)
+    assert_that(delta).is_between(lo_d, hi_d)
+
+
 def test_ccc_constant_series_is_nan() -> None:
     """Both series constant -> denominator 0 -> (nan, n), never a divide error."""
     ccc, support = concordance_correlation_coefficient(np.full(8, 0.4), np.full(8, 0.4))
