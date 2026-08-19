@@ -27,9 +27,9 @@ from moodengine import labeling as _labeling
 from moodengine import pooling as _pooling
 from moodengine import viz as _viz
 from moodengine._typing import ClusterMethod, ClusterMetrics, SupportsEmbedText
-from moodengine.config import Config
+from moodengine.config import Config, ensure_clap_fusion_supported
 from moodengine.embeddings.base import cache_key, load_cached, save_cached
-from moodengine.exceptions import MissingDependencyError
+from moodengine.exceptions import MissingDependencyError, ModelLoadError
 from moodengine.pooling import POOLERS
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,9 @@ def get_embedder(name: str, config: Config):
         try:
             from moodengine.embeddings.mulan import MuLanEmbedder
         except ModuleNotFoundError as exc:
-            raise MissingDependencyError("MuQ-MuLan embedding", "torch + muq", "muq") from exc
+            raise MissingDependencyError(
+                "MuQ-MuLan embedding", "torch + muq", "models,muq"
+            ) from exc
         return MuLanEmbedder(config)
     raise ValueError(f"unknown embedder name: {name!r} (expected 'mert', 'clap' or 'mulan')")
 
@@ -126,6 +128,14 @@ class LazyEmbedder:
             )
         self.name = key
         self.sample_rate = int(getattr(config, self._RATE_FIELDS[key]))
+        # Run the CLAP fusion refusal HERE, not only inside `CLAPEmbedder.__init__`. Deferring the
+        # weights also deferred that check into `track_embedding`, i.e. inside the per-file
+        # `except Exception` that skips and continues — so a config which produces irreproducible
+        # vectors logged one warning per file and returned an empty matrix instead of refusing.
+        # It is pure arithmetic on two config fields, so doing it eagerly costs nothing and keeps
+        # the outcome independent of how much of the run is served from cache.
+        if key == "clap":
+            ensure_clap_fusion_supported(config)
         self._config = config
         self._loaded: object | None = None
 
@@ -187,7 +197,8 @@ def _embedding_cache_extra(embedder, config: Config) -> str:
     ``_cfg-<hash>`` suffix hashing the remaining vector-affecting fields — the segmentation slice
     (overlap, min-segment, cap, selection policy, and the FRACTIONAL part of ``segment_seconds``,
     fixing the old ``int()`` truncation that collided 10.2 s with 10.7 s), the decode sample rate,
-    and (MERT only) the hub revision and per-layer weights — but ONLY when any of them differs from
+    and the backbone's hub revision (MERT and MuQ-MuLan) plus MERT's per-layer weights — but ONLY
+    when any of them differs from
     the pre-1.0 defaults (:data:`_LEGACY_CACHE_DEFAULTS` / :data:`_LEGACY_SAMPLE_RATE`). So a
     legacy-equivalent config yields the byte-identical legacy key, while changing e.g. ``overlap``
     or the 24 kHz MERT rate mints a new key instead of silently reusing another setting's vectors.
@@ -212,7 +223,11 @@ def _embedding_cache_extra(embedder, config: Config) -> str:
         "sample_rate": int(embedder.sample_rate),
     }
     legacy = dict(_LEGACY_CACHE_DEFAULTS)
-    legacy["sample_rate"] = _LEGACY_SAMPLE_RATE.get(embedder.name, int(embedder.sample_rate))
+    # An embedder with no pre-1.0 cache gets a sentinel that no real rate can equal, so its decode
+    # rate always reaches the hash. Defaulting to the CURRENT rate instead made the comparison a
+    # tautology: the field could never differ from its own legacy, and a config sitting on the
+    # legacy defaults everywhere else produced a key that did not encode the rate at all.
+    legacy["sample_rate"] = _LEGACY_SAMPLE_RATE.get(embedder.name, -1)
     if embedder.name == "mert":
         fields["mert_revision"] = config.mert_revision
         fields["mert_layer_weights"] = (
@@ -220,6 +235,10 @@ def _embedding_cache_extra(embedder, config: Config) -> str:
         )
         legacy["mert_revision"] = None
         legacy["mert_layer_weights"] = None
+    elif embedder.name == "mulan":
+        # Same reason MERT pins its revision in the key: the weights behind a cached vector are
+        # part of what produced it, and an unpinned hub reference can move underneath the cache.
+        fields["mulan_revision"] = config.mulan_revision
 
     if fields != legacy:
         digest = hashlib.sha1(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()[
@@ -322,7 +341,12 @@ def extract_embeddings(
     for done, path in enumerate(discovered, start=1):
         try:
             vec = track_embedding(embedder, path, config, force=force)
-        except Exception as exc:  # noqa: BLE001 - skip + continue on any failure
+        except (MissingDependencyError, ModelLoadError):
+            # Not a property of THIS file — the run cannot embed any of them. Skipping would emit
+            # one identical warning per track and hand back an empty matrix that reads exactly
+            # like "no audio found". Fail once instead.
+            raise
+        except Exception as exc:  # noqa: BLE001 - skip + continue on any per-file failure
             logger.warning("Skipping %s: %s", path, exc)
             if on_error is not None:
                 on_error(Path(path), exc)

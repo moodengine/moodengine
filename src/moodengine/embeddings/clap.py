@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from moodengine._math import l2_normalize as _l2_normalize
-from moodengine.config import CLAP_FUSION_SAMPLE_LIMIT, Config
+from moodengine.config import Config, ensure_clap_fusion_supported
 from moodengine.embeddings.base import Embedder
 from moodengine.exceptions import ModelLoadError
 
@@ -81,18 +81,13 @@ class CLAPEmbedder(Embedder):
         The fusion flag and audio backbone come from ``config.clap_enable_fusion``
         / ``config.clap_amodel``. ``config.clap_checkpoint`` selects a specific
         checkpoint path; ``None`` loads LAION's default pretrained weights.
+
+        Refuses (``ValueError``) a config whose segments exceed
+        :data:`~moodengine.config.CLAP_FUSION_SAMPLE_LIMIT` — see
+        :func:`~moodengine.config.ensure_clap_fusion_supported`. Checked before any weight is
+        touched, so the refusal costs nothing.
         """
-        samples = config.segment_seconds * config.clap_sample_rate
-        if samples > CLAP_FUSION_SAMPLE_LIMIT:
-            raise ValueError(
-                f"segment_seconds={config.segment_seconds} at clap_sample_rate="
-                f"{config.clap_sample_rate} gives {samples:.0f} samples per segment, above the "
-                f"{CLAP_FUSION_SAMPLE_LIMIT} at which laion-clap truncates by drawing chunks from "
-                "the unseeded global numpy RNG. Embeddings past that point are not reproducible "
-                "and would be cached as if they were, so this refuses rather than producing them. "
-                f"Use segment_seconds <= {CLAP_FUSION_SAMPLE_LIMIT / config.clap_sample_rate:g} "
-                "for CLAP (MERT has no such limit)."
-            )
+        ensure_clap_fusion_supported(config)
         self.config = config
         self.sample_rate = config.clap_sample_rate
         self.device = config.device
@@ -182,24 +177,34 @@ class CLAPEmbedder(Embedder):
         Checked against ``config.clap_sample_rate`` rather than trusting it: the pipeline calls
         ``extract(seg, sr=embedder.sample_rate)``, so ``sr`` echoes the config and comparing the two
         would always agree — including when the config itself is wrong. Only the model can say what
-        it was trained at. Read defensively (``None`` skips the check) because the attribute path is
-        laion-clap's internal structure, not a published API, and a missing attribute must not stop
-        a correctly-configured run.
+        it was trained at.
+
+        laion-clap keeps the loaded audio config in TWO places, neither a published API:
+        ``CLAP_Module.model_cfg`` (a plain dict parsed from the checkpoint's json) and
+        ``CLAP_Module.model.audio_cfg`` (a ``CLAPAudioCfp`` dataclass). Both are tried — reading
+        only one of them is how this check silently returned ``None`` on the shipped default
+        checkpoint, which made the guard inert exactly where it was supposed to apply. Still read
+        defensively (``None`` skips the check): a future layout change must not stop a
+        correctly-configured run.
         """
-        cfg = getattr(getattr(self.model, "model", None), "model_cfg", None)
-        if not isinstance(cfg, dict):
-            return None
-        audio_cfg = cfg.get("audio_cfg")
-        rate = audio_cfg.get("sample_rate") if isinstance(audio_cfg, dict) else None
-        return int(rate) if isinstance(rate, (int, float)) else None
+        outer = getattr(self.model, "model_cfg", None)
+        audio_cfg = outer.get("audio_cfg") if isinstance(outer, dict) else None
+        for source in (audio_cfg, getattr(getattr(self.model, "model", None), "audio_cfg", None)):
+            rate = (
+                source.get("sample_rate")
+                if isinstance(source, dict)
+                else getattr(source, "sample_rate", None)
+            )
+            if isinstance(rate, (int, float)):
+                return int(rate)
+        return None
 
-    def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
-        """Embed one mono float32 waveform into a clip-level vector.
+    def _ensure_model_rate(self, sr: int) -> None:
+        """Raise unless ``sr`` matches the loaded checkpoint's declared rate.
 
-        Returns a 1-D ``(hidden,)`` float32 array. ``sr`` must be the rate the waveform was decoded
-        at and must match the loaded checkpoint's declared rate; a mismatch raises ``ValueError``
-        rather than embedding time/pitch-warped audio, mirroring the MERT embedder. Empty/degenerate
-        inputs are padded to a small floor so the model never receives a zero-length clip.
+        Split out of :meth:`extract` so :meth:`extract_batch` cannot silently skip it — the
+        pipeline probes for ``extract_batch`` and takes it whenever present, which made this the
+        live path and left the checkpoint-rate guard unreachable on it.
         """
         expected = self._model_sample_rate()
         if expected is not None and int(sr) != expected:
@@ -209,12 +214,31 @@ class CLAPEmbedder(Embedder):
                 f"config.clap_sample_rate={expected} so audio is decoded at the model's rate "
                 "(off-rate audio silently warps every embedding)."
             )
-        wav = np.asarray(waveform, dtype=np.float32).reshape(-1)
 
-        # Guard the degenerate empty/very-short case: pad to a small floor.
+    def _padded(self, waveform: np.ndarray) -> np.ndarray:
+        """1-D float32 view of ``waveform``, padded up to a ~10 ms floor.
+
+        The floor keeps the model from ever receiving a zero-length clip. Shared with
+        :meth:`extract_batch` so the base contract holds — a batched override must not change the
+        numbers — and ``io_audio.segment_waveform`` does return a sub-floor trailing window on very
+        short files.
+        """
+        wav = np.asarray(waveform, dtype=np.float32).reshape(-1)
         min_len = max(self.sample_rate // 100, 1)  # ~10 ms of samples
         if wav.size < min_len:
             wav = np.pad(wav, (0, min_len - wav.size))
+        return wav
+
+    def extract(self, waveform: np.ndarray, sr: int) -> np.ndarray:
+        """Embed one mono float32 waveform into a clip-level vector.
+
+        Returns a 1-D ``(hidden,)`` float32 array. ``sr`` must be the rate the waveform was decoded
+        at and must match the loaded checkpoint's declared rate; a mismatch raises ``ValueError``
+        rather than embedding time/pitch-warped audio, mirroring the MERT embedder. Empty/degenerate
+        inputs are padded to a small floor so the model never receives a zero-length clip.
+        """
+        self._ensure_model_rate(sr)
+        wav = self._padded(waveform)
 
         with torch.inference_mode():
             emb = self.model.get_audio_embedding_from_data(x=wav[None, :])
@@ -229,17 +253,26 @@ class CLAPEmbedder(Embedder):
         numerics untouched — measured max deviation from the one-at-a-time path is 1.5e-8, i.e.
         float32 rounding.
 
+        Applies the SAME two guards as :meth:`extract` — the checkpoint-rate check and the
+        short-clip pad — because the pipeline takes this path whenever it exists, and the base
+        contract is that a batched override must not change the numbers.
+
         Measured on 8 real tracks (96 segments) on Apple Silicon: 1.24x on the forward pass and
         1.12x end to end, since decoding is 45 % of the per-track cost. Peak memory grows with the
         group, bounded by ``config.max_segments_per_track`` (12 by default, ~23 MB of input).
         """
-        by_length: dict[int, list[int]] = {}
-        for i, wav in enumerate(waveforms):
-            by_length.setdefault(int(np.asarray(wav).size), []).append(i)
+        self._ensure_model_rate(sr)
+        # Pad BEFORE grouping: the floor can lift a sub-floor trailing window into another
+        # group's length, and grouping on the raw sizes would then stack ragged rows.
+        prepared = [self._padded(wav) for wav in waveforms]
 
-        out: list[np.ndarray | None] = [None] * len(waveforms)
+        by_length: dict[int, list[int]] = {}
+        for i, wav in enumerate(prepared):
+            by_length.setdefault(int(wav.size), []).append(i)
+
+        out: list[np.ndarray | None] = [None] * len(prepared)
         for _length, idxs in sorted(by_length.items()):
-            stack = np.stack([np.asarray(waveforms[i], dtype=np.float32).reshape(-1) for i in idxs])
+            stack = np.stack([prepared[i] for i in idxs])
             with torch.inference_mode():
                 emb = _as_float32(self.model.get_audio_embedding_from_data(x=stack))
             for slot, i in enumerate(idxs):

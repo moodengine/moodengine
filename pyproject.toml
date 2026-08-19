@@ -219,10 +219,10 @@ DEP004 = ["typer"]
 
 [tool.coverage.run]
 source = ["moodengine"]
-# clap.py / mert.py are pure torch wrappers with no unit tests by contract (they run
-# only under the opt-in `-m model` suite) — counting their guaranteed-0% lines in the
-# default-suite denominator would make the floor dishonest, not stricter.
-omit = ["*/embeddings/clap.py", "*/embeddings/mert.py"]
+# clap.py / mert.py / mulan.py are pure torch wrappers with no unit tests by contract
+# (they run only under the opt-in `-m model` suite) — counting their guaranteed-0% lines
+# in the default-suite denominator would make the floor dishonest, not stricter.
+omit = ["*/embeddings/clap.py", "*/embeddings/mert.py", "*/embeddings/mulan.py"]
 
 [tool.coverage.report]
 show_missing = true
