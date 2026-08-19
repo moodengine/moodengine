@@ -84,6 +84,11 @@ def ot_morph(
     reg: float = 0.05,
 ) -> list[int]:
     """Up to ``n`` DISTINCT row indices of ``X``, ordered A→B by an entropic optimal-transport plan
+
+    .. note::
+       ``filenames`` is accepted and never read — the return is row POSITIONS, not names. It is
+       kept for signature stability and should be removed; pass ``[]``.
+
     (opt-in). Requires POT (``import ot`` is LAZY → ``ImportError`` when it isn't installed, which the
     caller can catch to degrade gracefully). Pure numpy + POT, deterministic.
 
@@ -164,3 +169,179 @@ def ot_morph(
     # order the picks by B-affinity (original row index as a deterministic tie-break).
     out.sort(key=lambda t: (float(sb[t]), t))
     return out
+
+
+def journey_tracks(
+    X: np.ndarray,
+    v_a: np.ndarray,
+    v_b: np.ndarray,
+    n: int = 8,
+    *,
+    mode: str = "slerp",
+    reg: float = 0.05,
+) -> list[int]:
+    """Up to ``n`` DISTINCT row indices of ``X``, ordered A→B — the same return shape for both modes.
+
+    The two morph strategies disagreed on what they hand back: :func:`ot_morph` already returns row
+    indices, while :func:`path_between` returns waypoint VECTORS and stops, leaving every caller to
+    reinvent waypoint→track selection. The module docstring described that step ("selecting the
+    nearest-unused track at each waypoint") but nothing implemented it, so the SLERP mode produced
+    no playlist at all. This is that step, and it makes the two modes interchangeable.
+
+    ``mode='slerp'`` walks the geodesic from :func:`path_between` and takes, at each waypoint, the
+    nearest track not already used — so every pick sits ON the arc and the valence/energy ramp is a
+    consequence of the path rather than a target imposed on it. ``mode='ot'`` delegates to
+    :func:`ot_morph` (needs POT; raises :class:`~moodengine.exceptions.MissingDependencyError`
+    when absent).
+
+    ``X`` ``(m, d)`` are track embeddings, re-L2-normalized defensively so the ranking is cosine on
+    any input. Returns fewer than ``n`` indices when the pool is smaller. Guards an empty pool and
+    ``n <= 0`` with ``[]``. Deterministic; ties resolve to the lowest row index. Pure numpy in
+    ``slerp`` mode.
+    """
+    Xn = l2_normalize(np.asarray(X, dtype=np.float32), axis=1)
+    m = Xn.shape[0] if Xn.ndim == 2 else 0
+    n = int(n)
+    if m == 0 or n <= 0:
+        return []
+    if mode == "ot":
+        # `filenames` is declared by `ot_morph` and never read (grep it) — the indices it returns
+        # are row positions, not names. Passing [] rather than fabricating a list documents that
+        # at the call site; the parameter itself should go, which is a separate change.
+        return ot_morph(v_a, v_b, Xn, [], n, reg=reg)
+    if mode != "slerp":
+        raise ValueError(f"unknown journey mode {mode!r} (expected 'slerp' | 'ot')")
+
+    waypoints = path_between(v_a, v_b, n)
+    picks: list[int] = []
+    used = np.zeros(m, dtype=bool)
+    for point in waypoints:
+        if used.all():
+            break
+        sims = Xn @ np.asarray(point, dtype=np.float32)
+        sims[used] = -np.inf  # nearest UNUSED: a journey must not stall on one track
+        choice = int(np.argmax(sims))
+        picks.append(choice)
+        used[choice] = True
+    return picks
+
+
+#: Above this many tracks the exact ordering is abandoned for 2-opt. Held-Karp is O(2^n · n²), so
+#: 12 costs about 590k operations (sub-millisecond) while 16 would cost ~17M — the wall is steep
+#: and close, which is why the cutoff is a constant rather than a knob.
+_EXACT_ORDER_MAX: int = 12
+
+
+def smooth_order(X: np.ndarray, start: int | None = None) -> list[int]:
+    """Order tracks so CONSECUTIVE ones are as similar as possible — the missing sequencing objective.
+
+    Nothing in the library optimized transitions. :func:`journey_tracks` walks a path between two
+    moods, which fixes the order by construction; this answers the other question: given a SET of
+    tracks, in what order should they play so each hand-off is smooth? It minimizes the total
+    cosine distance along the sequence — the open-path travelling-salesman objective, no return to
+    the start.
+
+    Exact below :data:`_EXACT_ORDER_MAX` tracks via Held-Karp dynamic programming over subsets
+    (``O(2^n · n²)``, sub-millisecond at 12); above it, a nearest-neighbour tour refined by 2-opt
+    until no swap improves, which is not optimal but is the standard practical answer and stays
+    milliseconds at playlist sizes.
+
+    ``X`` ``(n, d)`` are track embeddings, re-L2-normalized defensively. ``start`` pins the opening
+    track (a row index) when the caller has one in mind; ``None`` lets the optimizer choose. Returns
+    a permutation of ``range(n)``. Guards ``n <= 2`` (nothing to reorder). Deterministic; ties
+    resolve to the lowest index. Pure numpy.
+    """
+    Xn = l2_normalize(np.asarray(X, dtype=np.float32), axis=1)
+    n = Xn.shape[0] if Xn.ndim == 2 else 0
+    if n == 0:
+        return []
+    if n <= 2:
+        return list(range(n))
+
+    cost = (1.0 - Xn @ Xn.T).astype(np.float64)  # cosine distance
+    np.fill_diagonal(cost, 0.0)
+    starts = [int(start)] if start is not None and 0 <= int(start) < n else list(range(n))
+
+    if n <= _EXACT_ORDER_MAX:
+        return _held_karp_path(cost, starts)
+    return _two_opt_path(cost, starts[0] if start is not None else _cheapest_nn_start(cost))
+
+
+def _held_karp_path(cost: np.ndarray, starts: list[int]) -> list[int]:
+    """Exact minimum-cost open Hamiltonian path by subset DP, over the allowed start nodes."""
+    n = cost.shape[0]
+    best_tour, best_cost = list(range(n)), float("inf")
+    full = 1 << n
+    for origin in starts:
+        # dp[mask][j] = cheapest path visiting `mask`, starting at `origin`, ending at `j`.
+        dp = np.full((full, n), np.inf)
+        parent = np.full((full, n), -1, dtype=np.int32)
+        dp[1 << origin, origin] = 0.0
+        for mask in range(full):
+            if not (mask >> origin) & 1:
+                continue
+            for j in range(n):
+                here = dp[mask, j]
+                if not np.isfinite(here) or not (mask >> j) & 1:
+                    continue
+                for nxt in range(n):
+                    if (mask >> nxt) & 1:
+                        continue
+                    nmask = mask | (1 << nxt)
+                    cand = here + cost[j, nxt]
+                    if cand < dp[nmask, nxt]:
+                        dp[nmask, nxt] = cand
+                        parent[nmask, nxt] = j
+        end = int(np.argmin(dp[full - 1]))
+        if dp[full - 1, end] < best_cost:
+            best_cost = float(dp[full - 1, end])
+            tour, mask, node = [], full - 1, end
+            while node != -1:
+                tour.append(node)
+                prev = int(parent[mask, node])
+                mask ^= 1 << node
+                node = prev
+            best_tour = tour[::-1]
+    return [int(i) for i in best_tour]
+
+
+def _cheapest_nn_start(cost: np.ndarray) -> int:
+    """The start whose greedy nearest-neighbour tour is cheapest — a better 2-opt seed than row 0."""
+    return int(min(range(cost.shape[0]), key=lambda s: _tour_cost(cost, _nn_tour(cost, s))))
+
+
+def _nn_tour(cost: np.ndarray, start: int) -> list[int]:
+    n = cost.shape[0]
+    unused = set(range(n)) - {start}
+    tour = [start]
+    while unused:
+        nxt = min(unused, key=lambda j: (cost[tour[-1], j], j))
+        tour.append(nxt)
+        unused.discard(nxt)
+    return tour
+
+
+def _tour_cost(cost: np.ndarray, tour: list[int]) -> float:
+    return float(sum(cost[tour[i], tour[i + 1]] for i in range(len(tour) - 1)))
+
+
+def _two_opt_path(cost: np.ndarray, start: int) -> list[int]:
+    """Nearest-neighbour tour refined by 2-opt segment reversals until no swap improves."""
+    tour = _nn_tour(cost, start)
+    n = len(tour)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 1):
+            for j in range(i + 1, n):
+                # Reversing tour[i:j+1] only changes the two edges at its boundaries.
+                before = cost[tour[i - 1], tour[i]] + (
+                    cost[tour[j], tour[j + 1]] if j + 1 < n else 0.0
+                )
+                after = cost[tour[i - 1], tour[j]] + (
+                    cost[tour[i], tour[j + 1]] if j + 1 < n else 0.0
+                )
+                if after < before - 1e-12:
+                    tour[i : j + 1] = tour[i : j + 1][::-1]
+                    improved = True
+    return [int(i) for i in tour]
