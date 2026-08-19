@@ -27,9 +27,11 @@ from moodengine.labeling import (
     cluster_mood_profiles,
     compose_mood_vector,
     label_direction_redundancy,
+    MOOD_AFFECT,
     label_prior,
     label_tracks,
     labeling_quality_metrics,
+    mood_affect_consistency,
     l2_normalize,
     name_clusters,
     recenter_similarities,
@@ -496,6 +498,81 @@ def test_build_prompt_table_rejects_a_template_without_exactly_one_slot() -> Non
         build_prompt_table({"calm": ("calm",)}, ("a song with no slot",))
     with pytest.raises(ValueError, match=r"must contain exactly one"):
         build_prompt_table({"calm": ("calm",)}, ("a {} {} song",))
+
+
+def _affect_frame(moods, energies, valences):
+    return pd.DataFrame({"top_mood": moods, "energy": energies, "valence": valences})
+
+
+def test_mood_affect_consistency_flags_the_contradiction_nothing_checked() -> None:
+    """`top_mood` and the energy/valence axes come from the same embeddings via INDEPENDENT prompt
+    sets, so ``top_mood="calm"`` beside ``energy=0.9`` was possible and unflagged. A frame where
+    every mood contradicts its own axes must score badly on every output."""
+    frame = _affect_frame(
+        ["calm", "aggressive", "melancholic", "happy"],
+        [0.95, 0.05, 0.95, 0.05],  # each the opposite of what the mood implies
+        [0.05, 0.95, 0.95, 0.05],
+    )
+
+    report = mood_affect_consistency(frame)
+
+    assert_that(report["incoherent_share"]).is_equal_to(1.0)
+    assert_that(report["n_scored"]).is_equal_to(4)
+    assert_that(report["worst_moods"][0][1]).is_greater_than(0.5)
+
+
+def test_mood_affect_consistency_clean_frame_scores_coherent() -> None:
+    """The counterpart: tracks placed where their mood says they belong must NOT be flagged, or
+    the metric is an alarm nobody can act on."""
+    frame = _affect_frame(
+        ["calm", "aggressive", "melancholic", "happy"],
+        [0.15, 0.95, 0.30, 0.70],
+        [0.60, 0.20, 0.20, 0.90],
+    )
+
+    report = mood_affect_consistency(frame)
+
+    assert_that(report["incoherent_share"]).is_equal_to(0.0)
+    assert_that(report["arousal_pearson"]).is_greater_than(0.9)
+
+
+def test_mood_affect_consistency_separates_affect_from_texture_words() -> None:
+    """The vocabulary mixes emotions with genre/production descriptors — "jazzy" is not a feeling.
+    Their coordinates are a weaker claim (the typical affect of music so described), so the counts
+    are reported apart rather than pooled."""
+    frame = _affect_frame(
+        ["calm", "happy", "jazzy", "spacey"], [0.2, 0.7, 0.5, 0.3], [0.6, 0.9, 0.6, 0.5]
+    )
+
+    report = mood_affect_consistency(frame)
+
+    assert_that(report["n_affect"]).is_equal_to(2)
+    assert_that(report["n_texture"]).is_equal_to(2)
+
+
+def test_mood_affect_consistency_skips_unknown_moods_rather_than_guessing() -> None:
+    """A custom vocabulary has no circumplex coordinates. Those rows are dropped from the score,
+    never imputed — an invented coordinate would silently define what the mood means."""
+    frame = _affect_frame(["calm", "wonky", "happy"], [0.2, 0.5, 0.7], [0.6, 0.5, 0.9])
+
+    report = mood_affect_consistency(frame)
+
+    assert_that(report["n_scored"]).is_equal_to(2)
+
+
+def test_mood_affect_consistency_degenerate_frame_is_zeroed() -> None:
+    """No columns, or no rows, yields an absent measurement rather than a raise."""
+    assert_that(mood_affect_consistency(pd.DataFrame())["n_scored"]).is_equal_to(0)
+    assert_that(mood_affect_consistency(_affect_frame([], [], []))["n_scored"]).is_equal_to(0)
+
+
+def test_mood_affect_table_covers_the_shipped_vocabulary() -> None:
+    """A mood added to the prompts without a coordinate would silently vanish from the metric."""
+    assert_that(set(MOOD_AFFECT)).is_equal_to(set(DEFAULT_MOOD_PROMPTS))
+    for name, (valence, arousal, kind) in MOOD_AFFECT.items():
+        assert_that(valence).described_as(f"{name} valence").is_between(0.0, 1.0)
+        assert_that(arousal).described_as(f"{name} arousal").is_between(0.0, 1.0)
+        assert_that(kind).described_as(f"{name} kind").is_in("affect", "texture")
 
 
 # --------------------------------------------------------------------------- #
