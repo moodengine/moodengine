@@ -36,6 +36,13 @@ because measurement does not settle it: the reduced space recovers overlapping b
 some regimes and worse in others. What it does settle is that COSINE is meaningless on a UMAP
 layout — see the note on ``cluster_spherical_kmeans``."""
 
+HDBSCANSelection = Literal["eom", "leaf"]
+"""How HDBSCAN cuts its condensed tree (``Config.hdbscan_cluster_selection_method``).
+
+``"eom"`` (excess of mass, the default) keeps the most persistent clusters and tends to return a
+few broad ones; ``"leaf"`` takes the leaves instead, splitting the one dominant cluster a
+homogeneous library produces into its finer modes."""
+
 ProjectionMethod = Literal["umap", "densmap", "pacmap"]
 """2-D map projections (``Config.projection_method``)."""
 
@@ -137,6 +144,10 @@ class StabilityMetrics(TypedDict):
     mean_ami: float
     mean_noise_agreement: float
     n_boot: int
+    #: Which space the replicates were clustered in, mirroring ``ClusterMetrics.silhouette_space``
+    #: — a stability score validates one partition, and the reader has to know which. Stamped on
+    #: the degenerate all-zeros return too, so the key is unconditional.
+    space: ClusterSpace
 
 
 class CoverageEntropyResult(TypedDict):

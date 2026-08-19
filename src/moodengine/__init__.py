@@ -21,6 +21,7 @@ from moodengine._typing import (
     ClusterMetrics,
     CoverageEntropyResult,
     HDBSCANDetail,
+    HDBSCANSelection,
     LayerWeighting,
     PoolingMode,
     ProjectionMethod,
@@ -255,6 +256,7 @@ __all__ = [
     # typing vocabulary
     "ClusterMethod",
     "ClusterSpace",
+    "HDBSCANSelection",
     "PoolingMode",
     "LayerWeighting",
     "SegmentSelection",

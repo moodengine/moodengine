@@ -15,6 +15,7 @@ from platformdirs import user_cache_path
 
 from moodengine._typing import (
     ClusterSpace,
+    HDBSCANSelection,
     LayerWeighting,
     PoolingMode,
     ProjectionMethod,
@@ -160,7 +161,7 @@ class Config:
     # unexposed meant the only remedy was changing min_cluster_size and hoping.
     #   "eom"  — excess of mass, the default: prefers few large, stable clusters
     #   "leaf" — the finest stable clusters, which is what splits that dominant blob
-    hdbscan_cluster_selection_method: str = "eom"
+    hdbscan_cluster_selection_method: HDBSCANSelection = "eom"
     hdbscan_cluster_selection_epsilon: float = 0.0  # merge clusters closer than this distance
     hdbscan_max_cluster_size: int | None = None  # cap a runaway cluster (standalone backend only)
     hdbscan_allow_single_cluster: bool = False  # let a genuinely uniform library say so
@@ -197,7 +198,7 @@ class Config:
         _check_choice(
             "hdbscan_cluster_selection_method",
             self.hdbscan_cluster_selection_method,
-            ("eom", "leaf"),
+            get_args(HDBSCANSelection),
         )
 
         if self.segment_seconds <= 0:

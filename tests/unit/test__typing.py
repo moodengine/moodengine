@@ -21,6 +21,7 @@ from moodengine import (
     ClusterMetrics,
     CoverageEntropyResult,
     HDBSCANDetail,
+    HDBSCANSelection,
     LayerWeighting,
     PoolingMode,
     ProjectionMethod,
@@ -64,6 +65,7 @@ def test_cluster_method_alias_matches_run_clustering_vocabulary() -> None:
         ("projection_method", ProjectionMethod),
         ("segment_selection", SegmentSelection),
         ("cluster_space", ClusterSpace),
+        ("hdbscan_cluster_selection_method", HDBSCANSelection),
     ],
 )
 def test_config_literal_fields_match_their_runtime_checks(field: str, alias: object) -> None:
@@ -166,6 +168,7 @@ def test_typing_vocabulary_is_exported_from_the_package_root() -> None:
     for name in (
         "ClusterMethod",
         "ClusterSpace",
+        "HDBSCANSelection",
         "PoolingMode",
         "LayerWeighting",
         "ProjectionMethod",

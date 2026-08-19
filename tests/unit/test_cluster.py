@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import numpy as np
 import pytest
 from assertpy import assert_that
 
+import moodengine.cluster
 from moodengine.cluster import (
     bootstrap_stability,
     cluster_hdbscan,
@@ -632,7 +634,7 @@ def test_bootstrap_stability_keys_and_high_ari_on_blobs() -> None:
     X, _ = _three_blobs(seed=36, per=15)
     out = bootstrap_stability(X, method="kmeans", config=cfg)
     assert_that(set(out.keys())).is_equal_to(
-        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot"}
+        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot", "space"}
     )
     assert_that(out["n_boot"]).is_equal_to(8)
     assert_that(out["mean_ari"]).is_greater_than(0.8)  # clustering is highly reproducible
@@ -661,8 +663,69 @@ def test_bootstrap_stability_degenerate_returns_zeros() -> None:
             "mean_ami": 0.0,
             "mean_noise_agreement": 0.0,
             "n_boot": 5,
+            "space": "original",  # n=3 is below the UMAP floor, so the raw rows would be clustered
         }
     )
+
+
+def test_bootstrap_stability_reports_the_reduced_space_on_the_default_path() -> None:
+    """The default config clusters the UMAP layout, and the result says so."""
+    cfg = dataclasses.replace(default_config(), kmeans_n_clusters=3, bootstrap_n=4, seed=0)
+    X, _ = _three_blobs(seed=41, per=15)
+
+    out = bootstrap_stability(X, "kmeans", cfg)
+
+    assert_that(out["space"]).is_equal_to("reduced")
+
+
+def test_bootstrap_stability_skips_the_reduction_under_cluster_space_original(mocker) -> None:
+    """Under cluster_space='original' the replicates cluster the raw embeddings, exactly as
+    run_clustering does — so no UMAP is fit at all and the result names the space it used.
+
+    Reducing here while the pipeline clusters the originals would validate a partition that is
+    never shipped, which is the one thing a stability number must not do."""
+    cfg = dataclasses.replace(
+        default_config(), cluster_space="original", kmeans_n_clusters=3, bootstrap_n=4, seed=0
+    )
+    X, _ = _three_blobs(seed=42, per=15)
+    spy = mocker.spy(moodengine.cluster, "reduce_umap")
+
+    out = bootstrap_stability(X, "kmeans", cfg)
+
+    assert_that(spy.call_count).is_equal_to(0)
+    assert_that(out["space"]).is_equal_to("original")
+    assert_that(out["mean_ari"]).is_greater_than(0.8)  # separable blobs stay separable unreduced
+
+
+def test_bootstrap_stability_refit_reduction_is_inert_and_logged_in_the_original_space(
+    caplog,
+) -> None:
+    """`refit_reduction` has nothing to re-fit when clustering the originals. The documented
+    reading is the GAP between the two modes, so returning the frozen number in silence would
+    read as 'the structure is real' precisely when nothing was re-fit."""
+    cfg = dataclasses.replace(
+        default_config(), cluster_space="original", kmeans_n_clusters=3, bootstrap_n=4, seed=0
+    )
+    X, _ = _three_blobs(seed=43, per=15)
+
+    with caplog.at_level(logging.INFO, logger="moodengine.cluster"):
+        refit = bootstrap_stability(X, "kmeans", cfg, refit_reduction=True)
+    frozen = bootstrap_stability(X, "kmeans", cfg)
+
+    assert_that(refit).is_equal_to(frozen)
+    assert_that(caplog.text).contains("refit_reduction=True is inert")
+
+
+def test_bootstrap_stability_reduces_once_on_the_default_path(mocker) -> None:
+    """The frozen mode fits UMAP exactly once and subsamples its rows, rather than per replicate —
+    that is what isolates clustering variance from UMAP's own run-to-run noise."""
+    cfg = dataclasses.replace(default_config(), kmeans_n_clusters=3, bootstrap_n=5, seed=0)
+    X, _ = _three_blobs(seed=44, per=15)
+    spy = mocker.spy(moodengine.cluster, "reduce_umap")
+
+    bootstrap_stability(X, "kmeans", cfg)
+
+    assert_that(spy.call_count).is_equal_to(1)
 
 
 def test_bootstrap_stability_hdbscan_noise_agreement_is_a_fraction() -> None:
@@ -766,7 +829,7 @@ def test_bootstrap_stability_spherical_runs() -> None:
     X, _ = _angular_clusters(seed=7, per=20)
     out = bootstrap_stability(X, "spherical", cfg)
     assert_that(set(out)).is_equal_to(
-        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot"}
+        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot", "space"}
     )
     assert_that(out["n_boot"]).is_equal_to(5)
 
@@ -1028,7 +1091,7 @@ def test_bootstrap_stability_leiden_keys() -> None:
     X, _ = _three_blobs(seed=46, per=20)
     out = bootstrap_stability(X, "leiden", cfg)
     assert_that(set(out)).is_equal_to(
-        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot"}
+        {"mean_ari", "std_ari", "mean_ami", "mean_noise_agreement", "n_boot", "space"}
     )
     assert_that(out["n_boot"]).is_equal_to(6)
     assert_that(out["mean_ari"]).is_greater_than(

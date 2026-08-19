@@ -24,6 +24,7 @@ from moodengine._typing import (
     ClusteringResult,
     ClusterMethod,
     ClusterMetrics,
+    ClusterSpace,
     CoverageEntropyResult,
     HDBSCANDetail,
     Reducer2D,
@@ -1062,18 +1063,21 @@ def bootstrap_stability(
 ) -> StabilityMetrics:
     """Clustering stability via subsample-and-recluster bootstrap, in the deployed space.
 
-    Reduces ``X`` ONCE to ``config.umap_n_components_cluster`` dims — the exact space
-    :func:`run_clustering` clusters in — then repeatedly subsamples ``subsample`` of the
-    reduced rows (seeded by ``config.seed + i``) and runs the SAME ``method`` clustering
-    (``'kmeans'``, ``'hdbscan'``, ``'spherical'`` or ``'leiden'``) on each subsample.
-    Two things make the number trustworthy where a raw-space bootstrap would mislead:
+    Reduces ``X`` ONCE to ``config.umap_n_components_cluster`` dims — the space
+    :func:`run_clustering` clusters in on the default path — then repeatedly subsamples
+    ``subsample`` of the reduced rows (seeded by ``config.seed + i``) and runs the SAME
+    ``method`` clustering (``'kmeans'``, ``'hdbscan'``, ``'spherical'`` or ``'leiden'``) on each
+    subsample. Two things make the number trustworthy where a raw-space bootstrap would mislead:
 
-    * **Same space as production.** Clustering the reduced embedding (not the raw
+    * **Same space as production, on every path.** Clustering the reduced embedding (not the raw
       high-dim matrix) measures the stability of the partition the pipeline actually
       ships. Fitting UMAP once and subsampling its rows — rather than re-running UMAP per
       bootstrap — keeps the cost bounded and isolates clustering variance from UMAP's own
-      run-to-run noise. Tiny inputs (``n < max(config.umap_n_neighbors, 4)``) skip UMAP
-      and cluster the raw rows, exactly as :func:`run_clustering` does.
+      run-to-run noise. The two paths on which :func:`run_clustering` clusters the raw
+      embeddings instead are both mirrored here: a tiny input
+      (``n < max(config.umap_n_neighbors, 4)``) and ``config.cluster_space == "original"``.
+      ``metrics['space']`` names the space that was used, so a stability score is never read
+      against the wrong partition.
     * **Noise excluded from the shape scores.** Agreement (adjusted Rand / adjusted
       mutual information) is computed only over points that are non-noise (label ``!= -1``)
       in BOTH runs, so two HDBSCAN runs that merely agree on which points are noise do not
@@ -1092,8 +1096,12 @@ def bootstrap_stability(
     how much of the partition the projection invented. Costs one UMAP fit per replicate (seconds
     each, single-threaded because the seed is set), so pair it with a small ``n_boot``.
 
+    Under ``cluster_space="original"`` there is no reduction in the clustering path at all, so
+    ``refit_reduction`` has nothing to re-fit and is logged as inert rather than quietly returning
+    the frozen number (a zero gap would otherwise read as "the structure is real").
+
     ``n_boot`` defaults to ``config.bootstrap_n``. Returns ``{'mean_ari', 'std_ari',
-    'mean_ami', 'mean_noise_agreement', 'n_boot'}``; degenerate inputs yield zeros.
+    'mean_ami', 'mean_noise_agreement', 'n_boot', 'space'}``; degenerate inputs yield zeros.
     Deterministic given ``config.seed``.
     """
     from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
@@ -1102,24 +1110,41 @@ def bootstrap_stability(
     n = X.shape[0]
     if n_boot is None:
         n_boot = int(getattr(config, "bootstrap_n", 50))
+
+    # Mirror BOTH paths on which run_clustering clusters the raw embeddings: a tiny input (UMAP
+    # skipped) and `cluster_space="original"`. Reducing here when the pipeline does not would
+    # score a partition that never ships — the one thing a stability number must not do.
+    tiny = n < max(config.umap_n_neighbors, 4)
+    clusters_original = tiny or getattr(config, "cluster_space", "reduced") == "original"
+    space_name: ClusterSpace = "original" if clusters_original else "reduced"
+
     zeros: StabilityMetrics = {
         "mean_ari": 0.0,
         "std_ari": 0.0,
         "mean_ami": 0.0,
         "mean_noise_agreement": 0.0,
         "n_boot": int(n_boot),
+        "space": space_name,
     }
     _ensure_cluster_method(method)
     if n < 4 or n_boot < 2:
         return zeros
 
-    # Cluster the same reduced space run_clustering deploys; skip UMAP on tiny inputs. Under
-    # `refit_reduction` there is no shared layout at all — each replicate builds its own.
-    tiny = n < max(config.umap_n_neighbors, 4)
-    reduce_per_replicate = refit_reduction and not tiny
+    # Under `refit_reduction` there is no shared layout at all: each replicate builds its own.
+    reduce_per_replicate = refit_reduction and not clusters_original
+    if refit_reduction and not reduce_per_replicate:
+        # Silently falling back to the frozen mode would be worse than ignoring the flag: the
+        # documented reading is the GAP between the two modes, and a gap of zero against a frozen
+        # run reads as "the structure is real" precisely when nothing was re-fit.
+        reason = f"n={n} is below the UMAP floor" if tiny else "config.cluster_space='original'"
+        logger.info(
+            "refit_reduction=True is inert here: clustering runs on the original embeddings "
+            "(%s), so there is no reduction to re-fit and both modes return the same number.",
+            reason,
+        )
     space = (
         X
-        if (tiny or reduce_per_replicate)
+        if (clusters_original or reduce_per_replicate)
         else reduce_umap(X, config.umap_n_components_cluster, config)[0]
     )
 
@@ -1179,4 +1204,5 @@ def bootstrap_stability(
         "mean_ami": float(np.mean(amis)),
         "mean_noise_agreement": mean_noise,
         "n_boot": int(n_boot),
+        "space": space_name,
     }

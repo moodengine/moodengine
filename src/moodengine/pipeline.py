@@ -793,6 +793,13 @@ def write_cluster_report(
     noise cluster ``-1`` rendered last and labelled "noise"): size, dominant
     ``cluster_mood``, the ranked ``profiles[cid]``, the mean energy & valence over
     the cluster's rows (when those columns exist) and up to six example filenames.
+
+    When ``metrics`` carries the honesty fields :func:`cluster.run_clustering` stamps on every
+    result — ``silhouette_space``, ``silhouette_original``, ``structure`` — the silhouette is
+    labelled with the space it was scored in, the original-space score is reported next to it,
+    and a ``none_detected`` verdict opens the report with a blockquote saying so. They are read
+    with ``.get``, so a caller passing bare ``cluster_metrics`` output still gets a valid report.
+
     Defaults to ``config.output_dir/'cluster_report.md'``. Pure string building
     plus one file write; tolerant of missing optional columns / profiles.
     """
@@ -813,9 +820,35 @@ def write_cluster_report(
     noise_ratio = metrics.get("noise_ratio")
     if noise_ratio is not None:
         lines.append(f"- **Noise ratio:** {float(noise_ratio):.2%}")
+    # The headline silhouette is scored in whichever space the clustering ran in — the UMAP layout
+    # on the default path, a space fit to separate these very points. Reported alone it lets a
+    # persisted report certify "19 clusters, silhouette 0.28" for a library `run_clustering` has
+    # already judged structureless, and the file outlives the log line that said so. So the
+    # original-space score and its verdict ship beside it whenever the caller supplied them.
     sil = metrics.get("silhouette")
-    lines.append(f"- **Silhouette:** {f'{float(sil):.3f}' if sil is not None else 'n/a'}")
+    space = metrics.get("silhouette_space")
+    lines.append(
+        f"- **Silhouette:** {f'{float(sil):.3f}' if sil is not None else 'n/a'}"
+        + (f" ({space} space)" if space else "")
+    )
+    if "silhouette_original" in metrics:
+        sil_original = metrics.get("silhouette_original")
+        lines.append(
+            "- **Silhouette (original space):** "
+            + (f"{float(sil_original):.3f}" if sil_original is not None else "n/a")
+        )
+    structure = metrics.get("structure")
+    if structure is not None:
+        lines.append(f"- **Structure:** {structure}")
     lines.append("")
+    if structure == "none_detected":
+        lines.append(
+            "> **No substantial structure.** The original-space silhouette does not support the "
+            "clusters below: they are largely an artifact of the dimensionality reduction, and "
+            "the silhouette above is not evidence to the contrary. Read the sections as a "
+            "partition of a continuum, not as discovered groups."
+        )
+        lines.append("")
 
     if not has_df:
         lines.append("_No tracks to report._")
@@ -877,9 +910,11 @@ def compare_spaces(
     each with ``method`` (applying KMeans auto-k per space when requested), and
     returns ``{space: metrics}`` where ``space`` is one of ``"mert"``, ``"clap"``,
     ``"fused"``. Each value is the ``metrics`` dict from
-    :func:`cluster.run_clustering` augmented with ``"silhouette_original"`` (cosine
-    silhouette on the ORIGINAL pre-UMAP matrix) and ``"stability_ari"`` (mean
-    adjusted Rand index from :func:`cluster.bootstrap_stability`). A space whose
+    :func:`cluster.run_clustering` — which already carries ``"silhouette_original"`` (cosine
+    silhouette on the ORIGINAL pre-UMAP matrix) and its ``"structure"`` verdict — augmented with
+    ``"stability_ari"`` (mean adjusted Rand index from :func:`cluster.bootstrap_stability`).
+    Compare the spaces on ``silhouette_original``: the headline ``silhouette`` is scored inside
+    each space's own UMAP layout, so it is not comparable across them. A space whose
     embeddings are empty is skipped and logged. Print-friendly; writes no files.
     """
     out: dict[str, dict] = {}
@@ -896,10 +931,11 @@ def compare_spaces(
             best_k, _ = _cluster.select_kmeans_k(X, cfg)
             cfg = replace(cfg, kmeans_n_clusters=best_k)
         result = _cluster.run_clustering(X, method, cfg)
+        # `silhouette_original` and `structure` are already stamped on every run_clustering
+        # result, sampled at a fixed cap and seeded from the config. Recomputing the score here
+        # (uncapped, unseeded) used to overwrite it while leaving `structure` derived from the
+        # OLD value — pairing a verdict with a number it did not come from above the cap.
         metrics = dict(result["metrics"])
-        metrics["silhouette_original"] = _cluster.silhouette_original(
-            X, np.asarray(result["labels"], dtype=int), metric="cosine"
-        )
         stability = _cluster.bootstrap_stability(X, method, cfg)
         metrics["stability_ari"] = stability["mean_ari"]
         out[name] = metrics
