@@ -204,9 +204,11 @@ def fit_linear_probe(
     said so. Every column is class-balanced, which is what stops a mood held by a handful of tracks
     from getting an intercept no input can overcome.
 
-    ``linear`` is fit with ``sklearn.linear_model.LogisticRegression`` /
-    ``LogisticRegressionCV`` (OvR, per mood; cross-platform wheels, deterministic — the ``lbfgs``
-    solver needs no ``random_state``, and the fold shuffle is seeded) — no torch. A degenerate
+    ``linear`` is fit with ``sklearn.linear_model.LogisticRegression``, swept over ``C`` by
+    ``GridSearchCV`` + ``StratifiedKFold`` when ``C is None`` (OvR, per mood; cross-platform
+    wheels, deterministic — the ``lbfgs`` solver needs no ``random_state``, and the fold shuffle
+    is seeded) — no torch. Not ``LogisticRegressionCV``: only ``GridSearchCV.best_score_`` gives
+    ``cv_score`` a stable, documented meaning; see the note at the fit site. A degenerate
     column (a mood present in every / no training row) gets a constant saturated bias
     (``±_LOGIT_CLAMP``) instead of a fit; a column with fewer than 2 positives (or 2 negatives)
     cannot be split, so it is fit unswept at ``C=1.0``, logged, and left with ``cv_score = nan``.

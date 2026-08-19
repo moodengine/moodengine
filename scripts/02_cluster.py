@@ -30,7 +30,9 @@ def main(
     input_dir: pathlib.Path | None = typer.Option(
         None, "--input-dir", help="Directory of audio files (defaults to config.raw_dir)."
     ),
-    embedder: str = typer.Option("mert", "--embedder", help="Embedder to use: 'mert' or 'clap'."),
+    embedder: str = typer.Option(
+        "mert", "--embedder", help="Embedder to use: 'mert', 'clap' or 'mulan'."
+    ),
     method: str = typer.Option(
         "hdbscan", "--method", help="Clustering method: 'hdbscan' or 'kmeans'."
     ),

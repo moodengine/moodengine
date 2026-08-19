@@ -10,8 +10,8 @@ This module is the ONE place the deep-learning stack is allowed. The rules here 
 
 **Keep `base.py` torch-free.** It holds the `Embedder` ABC and the on-disk cache, and is
 imported by the lightweight pipeline and the test suite — so it imports only numpy + stdlib.
-torch / transformers / laion_clap are imported eagerly at the top of the *concrete* modules
-(`mert.py`, `clap.py`) only; that is the sanctioned exception to the torch-free rule. The
+torch / transformers / laion_clap / muq are imported eagerly at the top of the *concrete*
+modules (`mert.py`, `clap.py`, `mulan.py`) only; that is the sanctioned exception to the torch-free rule. The
 package root never imports the concrete embedders — they are constructed lazily via
 `get_embedder` (in `pipeline.py`), so `import moodengine` stays light.
 
@@ -39,11 +39,12 @@ the hub, so it loads at a reviewed, pinned revision — arbitrary hub Python is 
 exactly what was reviewed. Bump the pin deliberately, after reviewing the upstream diff;
 expose an override (`config.mert_revision`) but default to the reviewed snapshot.
 
-**Weights carry their own license,** separate from this package's code license (MERT-v1-95M
-is CC-BY-NC-4.0 / non-commercial). State that wherever a default model is chosen; never
-imply the code license covers the weights.
+**Weights carry their own license,** separate from this package's code license, and separate
+again from the wrapping package's (MERT-v1-95M and MuQ-MuLan are CC-BY-NC-4.0 /
+non-commercial, while the `muq` code itself is MIT). State that wherever a default model is
+chosen; never imply the code license covers the weights.
 
-**No unit tests here by contract.** `clap.py` and `mert.py` are pure torch wrappers covered
-only by the opt-in `-m model` suite, and are `omit`-ted from coverage. Don't add mocked unit
+**No unit tests here by contract.** `clap.py`, `mert.py` and `mulan.py` are pure torch wrappers
+covered only by the opt-in `-m model` suite, and are `omit`-ted from coverage. Don't add mocked unit
 tests for them (see `testing.md`) — pin real behavior in the model suite instead. The cache
 helpers and the ABC in `base.py` ARE torch-free and unit-tested normally.

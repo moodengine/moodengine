@@ -15,7 +15,8 @@ conventions in .claude/rules/ (path-scoped) and procedures in .claude/skills/.
 ## What this is
 
 A **pure, stateless** music-mood library (music information retrieval). The pipeline:
-audio → embeddings (MERT / CLAP, optional `[models]` extra) → pooling → clustering →
+audio → embeddings (MERT / CLAP / MuQ-MuLan, optional `[models]` + `[muq]` extras) →
+pooling → clustering →
 zero-shot mood labeling → search / evaluation / calibration / visualization. It is a
 library for external adopters — every public choice must make sense to a stranger who
 has only this repo, no other context.
@@ -54,7 +55,8 @@ one computes *and* formats *and* writes, split it.
 Everything runs through `uv`; a plain `uv sync` is the torch-free "light" install.
 
 - `uv sync` — light install + dev tooling (PEP 735 `dev` group).
-  `uv sync --extra models` adds torch (~GBs; only needed to embed real audio).
+  `uv sync --extra models` adds torch (~GBs; only needed to embed real audio), and
+  `--extra muq` on top of it adds the MuQ-MuLan backbone.
 - `uv run pytest` — the default suite; torch-free by contract. `-m model` runs the
   real-model tests (needs `--extra models`); `-m benchmark` runs hot-path benchmarks.
   Both markers are deselected by default.
@@ -84,9 +86,12 @@ Everything runs through `uv`; a plain `uv sync` is the torch-free "light" instal
 - **Optional backends.** The compute extras (`[ot]`, `[cluster-graph]`, `[pacmap]`,
   `[explain]`) import lazily at use-site and raise `MissingDependencyError` naming the exact
   `pip install "moodengine[...]"` when absent; their tests self-skip via
-  `pytest.importorskip`, so the light suite stays green. The `[models]` backbones differ —
-  torch is imported at the top of the embedder modules, so without it `get_embedder`
-  surfaces a plain `ModuleNotFoundError`, not the friendly error.
+  `pytest.importorskip`, so the light suite stays green. The `[models]` / `[muq]` backbones
+  reach the same outcome by a different route: torch IS imported at the top of each embedder
+  module, so `get_embedder` catches the `ModuleNotFoundError` per branch and re-raises
+  `MissingDependencyError` naming the extra (`models` for MERT/CLAP, `models,muq` for
+  MuQ-MuLan — the weights are a torch model, so `[muq]` alone cannot satisfy it). Importing
+  `moodengine.embeddings.clap` directly still surfaces the bare `ModuleNotFoundError`.
 - **Public API surface is a contract.** A new export goes in both the
   `src/moodengine/__init__.py` imports *and* `__all__`; keep them in sync (a test checks it).
 - **No volatile stats** in `CLAUDE.md` or `README.md` (test/file counts, timings,
