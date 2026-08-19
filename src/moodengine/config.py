@@ -248,8 +248,8 @@ class Config:
         # NOTE: the CLAP fusion-truncation limit on `segment_seconds * clap_sample_rate` is NOT
         # checked here. It is a property of laion-clap, not of the configuration, and a MERT-only
         # run at 15 s segments is perfectly valid — raising here would block it for a reason that
-        # never applies to it. `CLAPEmbedder.__init__` enforces it instead, before any audio is
-        # embedded. See `_CLAP_FUSION_SAMPLE_LIMIT`.
+        # never applies to it. `ensure_clap_fusion_supported` enforces it instead, from every
+        # entry point that actually builds a CLAP embedder. See `CLAP_FUSION_SAMPLE_LIMIT`.
 
         if len(self.fusion_weights) != 2:
             raise ValueError(
