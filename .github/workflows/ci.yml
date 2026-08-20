@@ -128,7 +128,72 @@ jobs:
       # fail_under lives in pyproject ([tool.coverage.report]); --cov with no path
       # uses [tool.coverage.run] source/omit.
       - name: Tests with coverage floor
-        run: uv run pytest --cov --cov-report=term-missing
+        run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+
+      # Handed to the `sonarqube` job below, which needs a coverage report and has
+      # no reason to pay for a second run of the same suite to get one.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  # SonarQube Cloud. Automatic Analysis is switched OFF for this project: the two
+  # modes are mutually exclusive and only a scanner run can import coverage, which
+  # left the hosted analysis reporting no coverage at all. Analysis settings live
+  # in `sonar-project.properties` at the repo root, not in the web UI.
+  sonarqube:
+    name: SonarQube Cloud
+    needs: [coverage]
+    # SONAR_TOKEN is not exposed to pull requests from forks, so analysis is
+    # skipped there instead of failing on a missing secret. `CI success` tolerates
+    # a skipped job, and the push-to-main analysis covers the code once merged.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history, not the default shallow clone: Sonar attributes every
+          # issue to a commit via git blame, and the new-code period is "previous
+          # version", which it resolves from the release tags.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download coverage report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-xml
+
+      # The new-code period is "previous version", so an analysis that reports no
+      # version has no baseline to diff against and the gate silently grades
+      # nothing. `__version__` is the single source of truth (release-please bumps
+      # it in place), read here rather than installed to keep the job import-free.
+      - name: Resolve project version
+        id: version
+        shell: bash
+        run: |
+          v="$(sed -nE 's/^__version__ *= *"([^"]+)".*/\1/p' src/moodengine/__init__.py)"
+          if [ -z "$v" ]; then
+            echo "::error::could not read __version__ from src/moodengine/__init__.py"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Analyze
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          # qualitygate.wait blocks on a red gate rather than reporting green and
+          # leaving the verdict to be discovered in the web UI — without it this job
+          # passes over a failing gate, which makes it a report, not a gate.
+          args: >-
+            -Dsonar.projectVersion=${{ steps.version.outputs.version }}
+            -Dsonar.qualitygate.wait=true
 
   # Keeps the declared lower bounds honest: resolve every direct dependency to
   # its minimum version and run the suite against that.
@@ -290,7 +355,7 @@ jobs:
   ci-success:
     name: CI success
     if: always()
-    needs: [test, static, coverage, test-lowest, test-extras, commits, dco]
+    needs: [test, static, coverage, sonarqube, test-lowest, test-extras, commits, dco]
     runs-on: ubuntu-latest
     steps:
       # Fail closed. The previous form guarded the failing step with
@@ -301,8 +366,8 @@ jobs:
       # protection requires went green over a red run. Asserting the accepted results
       # instead means an unrecognised or missing result fails the gate rather than
       # slipping through it. `skipped` is accepted on purpose: the PR-only gates
-      # (commits, dco) legitimately skip on push-to-main, and test-models is not in
-      # `needs` at all. Dumping the whole context makes the next anomaly diagnosable
+      # (commits, dco) legitimately skip on push-to-main, sonarqube skips on fork
+      # PRs, and test-models is not in `needs` at all. Dumping the whole context makes the next anomaly diagnosable
       # from the log instead of by re-deriving it from check-run timestamps.
       - name: Verify every required job succeeded
         shell: bash
