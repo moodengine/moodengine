@@ -366,7 +366,7 @@ def test_retrieval_perfect_ranking_beats_the_random_floor() -> None:
     assert_that(scores["macro_precision_at_k"]).is_equal_to(1.0)  # vs a 0.25 random floor
 
 
-def test_retrieval_bootstrap_takes_the_number_of_draws_it_advertises() -> None:
+def test_retrieval_bootstrap_takes_the_number_of_draws_it_advertises(monkeypatch) -> None:
     """The CI was computed from `resamples // 20` draws while the constant and the parameter both
     said 2000, so every published interval came from a twentieth of the stated resampling."""
     bench = _load_retrieval_bench()
@@ -380,10 +380,22 @@ def test_retrieval_bootstrap_takes_the_number_of_draws_it_advertises() -> None:
             draws.append(len(prompts))
             return np.zeros((len(prompts), 2), dtype=np.float32)
 
+    # Count the DRAWS, not the embed calls. Counting embeds only observes the memoizer: it
+    # returns 4 whatever the loop bound is, which is why reverting `int(resamples)` back to
+    # `resamples // 20` used to leave this test green.
+    real_scorer = bench.evaluate_text_queries
+    scored: list[int] = []
+
+    def _counting_scorer(*args, **kwargs):
+        scored.append(1)
+        return real_scorer(*args, **kwargs)
+
+    monkeypatch.setattr(bench, "evaluate_text_queries", _counting_scorer)
+
     bench._bootstrap_macro_ci(X, _CountingOracle(), sel, 0.25, 10, seed=0, resamples=37)
 
-    # 37 draws actually taken; the memoized wrapper embeds each distinct query exactly once.
-    assert_that(len(draws)).is_equal_to(4)
+    assert_that(len(scored)).is_equal_to(37)  # the loop bound, taken at face value
+    assert_that(len(draws)).is_equal_to(4)  # and each distinct query embedded exactly once
 
 
 def test_retrieval_memoized_embedder_returns_what_the_real_one_would() -> None:

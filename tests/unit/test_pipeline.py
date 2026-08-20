@@ -195,15 +195,34 @@ def test_extract_embeddings_reraises_a_missing_dependency_instead_of_skipping_ev
 
 
 def test_cache_extra_encodes_the_decode_rate_for_an_embedder_with_no_legacy_cache() -> None:
-    """MuQ-MuLan has no pre-1.0 cache, so its rate must always reach the key. Defaulting the
-    "legacy" rate to the CURRENT one made that comparison a tautology, and a config sitting on the
-    legacy defaults everywhere else produced a key that did not encode the rate at all."""
+    """An embedder absent from `_LEGACY_SAMPLE_RATE` must still get its decode rate into the key.
+
+    This is the case the `-1` sentinel exists for, and the only one that isolates it. Defaulting
+    the "legacy" rate to the embedder's CURRENT rate made the comparison a tautology: the field
+    could never differ from its own legacy, so a config sitting on the legacy defaults everywhere
+    else produced a key that did not encode the rate at all — and two runs at different decode
+    rates would then share one cache entry.
+
+    Deliberately NOT parametrized on 'mulan': `_embedding_cache_extra` folds `mulan_revision`
+    into that branch, which forces the hash to differ on its own and would mask the sentinel.
+    """
+    config = dataclasses.replace(default_config(), segment_selection="head")
+
+    at_24k = pipeline._embedding_cache_extra(_FakeEmbedder("future_backbone", 24_000), config)
+    at_16k = pipeline._embedding_cache_extra(_FakeEmbedder("future_backbone", 16_000), config)
+
+    assert_that(at_24k).contains("_cfg-")
+    assert_that(at_24k).is_not_equal_to(at_16k)
+
+
+def test_cache_extra_still_encodes_the_mulan_rate_through_its_own_branch() -> None:
+    """MuQ-MuLan reaches the same outcome by a second route — its revision field — so pin that
+    too rather than assuming the sentinel is what does the work there."""
     config = dataclasses.replace(default_config(), segment_selection="head")
 
     at_24k = pipeline._embedding_cache_extra(_FakeEmbedder("mulan", 24_000), config)
     at_16k = pipeline._embedding_cache_extra(_FakeEmbedder("mulan", 16_000), config)
 
-    assert_that(at_24k).contains("_cfg-")
     assert_that(at_24k).is_not_equal_to(at_16k)
 
 

@@ -284,20 +284,49 @@ def test_smooth_order_pinned_start_is_optimal_among_paths_opening_there() -> Non
     assert_that(_path_cost(X, order)).is_close_to(_path_cost(X, brute), tolerance=1e-9)
 
 
-def test_smooth_order_free_start_costs_one_dp_pass_not_n(monkeypatch) -> None:
-    """Every allowed origin is seeded into ONE subset DP. Re-running the whole DP per origin
-    multiplied the documented `O(2^n * n^2)` by n on the DEFAULT free-start path."""
-    rng = np.random.default_rng(7)
-    X = rng.standard_normal((9, 5)).astype(np.float32)
-    calls: list[int] = []
-    real = journey._held_karp_path
-    monkeypatch.setattr(
-        journey, "_held_karp_path", lambda c, st: (calls.append(len(st)), real(c, st))[1]
-    )
+class _CountingCost(np.ndarray):
+    """A cost matrix that tallies its own reads, so DP work is observable without a clock.
 
-    smooth_order(X)
+    Counting `cost` lookups is what distinguishes ONE subset DP seeded with every origin from
+    one DP re-run per origin. A wall-clock assertion would measure the same thing far less
+    reliably, and counting calls to `_held_karp_path` measures only the caller — the per-origin
+    loop lived INSIDE it.
+    """
 
-    assert_that(calls).is_equal_to([9])  # nine origins, one call
+    reads = 0
+
+    def __getitem__(self, key):
+        type(self).reads += 1
+        return super().__getitem__(key)
+
+
+def _dp_reads(cost: np.ndarray, starts: list[int]) -> int:
+    counting = cost.copy().view(_CountingCost)
+    _CountingCost.reads = 0
+    journey._held_karp_path(counting, starts)
+    return _CountingCost.reads
+
+
+def test_held_karp_seeds_every_origin_into_one_dp_pass() -> None:
+    """Free start must cost ONE pass, not one per origin.
+
+    Re-running the whole DP per origin multiplied the documented `O(2^n * n^2)` by n on the
+    DEFAULT free-start path. Measured on this input: the shipped single pass reads the cost
+    matrix 2.65x more for a free start than for a pinned one, while the per-origin shape read
+    it 8.00x more — exactly n. The threshold sits between the two, so reverting the seeding
+    fails this test.
+    """
+    n = 8
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((n, 5)).astype(np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    cost = (1.0 - X @ X.T).astype(np.float64)
+    np.fill_diagonal(cost, 0.0)
+
+    free = _dp_reads(cost, list(range(n)))
+    pinned = _dp_reads(cost, [0])
+
+    assert_that(free).is_less_than(4 * pinned)  # one pass ~2.65x; per-origin would be ~n = 8x
 
 
 def test_smooth_order_rejects_a_start_outside_the_row_range() -> None:
