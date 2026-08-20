@@ -69,9 +69,58 @@ def mahalanobis_scores(
 
 # Rows per cosine slab in knn_distance_scores: the peak allocation is one
 # (block, m) float32 slab ≈ 40 MB at m = 10k — a full (n, m) block would OOM around
-# 10-15k tracks on a 16 GB machine. The top-k select runs IN PLACE on that slab, so it
-# stays one slab; the copying `np.partition` used to double this line's footprint.
+# 10-15k tracks on a 16 GB machine. On the wide path the select no longer runs in place on
+# that slab: the chunk-max prefilter below adds a (block, kk·chunk) float32 gather and its
+# intp index array on top of it — ~3.9 MB against a 40 MB slab at block=1024, kk=10,
+# chunk=32, m=10k, so the slab still sets the peak. The narrow path keeps the in-place
+# partition and stays exactly one slab.
 _KNN_BLOCK_ROWS = 1024
+
+#: Column width of one prefilter chunk. Picking the top-kk CHUNKS by their maximum reduces the
+#: top-kk select from m columns to kk·32, which is where the win comes from at library scale.
+#: Measured across widths on n=10000/d=512/k=10: 32 -> 2.67x, 64 -> 2.11x, 128 -> 1.42x,
+#: 256 -> 1.01x. Narrower than 32 spends more on the chunk-max reduction than it saves.
+_KNN_PREFILTER_CHUNK = 32
+
+
+def _top_k_per_row(sims: np.ndarray, kk: int) -> np.ndarray:
+    """The ``kk`` largest values of each row of ``sims``, as an unordered ``(rows, kk)`` block.
+
+    Selecting over all ``m`` columns costs O(m) per row. Chunking first costs far less and is
+    exact, by disjointness: split the columns into fixed-width chunks, take each chunk's maximum,
+    and keep the ``kk`` chunks with the largest maxima. Those ``kk`` maxima are ``kk`` DISTINCT
+    elements (the chunks share no column), and every element in a dropped chunk is ``<=`` its own
+    chunk maximum ``<=`` the smallest kept one. So no dropped element can outrank all ``kk`` of
+    them: at best it ties, and swapping a tie leaves the selected MULTISET — and therefore the
+    mean this feeds — unchanged. Disjointness is what carries the argument, which is why the
+    ragged tail is appended to the candidates unconditionally instead of being covered by a
+    clamped final chunk: an overlapping chunk could make two chunk maxima the same physical
+    element, and the count of distinct dominators would no longer be ``kk``.
+
+    Falls back to the in-place full-width partition when chunking would not narrow the search --
+    few chunks relative to ``kk``, or a candidate set no smaller than half the row. ``sims`` is a
+    fresh slab nobody else holds, so that path partitions it in place rather than allocating a
+    second ``(rows, m)`` array.
+    """
+    m = sims.shape[1]
+    n_chunks = m // _KNN_PREFILTER_CHUNK
+    body_width = n_chunks * _KNN_PREFILTER_CHUNK
+    candidate_width = kk * _KNN_PREFILTER_CHUNK + (m - body_width)
+    if n_chunks <= kk or candidate_width * 2 >= m:
+        sims.partition(m - kk, axis=1)
+        return sims[:, -kk:]
+
+    rows = sims.shape[0]
+    # A column slice of a C-contiguous slab reshapes to (rows, n_chunks, chunk) as a strided
+    # VIEW, so the chunk maxima cost one reduction and no copy of the slab.
+    chunk_max = sims[:, :body_width].reshape(rows, n_chunks, _KNN_PREFILTER_CHUNK).max(axis=2)
+    keep = np.argpartition(chunk_max, n_chunks - kk, axis=1)[:, -kk:]  # (rows, kk) chunk ids
+    cols = keep[:, :, None] * _KNN_PREFILTER_CHUNK + np.arange(_KNN_PREFILTER_CHUNK)
+    candidates = np.take_along_axis(sims, cols.reshape(rows, -1), axis=1)
+    if body_width < m:
+        candidates = np.concatenate([candidates, sims[:, body_width:]], axis=1)
+    candidates.partition(candidates.shape[1] - kk, axis=1)
+    return candidates[:, -kk:]
 
 
 def knn_distance_scores(X: np.ndarray, *, k: int = 10, ref: np.ndarray | None = None) -> np.ndarray:
@@ -82,7 +131,9 @@ def knn_distance_scores(X: np.ndarray, *, k: int = 10, ref: np.ndarray | None = 
     ``X``; when it does, each row excludes ITSELF from its neighbour set (its own cosine 1.0 would
     otherwise dominate). The cosine block is computed in row slabs (rows re-normalized defensively):
     compute is O(n·m·d) either way, but peak memory is O(block·m), not O(n·m), so large libraries
-    never materialize an (n, m) matrix.
+    never materialize an (n, m) matrix. Above a width threshold the per-row top-k select runs on a
+    chunk-max prefiltered candidate set rather than the full row, which adds an O(block·k·32)
+    gather on top of that slab — a few MB against tens — and returns the same k values.
 
     ``k`` is clamped to ``[1, n_neighbours]`` where ``n_neighbours`` excludes self. Returns ``(n,)``
     float32 in ``[0, 2]`` (cosine distance range), deterministic. Guards: empty ``X``/``ref`` or no
@@ -114,11 +165,7 @@ def knn_distance_scores(X: np.ndarray, *, k: int = 10, ref: np.ndarray | None = 
         if is_self:
             rows = np.arange(start, stop)
             sims[rows - start, rows] = -np.inf  # a row is never its own neighbour
-        # Top-kk cosines per row: partial select IN PLACE, then view the kk largest. `sims` is a
-        # fresh slab nobody else holds, so partitioning it in place is safe and avoids allocating a
-        # second (block, m) array — which is what made this line, not the matmul, the peak.
-        sims.partition(sims.shape[1] - kk, axis=1)
-        part = sims[:, -kk:]
+        part = _top_k_per_row(sims, kk)
         # Clamp the mean cosine to [-1, 1] before converting to a distance: a duplicate / re-encode
         # makes two rows bit-identical, and float32 ``X @ X.T`` then yields a self-cosine slightly
         # ABOVE 1.0, which would make ``1 - cos`` a (physically impossible) tiny NEGATIVE distance.

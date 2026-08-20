@@ -169,3 +169,72 @@ def test_knn_distance_scores_does_not_mutate_its_input() -> None:
     knn_distance_scores(X, k=4)
 
     np.testing.assert_array_equal(X, before)
+
+
+# --------------------------------------------------------------------------- #
+# chunk-max prefilter (the wide-row top-k select)
+# --------------------------------------------------------------------------- #
+#: A chunk this wide makes `n_chunks <= kk` for every row width used below, which is the
+#: guard's first fallback condition — so patching it in forces the full-width partition and
+#: gives the tests a reference path that is the code as it shipped before the prefilter.
+_FORCE_FULL_WIDTH = 1 << 20
+
+
+@pytest.mark.parametrize("n", [997, 1500, 2048, 5000], ids=lambda n: f"n{n}")
+@pytest.mark.parametrize("k", [3, 10, 25], ids=lambda k: f"k{k}")
+def test_knn_prefilter_equals_the_full_width_select(monkeypatch, n, k):
+    """Prefiltered scores must match the full-width partition at float32-ULP tolerance.
+
+    Widths are chosen to cover the shapes the chunking can get wrong: 997 and 1500 are ragged
+    (not multiples of the 32-wide chunk, so the tail is appended rather than chunked), 2048 is
+    an exact multiple, and 1500/2048/5000 span more than one row slab."""
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((n, 8)).astype(np.float32)
+
+    prefiltered = knn_distance_scores(X, k=k)
+    monkeypatch.setattr(novelty, "_KNN_PREFILTER_CHUNK", _FORCE_FULL_WIDTH)
+    full_width = knn_distance_scores(X, k=k)
+
+    np.testing.assert_allclose(prefiltered, full_width, rtol=0.0, atol=2e-6)
+
+
+def test_knn_prefilter_selects_the_same_values_under_heavy_ties():
+    """Ties are what the disjoint-chunk argument has to survive, so pin them exactly.
+
+    Sign vectors give enormous numbers of EXACTLY equal cosines, so which physical element a
+    selection returns is ambiguous — but the multiset of VALUES is not, and that is what the
+    mean consumes. Bitwise equality, not a tolerance: a wrong chunk count would change the
+    values themselves, not merely their order."""
+    rng = np.random.default_rng(17)
+    X = (rng.integers(0, 2, (600, 24)).astype(np.float32) * 2 - 1) / np.sqrt(24)
+    sims = (X @ X.T).astype(np.float32)
+    reference = sims.copy()
+    reference.partition(reference.shape[1] - 10, axis=1)
+
+    selected = novelty._top_k_per_row(sims.copy(), 10)
+
+    assert_that(
+        np.array_equal(np.sort(selected, axis=1), np.sort(reference[:, -10:], axis=1))
+    ).is_true()
+
+
+def test_knn_prefilter_guard_falls_back_when_chunking_would_not_narrow_the_row():
+    """The guard has to actually switch paths, so assert the switch, not just the answer.
+
+    The two paths differ observably: the fallback partitions the slab IN PLACE (that is the
+    allocation it saves), while the prefilter gathers candidates and leaves the slab intact.
+    A narrow row must take the first, a wide row the second, and both must agree."""
+    rng = np.random.default_rng(23)
+    narrow = rng.standard_normal((4, 120)).astype(np.float32)  # 3 chunks, k=10 -> no narrowing
+    wide = rng.standard_normal((4, 4000)).astype(np.float32)  # 125 chunks -> prefilter
+
+    narrow_in, wide_in = narrow.copy(), wide.copy()
+    narrow_out = novelty._top_k_per_row(narrow_in, 10)
+    wide_out = novelty._top_k_per_row(wide_in, 10)
+
+    assert_that(np.array_equal(narrow_in, narrow)).is_false()  # partitioned in place
+    assert_that(np.array_equal(wide_in, wide)).is_true()  # left intact
+    for got, src in ((narrow_out, narrow), (wide_out, wide)):
+        want = src.copy()
+        want.partition(want.shape[1] - 10, axis=1)
+        assert_that(np.array_equal(np.sort(got, axis=1), np.sort(want[:, -10:], axis=1))).is_true()
