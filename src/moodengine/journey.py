@@ -281,9 +281,13 @@ def _held_karp_path(cost: np.ndarray, starts: list[int]) -> list[int]:
     """Exact minimum-cost open Hamiltonian path by subset DP, over the allowed start nodes.
 
     ONE pass however many origins are allowed: each is seeded as its own singleton state, so the
-    DP explores all of them at once and the stated ``O(2^n · n²)`` holds. Re-running the whole DP
-    per origin multiplied that by ``n`` on the DEFAULT free-start path — measured at 0.43 s versus
-    0.036 s pinned, for 12 tracks.
+    DP explores all of them at once and the stated ``O(2^n · n²)`` holds.
+
+    At 12 tracks this pass costs ~80 ms free-start and ~48 ms pinned. The shape it replaced —
+    a full DP re-run per origin — cost 0.43 s free-start and 0.036 s pinned: it multiplied the
+    complexity by ``n`` on the DEFAULT path, in exchange for skipping every mask not containing
+    the single pinned origin. So pinning is ~1.33x slower here and the default is ~5.5x faster,
+    which is the trade this deliberately takes.
     """
     n = cost.shape[0]
     full = 1 << n
