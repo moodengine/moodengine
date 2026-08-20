@@ -45,9 +45,30 @@ _MAX_PLAYERS: int = 8  # 2ⁿ coalition evals — the exact-Shapley guard-rail
 
 class SupportsPredictProba(Protocol):
     """Structural surface of the fitted classifier the surrogate wraps: any object
-    with a sklearn-style ``predict_proba(X) -> (n, n_classes)``."""
+    with a sklearn-style ``predict_proba(X) -> (n, n_classes)``.
+
+    **Rows must be scored independently.** ``predict_proba(X)[i]`` has to depend only on ``X[i]``,
+    never on the other rows of the batch — which is what "sklearn-style" means in practice, and what
+    every fitted sklearn estimator does. :func:`surrogate_shap` relies on it: it scores all ``2ⁿ``
+    coalitions in ONE call, so an estimator that standardizes by the batch's own column means (a
+    transform that conforms to this Protocol but is not row-independent) would see a different batch
+    and return different attributions than a per-row loop.
+    """
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray: ...
+
+
+def _ensure_within_player_cap(n: int) -> None:
+    """Reject a game too large to enumerate exactly. Shared by BOTH exact-Shapley entry points.
+
+    :func:`surrogate_shap` used to inherit this check by routing through :func:`shapley_exact`;
+    batching the coalitions means it no longer does, and the cap is what keeps ``2ⁿ`` from being an
+    allocation rather than a loop bound. One home for the rule so the two paths cannot drift.
+    """
+    if n < 0:
+        raise ValueError("n_players must be >= 0")
+    if n > _MAX_PLAYERS:
+        raise ValueError(f"n_players={n} exceeds the exact-Shapley cap {_MAX_PLAYERS} (2^n evals)")
 
 
 def shapley_exact(value: Callable[[frozenset], float], n_players: int) -> np.ndarray:
@@ -63,33 +84,42 @@ def shapley_exact(value: Callable[[frozenset], float], n_players: int) -> np.nda
     small: blend components or a whitelist of interpretable signals). ``n_players == 0`` ⇒ empty
     ``φ``. Deterministic; ``value`` must be a pure function of its coalition."""
     n = int(n_players)
-    if n < 0:
-        raise ValueError("n_players must be >= 0")
-    if n > _MAX_PLAYERS:
-        raise ValueError(f"n_players={n} exceeds the exact-Shapley cap {_MAX_PLAYERS} (2^n evals)")
-    phi = np.zeros((n,), dtype=np.float64)
+    _ensure_within_player_cap(n)
     if n == 0:
-        return phi
+        return np.zeros((0,), dtype=np.float64)
 
-    _cache: dict[frozenset, float] = {}
+    # Every one of the 2ⁿ coalitions is needed (the old memo saw each exactly once), so evaluate
+    # them into a table indexed by bitmask and hand that to the shared weighting below — the same
+    # code path :func:`surrogate_shap` reaches after ONE batched model call, so the two cannot drift.
+    payoff = np.fromiter(
+        (float(value(frozenset(i for i in range(n) if (mask >> i) & 1))) for mask in range(1 << n)),
+        dtype=np.float64,
+        count=1 << n,
+    )
+    return _shapley_from_payoffs(payoff, n)
 
-    def v(coalition: frozenset) -> float:
-        got = _cache.get(coalition)
-        if got is None:
-            got = float(value(coalition))
-            _cache[coalition] = got
-        return got
 
+def _shapley_from_payoffs(payoff: np.ndarray, n: int) -> np.ndarray:
+    """Shapley values from a payoff table indexed by coalition BITMASK (``payoff[mask]``).
+
+    ``mask`` has bit ``i`` set when player ``i`` is in the coalition, so ``payoff`` is exactly what a
+    single batched evaluation of all ``2ⁿ`` coalitions produces, in order. The per-player sum runs
+    over the ``2ⁿ⁻¹`` masks without ``i`` as one dot product rather than a Python loop."""
+    phi = np.zeros((n,), dtype=np.float64)
     fact = [factorial(k) for k in range(n + 1)]
     n_fact = fact[n]
+    masks = np.arange(1 << n, dtype=np.intp)
+    sizes = np.fromiter((int(m).bit_count() for m in masks), dtype=np.intp, count=1 << n)
     for i in range(n):
-        others = [j for j in range(n) if j != i]
-        m = len(others)  # n - 1
-        for mask in range(1 << m):
-            coalition = frozenset(others[t] for t in range(m) if (mask >> t) & 1)
-            s = len(coalition)
-            weight = fact[s] * fact[n - s - 1] / n_fact
-            phi[i] += weight * (v(coalition | {i}) - v(coalition))
+        bit = 1 << i
+        without = masks[(masks & bit) == 0]
+        s = sizes[without]
+        weight = np.fromiter(
+            (fact[int(k)] * fact[n - int(k) - 1] / n_fact for k in s),
+            dtype=np.float64,
+            count=without.shape[0],
+        )
+        phi[i] = float(np.dot(weight, payoff[without | bit] - payoff[without]))
     return phi
 
 
@@ -259,6 +289,11 @@ def surrogate_shap(
     with interventional perturbation against the same single ``baseline`` reference (imported lazily;
     :class:`~moodengine.exceptions.MissingDependencyError` if ``shap`` is absent) — which is
     mathematically the same game, so the two concord.
+    All ``2ⁿ`` coalitions are scored in a SINGLE ``predict_proba`` call, so the wrapped estimator
+    must score rows independently — see :class:`SupportsPredictProba`. Every fitted sklearn
+    classifier does; an estimator that standardizes against the batch it is given does not, and
+    would return different attributions here than under a per-coalition loop.
+
     Returns ``φ`` ``(n_features,)`` float64. Deterministic; inputs are never mutated."""
     x = np.asarray(x, dtype=np.float64).ravel()
     nf = len(surr.feature_names)
@@ -270,15 +305,25 @@ def surrogate_shap(
     if backend != "exact":
         raise ValueError(f"unknown backend {backend!r} (expected 'exact' | 'treeshap')")
 
+    # Enforced HERE, not inherited: batching the coalitions means this no longer routes through
+    # `shapley_exact`, and without the cap `1 << nf` below is an allocation, not a loop bound —
+    # a 25-feature surrogate would ask for a (33M, 25) design matrix.
+    _ensure_within_player_cap(nf)
+    if nf == 0:
+        # A surrogate with no features has nothing to attribute. Returning here deliberately:
+        # the batched form below would otherwise hand `predict_proba` a (1, 0) design matrix,
+        # which sklearn rejects — and the per-coalition form never called the model at all.
+        return np.zeros((0,), dtype=np.float64)
+
     baseline = np.asarray(surr.baseline, dtype=np.float64).ravel()
-
-    def value(coalition: frozenset) -> float:
-        vec = baseline.copy()
-        for f in coalition:
-            vec[f] = x[f]
-        return float(surr.model.predict_proba(vec.reshape(1, -1))[0][col])
-
-    return shapley_exact(value, nf)
+    # One call, not 2ⁿ: row `mask` of the design matrix takes x on the signals in the coalition and
+    # the baseline elsewhere, which is the interventional value function evaluated everywhere at
+    # once. The cap checked above holds the matrix to at most (256, n_features).
+    masks = np.arange(1 << nf, dtype=np.intp)
+    in_coalition = ((masks[:, None] >> np.arange(nf, dtype=np.intp)) & 1).astype(bool)
+    design = np.where(in_coalition, x, baseline)
+    payoff = np.asarray(surr.model.predict_proba(design), dtype=np.float64)[:, col]
+    return _shapley_from_payoffs(payoff, nf)
 
 
 def _treeshap(surr: SignalSurrogate, x: np.ndarray, col: int) -> np.ndarray:

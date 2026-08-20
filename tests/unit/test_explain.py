@@ -169,6 +169,91 @@ def test_surrogate_shap_baseline_feature_gets_zero():
     assert_that(np.allclose(phi[1:], 0.0, atol=1e-9)).is_true()  # untouched signals -> 0
 
 
+def _wide_signals(n_features: int, n_per: int = 40, seed: int = 0):
+    """A surrogate over ``n_features`` signals where only feature 0 separates the moods.
+
+    The axiom tests below need MORE than the 3 features `_separable_signals` gives: the coalition
+    enumeration is 2^n_features wide, so nf=3 exercises 8 coalitions and cannot distinguish a
+    correct weighting from several wrong ones that happen to agree on small games."""
+    rng = np.random.default_rng(seed)
+    rows, y = [], []
+    for j, center in enumerate((0.0, 5.0, 10.0)):
+        col0 = center + 0.3 * rng.standard_normal(n_per)
+        rest = rng.standard_normal((n_per, n_features - 1))
+        rows.append(np.column_stack([col0, rest]))
+        y.extend([j] * n_per)
+    feats = ["disc"] + [f"n{i}" for i in range(1, n_features)]
+    return np.vstack(rows), np.array(y), feats, ["calm", "energetic", "dark"]
+
+
+@pytest.mark.parametrize("n_features", [5, 8], ids=lambda n: f"nf{n}")
+@pytest.mark.parametrize("kind", ["tree", "linear"])
+def test_surrogate_shap_axioms_hold_on_a_wide_game(n_features, kind):
+    """Efficiency and the dummy axiom at 32 and 256 coalitions, not just the 8 that nf=3 gives.
+
+    All coalitions are scored in one batched call, so the mapping from coalition bitmask to design
+    row is what has to be right — and a mis-ordered mapping still satisfies both axioms on a small
+    enough game. These sizes are where it stops being able to."""
+    S, y, feats, moods = _wide_signals(n_features, seed=7)
+    surr = fit_signal_surrogate(S, y, feats, moods, kind=kind)
+    mood_idx = surr.mood_names.index("energetic")
+    x = S[y == 1][0]
+
+    phi = surrogate_shap(surr, x, mood_idx, backend="exact")
+
+    p_x = float(surr.model.predict_proba(x.reshape(1, -1))[0][mood_idx])
+    p_base = float(surr.model.predict_proba(surr.baseline.reshape(1, -1))[0][mood_idx])
+    assert_that(float(phi.sum())).is_close_to(p_x - p_base, 1e-9)  # efficiency
+    at_baseline = surr.baseline.copy()
+    at_baseline[0] = x[0]  # only the discriminative signal moves off baseline
+    phi_dummy = surrogate_shap(surr, at_baseline, mood_idx, backend="exact")
+    assert_that(np.allclose(phi_dummy[1:], 0.0, atol=1e-9)).is_true()  # dummy
+
+
+def test_surrogate_shap_refuses_a_surrogate_wider_than_the_exact_cap():
+    """The 2ⁿ cap has to hold on the batched path too, where it is no longer inherited.
+
+    `surrogate_shap` used to reach the cap by routing through `shapley_exact`. Scoring every
+    coalition in one call means it no longer does — and there `1 << nf` is an ALLOCATION, not a
+    loop bound: a 25-feature surrogate would ask for a (33M, 25) design matrix. The existing cap
+    test exercises `shapley_exact` directly and never notices."""
+    S, y, feats, moods = _wide_signals(4, seed=2)
+    fitted = fit_signal_surrogate(S, y, feats, moods, kind="tree")
+    too_wide = SignalSurrogate(
+        kind="tree",
+        model=fitted.model,
+        feature_names=[f"f{i}" for i in range(12)],
+        mood_names=fitted.mood_names,
+        baseline=np.zeros(12),
+        fidelity=0.5,
+    )
+
+    with pytest.raises(ValueError, match=r"exceeds the exact-Shapley cap"):
+        surrogate_shap(too_wide, np.zeros(12), 0, backend="exact")
+
+
+def test_surrogate_shap_with_no_features_returns_an_empty_attribution():
+    """A featureless surrogate has nothing to attribute, and must not reach the model.
+
+    `SignalSurrogate` is documented as hand-constructible, so `feature_names=[]` is reachable. The
+    per-coalition form never called `predict_proba` at all there; the batched form would hand it a
+    (1, 0) design matrix, which sklearn rejects — so the early return is deliberate, and pinned."""
+    S, y, feats, moods = _separable_signals(seed=8)
+    fitted = fit_signal_surrogate(S, y, feats, moods, kind="tree")
+    featureless = SignalSurrogate(
+        kind="tree",
+        model=fitted.model,
+        feature_names=[],
+        mood_names=fitted.mood_names,
+        baseline=np.zeros(0),
+        fidelity=0.5,
+    )
+
+    phi = surrogate_shap(featureless, np.zeros(0), 0, backend="exact")
+
+    assert_that(phi.shape).is_equal_to((0,))
+
+
 def test_surrogate_shap_treeshap_concords_with_exact():
     pytest.importorskip("shap")
     S, y, feats, moods = _separable_signals(seed=6)
