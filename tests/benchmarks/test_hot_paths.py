@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from moodengine.cluster import outlier_scores
+from moodengine.journey import smooth_order
 from moodengine.labeling import label_tracks
 from moodengine.novelty import knn_distance_scores
 from moodengine.search import (
@@ -33,6 +34,17 @@ def _library(n: int, d: int = _D, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((n, d)).astype(np.float32)
     return X / np.linalg.norm(X, axis=1, keepdims=True)
+
+
+#: smooth_order is quadratic per 2-opt pass with a pass count that grows too, so it gets its own
+#: playlist-sized fixture rather than the 1k/10k library ones — 250 tracks runs in tens of
+#: milliseconds while 10 000 would run for hours, and a playlist is the size this function is for.
+_ORDER_N = 250
+
+
+@pytest.fixture(scope="module")
+def playlist():
+    return _library(_ORDER_N, seed=3)
 
 
 @pytest.fixture(params=_SIZES, ids=lambda n: f"n{n}", scope="module")
@@ -92,3 +104,14 @@ def test_bench_outlier_scores(benchmark, library):
     rng = np.random.default_rng(2)
     labels = rng.integers(0, 8, size=X.shape[0])
     benchmark(outlier_scores, X, labels)
+
+
+# Both start modes: they exercise different code. The free-start path pays the all-starts
+# nearest-neighbour seed and then 2-opt; a pinned start skips the seed entirely, so a change that
+# speeds up only one of them would look like a win for both if only one were measured.
+def test_bench_smooth_order_free_start(benchmark, playlist):
+    benchmark(smooth_order, playlist)
+
+
+def test_bench_smooth_order_pinned_start(benchmark, playlist):
+    benchmark(smooth_order, playlist, start=0)
