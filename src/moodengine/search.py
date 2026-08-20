@@ -201,12 +201,18 @@ def _camelot_harm(a: str | None, b: str | None) -> float:
         return 0.0
 
 
+#: Playback-rate ratios the tempo term considers, so double- and half-time read as compatible.
+#: Shared by the scalar `_tempo_compat` and the vectorized per-step row in `_neighbours_greedy` —
+#: one definition, so the two forms cannot drift apart.
+_TEMPO_RATIOS: tuple[float, ...] = (1.0, 2.0, 0.5)
+
+
 def _tempo_compat(a: float, b: float, sigma: float) -> float:
     """Octave-aware BPM compatibility ``exp(−(d/σ)²/2)`` with ``d = min_{r∈{1,2,½}} |log2(a·r/b)|`` —
     so double-/half-time are treated as compatible. ``0.0`` when either BPM is NaN / non-positive."""
     if not (np.isfinite(a) and np.isfinite(b)) or a <= 0.0 or b <= 0.0:
         return 0.0
-    d = min(abs(float(np.log2(a * r / b))) for r in (1.0, 2.0, 0.5))
+    d = min(abs(float(np.log2(a * r / b))) for r in _TEMPO_RATIOS)
     return float(np.exp(-((d / sigma) ** 2) / 2.0))
 
 
@@ -258,20 +264,59 @@ def _neighbours_greedy(
     cam_list: list[str | None] = camelot if camelot is not None else []
     bpm_vec = np.asarray(bpm, dtype=np.float64).reshape(-1) if bpm is not None else np.empty(0)
 
-    def _bonus(cand_positions: list[int], ref_row: int) -> np.ndarray:
-        """Harmonic + tempo bonus for the remaining candidates, measured against ``ref_row`` (the seed
-        on the first pick, then the previously-selected track → a continuous harmonic/tempo chain)."""
-        out = np.zeros(len(cand_positions), dtype=np.float32)
-        ref_cam = cam_list[ref_row] if (use_harm and 0 <= ref_row < len(cam_list)) else None
-        ref_bpm = bpm_vec[ref_row] if (use_tempo and ref_row < bpm_vec.shape[0]) else np.nan
-        for i, p in enumerate(cand_positions):
-            r = int(pool[p])
-            if use_harm:
-                cam = cam_list[r] if r < len(cam_list) else None
-                out[i] += harmonic_weight * _camelot_harm(cam, ref_cam)
-            if use_tempo:
-                a = bpm_vec[r] if r < bpm_vec.shape[0] else np.nan
-                out[i] += tempo_weight * _tempo_compat(float(a), float(ref_bpm), tempo_sigma)
+    # The bonus depends on the candidate and on ``ref_row``, and ``ref_row`` changes ONCE per greedy
+    # step — so it is computed for the whole pool per step and indexed, instead of calling the scalar
+    # helpers once per (step, candidate). Two things keep that exact rather than merely close:
+    # the harmonic side calls `_camelot_harm` itself, once per DISTINCT code, so the ``a == b`` rule
+    # that scores two identical MALFORMED codes 1.0 is inherited rather than re-derived from a
+    # hand-written key map; and both caches are function-local, because a module-level memo would
+    # give this stateless core a hidden per-process memory.
+    pool_rows = pool.tolist()
+    distinct_cam: list[str | None] = []
+    cam_ids = np.empty(0, dtype=np.intp)
+    harm_rows: dict[str | None, np.ndarray] = {}
+    pool_bpm = np.empty(0)
+    tempo_ok = np.empty(0, dtype=bool)
+    safe_bpm = np.empty(0)
+    tempo_rows: dict[float, np.ndarray] = {}
+    if use_harm:
+        pool_cam = [cam_list[r] if r < len(cam_list) else None for r in pool_rows]
+        distinct_cam = list(dict.fromkeys(pool_cam))
+        cam_index = {c: i for i, c in enumerate(distinct_cam)}
+        cam_ids = np.array([cam_index[c] for c in pool_cam], dtype=np.intp)
+    if use_tempo:
+        pool_bpm = np.array(
+            [bpm_vec[r] if r < bpm_vec.shape[0] else np.nan for r in pool_rows], dtype=np.float64
+        )
+        tempo_ok = np.isfinite(pool_bpm) & (pool_bpm > 0.0)
+        # A placeholder under the mask keeps log2 off NaN and non-positive BPMs, which would
+        # otherwise warn and produce values the mask discards anyway.
+        safe_bpm = np.where(tempo_ok, pool_bpm, 1.0)
+
+    def _bonus_row(ref_row: int) -> np.ndarray:
+        """Harmonic + tempo bonus of EVERY pool member against ``ref_row`` (the seed on the first
+        pick, then the previously-selected track → a continuous harmonic/tempo chain)."""
+        out = np.zeros(pool_size, dtype=np.float32)
+        if use_harm:
+            ref_cam = cam_list[ref_row] if 0 <= ref_row < len(cam_list) else None
+            row = harm_rows.get(ref_cam)
+            if row is None:
+                per_code = np.array(
+                    [_camelot_harm(c, ref_cam) for c in distinct_cam], dtype=np.float32
+                )
+                row = harm_rows[ref_cam] = per_code[cam_ids]
+            out += harmonic_weight * row
+        if use_tempo:
+            ref_bpm = float(bpm_vec[ref_row]) if ref_row < bpm_vec.shape[0] else float("nan")
+            if not np.isfinite(ref_bpm) or ref_bpm <= 0.0:
+                return out  # an unknown reference BPM contributes nothing, as it did per-scalar
+            row = tempo_rows.get(ref_bpm)
+            if row is None:
+                d = np.min(np.abs(np.log2(np.outer(safe_bpm, _TEMPO_RATIOS) / ref_bpm)), axis=1)
+                row = tempo_rows[ref_bpm] = np.where(
+                    tempo_ok, np.exp(-((d / tempo_sigma) ** 2) / 2.0), 0.0
+                ).astype(np.float32)
+            out += tempo_weight * row
         return out
 
     # Greedy. selected/remaining are POSITIONS into `pool`; `max_sim[p]` is p's TRUE max cosine to any
@@ -288,7 +333,7 @@ def _neighbours_greedy(
         div = np.zeros(len(remaining), dtype=np.float32) if max_sim is None else max_sim[cand]
         score = lam * rel[cand] - (1.0 - lam) * div
         if use_harm or use_tempo:
-            score = score + _bonus(remaining, ref_row)
+            score = score + _bonus_row(ref_row)[cand]
         best = remaining.pop(
             int(np.argmax(score))
         )  # first max on ties → the more-relevant candidate

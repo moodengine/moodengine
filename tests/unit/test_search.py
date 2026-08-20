@@ -414,6 +414,75 @@ def test_find_neighbours_harmonic_matches_chained_reference_greedy() -> None:
                 assert_that(gs).is_close_to(rs, 1e-5)
 
 
+@pytest.mark.parametrize(
+    "camelot_kind",
+    ["none_entries", "malformed", "all_malformed", "short_list"],
+)
+@pytest.mark.parametrize("bpm_kind", ["nan_entries", "non_positive", "short_vector"])
+def test_find_neighbours_harmonic_survives_ill_formed_key_and_tempo_metadata(
+    camelot_kind, bpm_kind
+) -> None:
+    """Real libraries carry unknown, malformed and missing metadata, and none of it may raise.
+
+    Key detection returns ``None`` for tracks it cannot analyse, third-party tags contain codes
+    outside the wheel, and a caller can pass ``camelot``/``bpm`` shorter than the library. Nothing
+    covered these: the whole file passes against a bonus that mishandles them."""
+    n = 30
+    X = _l2(np.random.default_rng(9).standard_normal((n, 10)).astype(np.float32))
+    files = [f"t{i}" for i in range(n)]
+    wheel = [f"{(i % 12) + 1}{'A' if i % 2 else 'B'}" for i in range(n)]
+    camelot = {
+        "none_entries": [None if i % 3 == 0 else wheel[i] for i in range(n)],
+        "malformed": ["ZZ" if i % 3 == 0 else wheel[i] for i in range(n)],
+        "all_malformed": ["ZZ"] * n,
+        "short_list": wheel[: n // 3],
+    }[camelot_kind]
+    bpm = {
+        "nan_entries": np.where(np.arange(n) % 4 == 0, np.nan, 90.0 + np.arange(n) % 60),
+        "non_positive": np.where(np.arange(n) % 4 == 0, 0.0, 90.0 + np.arange(n) % 60),
+        "short_vector": (90.0 + np.arange(n // 3) % 60),
+    }[bpm_kind].astype(np.float64)
+
+    got = find_neighbours_harmonic(
+        0,
+        X,
+        files,
+        top_k=8,
+        lambda_=0.6,
+        camelot=camelot,
+        bpm=bpm,
+        harmonic_weight=0.5,
+        tempo_weight=0.4,
+    )
+
+    assert_that(got).is_length(8)
+    assert_that(sorted({g[0] for g in got})).is_length(8)  # no duplicate picks
+    assert_that([g[0] for g in got]).does_not_contain(files[0])  # the seed is never returned
+
+
+def test_identical_malformed_codes_still_score_as_a_key_match() -> None:
+    """``_camelot_harm`` short-circuits on ``a == b`` BEFORE consulting the wheel, so two tracks
+    tagged with the same unrecognised code are a perfect key match. A bonus table built from a
+    hand-written ``{1..12}{A,B}`` map returns 0.0 there instead, and nothing caught it.
+
+    Discriminating fixture: half the library carries the seed's malformed code and half a real
+    one. Under the short-circuit the malformed half is favoured; under the bug the bonus is a
+    constant 0.0 and the picks collapse to the plain relevance ordering."""
+    n = 40
+    X = _l2(np.random.default_rng(31).standard_normal((n, 12)).astype(np.float32))
+    files = [f"t{i}" for i in range(n)]
+    codes = ["ZZ" if i % 2 == 0 else "8A" for i in range(n)]  # seed (row 0) is "ZZ"
+    kw = dict(top_k=10, lambda_=1.0, camelot=codes, tempo_weight=0.0)
+
+    with_bonus = find_neighbours_harmonic(0, X, files, harmonic_weight=5.0, **kw)
+    without_bonus = find_neighbours_harmonic(0, X, files, harmonic_weight=0.0, **kw)
+
+    assert_that(_camelot_harm("ZZ", "ZZ")).is_equal_to(1.0)  # the rule itself
+    picked = [int(name[1:]) for name, _ in with_bonus]
+    assert_that([i for i in picked if i % 2 == 0]).is_length(10)  # every pick shares the code
+    assert_that([n for n, _ in with_bonus]).is_not_equal_to([n for n, _ in without_bonus])
+
+
 def test_camelot_harm_and_tempo_compat_primitives() -> None:
     assert_that(_camelot_harm("8A", "8A")).is_equal_to(1.0)
     assert_that(_camelot_harm("8A", "9A")).is_equal_to(0.5)  # wheel neighbour (8A ∈ neighbours(9A))
