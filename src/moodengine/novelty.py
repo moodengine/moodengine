@@ -67,9 +67,10 @@ def mahalanobis_scores(
     return np.sqrt(np.maximum(dist2, 0.0)).astype(np.float32)
 
 
-# Rows per cosine slab in knn_distance_scores: the peak allocation is
-# (block, m) float32 ≈ 40 MB at m = 10k — a full (n, m) block would OOM around
-# 10-15k tracks on a 16 GB machine.
+# Rows per cosine slab in knn_distance_scores: the peak allocation is one
+# (block, m) float32 slab ≈ 40 MB at m = 10k — a full (n, m) block would OOM around
+# 10-15k tracks on a 16 GB machine. The top-k select runs IN PLACE on that slab, so it
+# stays one slab; the copying `np.partition` used to double this line's footprint.
 _KNN_BLOCK_ROWS = 1024
 
 
@@ -98,7 +99,9 @@ def knn_distance_scores(X: np.ndarray, *, k: int = 10, ref: np.ndarray | None = 
     R = X if is_self else ensure_finite_2d(R, name="ref")
 
     Xn = l2_normalize(X, axis=1)
-    Rn = l2_normalize(R, axis=1)
+    # `R is X` on the self path, and normalization is idempotent — reuse it rather than paying a
+    # second pass and a second (n, d) copy.
+    Rn = Xn if is_self else l2_normalize(R, axis=1)
     n_avail = R.shape[0] - (1 if is_self else 0)  # self excluded from its own neighbour pool
     if n_avail < 1:
         return np.zeros((X.shape[0],), dtype=np.float32)
@@ -111,8 +114,11 @@ def knn_distance_scores(X: np.ndarray, *, k: int = 10, ref: np.ndarray | None = 
         if is_self:
             rows = np.arange(start, stop)
             sims[rows - start, rows] = -np.inf  # a row is never its own neighbour
-        # Top-kk cosines per row (descending): partial select then take the kk largest.
-        part = np.partition(sims, sims.shape[1] - kk, axis=1)[:, -kk:]
+        # Top-kk cosines per row: partial select IN PLACE, then view the kk largest. `sims` is a
+        # fresh slab nobody else holds, so partitioning it in place is safe and avoids allocating a
+        # second (block, m) array — which is what made this line, not the matmul, the peak.
+        sims.partition(sims.shape[1] - kk, axis=1)
+        part = sims[:, -kk:]
         # Clamp the mean cosine to [-1, 1] before converting to a distance: a duplicate / re-encode
         # makes two rows bit-identical, and float32 ``X @ X.T`` then yields a self-cosine slightly
         # ABOVE 1.0, which would make ``1 - cos`` a (physically impossible) tiny NEGATIVE distance.

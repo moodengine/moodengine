@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from assertpy import assert_that
 
+import moodengine.novelty as novelty
 from moodengine.novelty import knn_distance_scores, mahalanobis_scores
 
 logger = logging.getLogger(__name__)
@@ -146,3 +147,25 @@ def test_novelty_scores_reject_non_finite_input():
         knn_distance_scores(X, k=3)
     with pytest.raises(ValueError, match="non-finite"):
         mahalanobis_scores(X)
+
+
+def test_knn_self_path_reuses_one_normalization(mocker) -> None:
+    """`ref is None` means `R is X`, and normalization is idempotent — normalizing twice bought
+    nothing and allocated a second (n, d) copy."""
+    spy = mocker.spy(novelty, "l2_normalize")
+    X = np.random.default_rng(4).standard_normal((20, 6)).astype(np.float32)
+
+    knn_distance_scores(X, k=3)
+
+    assert_that(spy.call_count).is_equal_to(1)
+
+
+def test_knn_distance_scores_does_not_mutate_its_input() -> None:
+    """The top-k select runs in place on the slab, which is freshly allocated per block — the
+    caller's matrix must be untouched, as the docstring promises."""
+    X = np.random.default_rng(5).standard_normal((30, 8)).astype(np.float32)
+    before = X.copy()
+
+    knn_distance_scores(X, k=4)
+
+    np.testing.assert_array_equal(X, before)

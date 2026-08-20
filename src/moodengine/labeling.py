@@ -663,25 +663,39 @@ def label_tracks(
         X, mood_names, mood_matrix, temperature=temperature, recenter=recenter, prior=prior
     ).probs  # (n, n_moods)
 
-    rows: list[dict] = []
-    for prob_row in probs:
-        if k == 0:
-            rows.append(
-                {"top_mood": "", "top_score": float("nan"), "mood_topk": [], "mood_topk_scores": []}
-            )
-            continue
-        order = np.argsort(-prob_row, kind="stable")[:k]
-        topk = [mood_names[i] for i in order]
-        topk_scores = [float(prob_row[i]) for i in order]
-        rows.append(
+    n = probs.shape[0]
+    if k == 0:
+        return pd.DataFrame(
             {
-                "top_mood": topk[0],
-                "top_score": topk_scores[0],
-                "mood_topk": topk,
-                "mood_topk_scores": topk_scores,
-            }
+                "top_mood": [""] * n,
+                "top_score": [float("nan")] * n,
+                "mood_topk": [[] for _ in range(n)],
+                "mood_topk_scores": [[] for _ in range(n)],
+            },
+            columns=["top_mood", "top_score", "mood_topk", "mood_topk_scores"],
         )
-    return pd.DataFrame(rows, columns=["top_mood", "top_score", "mood_topk", "mood_topk_scores"])
+
+    # One vectorized rank over the whole (n, n_moods) block rather than a Python loop with a
+    # per-row argsort: the loop was the bulk of this function's cost on a real library, and
+    # `n_tracks` is exactly the dimension the performance rules say never to loop over. Stable
+    # ordering is preserved, so ties still resolve to the lower mood index.
+    order = np.argsort(-probs, axis=1, kind="stable")[:, :k]  # (n, k)
+    names = np.asarray(mood_names, dtype=object)
+    topk_names = names[order]  # (n, k)
+    topk_scores = np.take_along_axis(probs, order, axis=1).astype(float)  # (n, k)
+
+    return pd.DataFrame(
+        {
+            "top_mood": topk_names[:, 0].tolist(),
+            "top_score": topk_scores[:, 0].tolist(),
+            # `.tolist()` rather than `list(...)`: it unboxes to Python `str` / `float`, which is
+            # what the documented `list[str]` / `list[float]` contract says. Wrapping the numpy
+            # rows would leak `np.float64` into every cell.
+            "mood_topk": topk_names.tolist(),
+            "mood_topk_scores": topk_scores.tolist(),
+        },
+        columns=["top_mood", "top_score", "mood_topk", "mood_topk_scores"],
+    )
 
 
 def score_axis(
