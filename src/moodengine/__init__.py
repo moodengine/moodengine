@@ -91,6 +91,7 @@ from moodengine.labeling import (
     DEFAULT_MOOD_PROMPTS,
     MOOD_AFFECT,
     DEFAULT_TEMPERATURE,
+    RECENTER_MIN_N,
     ENERGY_PROMPTS,
     VALENCE_PROMPTS,
     MoodScores,
@@ -339,6 +340,7 @@ __all__ = [
     "DEFAULT_MOOD_PROMPTS",
     "MOOD_AFFECT",
     "DEFAULT_TEMPERATURE",
+    "RECENTER_MIN_N",
     "ENERGY_PROMPTS",
     "VALENCE_PROMPTS",
     # mood arc (per-segment)

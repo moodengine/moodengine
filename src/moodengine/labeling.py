@@ -361,10 +361,18 @@ def label_prior(sims: np.ndarray) -> NDArray[np.float32]:
     return s.mean(axis=0, dtype=np.float32)
 
 
+#: Rows below which a per-label mean is not an estimate worth subtracting. Centering on fewer
+#: than this leaves the offset dominated by the very rows it is meant to correct — in the limit of
+#: one row it IS that row, so subtracting it yields exactly zero and every score collapses to the
+#: uniform softmax. Shared by :func:`recenter_similarities` and by any caller deciding whether to
+#: derive a prior at all, so the two cannot drift.
+RECENTER_MIN_N: int = 5
+
+
 def recenter_similarities(
     sims: np.ndarray,
     enable: bool = True,
-    min_n: int = 5,
+    min_n: int = RECENTER_MIN_N,
     prior: np.ndarray | None = None,
 ) -> NDArray[np.float32]:
     """Subtract each label's mean cosine to cancel its modality-gap offset.

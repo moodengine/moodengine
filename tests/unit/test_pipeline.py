@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import logging
 import importlib.util
 from pathlib import Path
 
@@ -583,9 +584,58 @@ def test_write_cluster_report_surfaces_the_original_space_silhouette_and_verdict
         df, {}, metrics, tmp_config, "hdbscan", out_path=out_path
     ).read_text(encoding="utf-8")
 
-    assert_that(text).contains("**Silhouette:** 0.275 (reduced space)")
-    assert_that(text).contains("**Silhouette (original space):** 0.011")
+    assert_that(text).contains("**Silhouette:** 0.275 (reduced space, euclidean)")
+    assert_that(text).contains("**Silhouette (original space, cosine):** 0.011")
     assert_that(text).contains("**Structure:** weak")
+
+
+def test_write_cluster_report_names_the_metric_not_only_the_space(tmp_config):
+    """Both silhouettes can be scored in the SAME space and still differ — `cluster_metrics` uses
+    sklearn's euclidean default while `silhouette_original` is always cosine. Labelling both
+    "(original space)" printed two different numbers under one label, which reads as a
+    contradiction."""
+    df = pd.DataFrame({"filename": ["a.wav"], "cluster": [0]})
+    metrics = {
+        "n_clusters": 3,
+        "noise_ratio": 0.0,
+        "silhouette": 0.903,
+        "silhouette_space": "original",
+        "silhouette_original": 0.991,
+        "structure": "clustered",
+    }
+    out_path = tmp_config.output_dir / "report.md"
+    tmp_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    text = pipeline.write_cluster_report(
+        df, {}, metrics, tmp_config, "kmeans", out_path=out_path
+    ).read_text(encoding="utf-8")
+
+    assert_that(text).contains("**Silhouette:** 0.903 (original space, euclidean)")
+    assert_that(text).contains("**Silhouette (original space, cosine):** 0.991")
+
+
+def test_write_cluster_report_does_not_blame_a_reduction_that_never_ran(tmp_config):
+    """On the original-space path there IS no reduction, so the warning must not attribute the
+    clusters to one."""
+    df = pd.DataFrame({"filename": ["a.wav"], "cluster": [0]})
+    metrics = {
+        "n_clusters": 19,
+        "noise_ratio": 0.1,
+        "silhouette": 0.2,
+        "silhouette_space": "original",
+        "silhouette_original": 0.01,
+        "structure": "none_detected",
+    }
+    out_path = tmp_config.output_dir / "report.md"
+    tmp_config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    text = pipeline.write_cluster_report(
+        df, {}, metrics, tmp_config, "hdbscan", out_path=out_path
+    ).read_text(encoding="utf-8")
+
+    assert_that(text).contains("No substantial structure")
+    assert_that(text).does_not_contain("artifact of the dimensionality reduction")
+    assert_that(text).contains("produced in that same space")
 
 
 def test_write_cluster_report_warns_in_the_file_when_no_structure_is_detected(tmp_config):
@@ -840,6 +890,27 @@ def test_run_pipeline_core_returns_all_three_recentering_priors(tmp_config, make
     assert_that(result.energy_prior.shape).is_equal_to((2,))
     assert_that(result.valence_prior.shape).is_equal_to((2,))
     assert_that(result.energy_prior.dtype).is_equal_to(np.float32)
+
+
+def test_run_pipeline_core_withholds_priors_below_the_recentering_floor(
+    tmp_config, make_audio_library, caplog
+):
+    """A prior derived from too few rows and fed straight back subtracts each row's own
+    similarity from itself — at n=1 exactly zero, collapsing every axis to 0.5. Below
+    `RECENTER_MIN_N` the priors stay None and the documented small-batch behaviour applies."""
+    make_audio_library(tmp_config.raw_dir, n=2)
+
+    with caplog.at_level(logging.INFO, logger="moodengine.pipeline"):
+        result = pipeline.run_pipeline_core(
+            tmp_config, embedder_name="clap", method="kmeans", with_labels=True
+        )
+
+    assert_that(result.mood_prior).is_none()
+    assert_that(result.energy_prior).is_none()
+    assert_that(result.valence_prior).is_none()
+    assert_that(caplog.text).contains("not estimating recentering priors")
+    # ...and the axes are not the self-cancelling 0.5 the prior path produced.
+    assert_that(float(result.assignments["energy"].iloc[0])).is_not_close_to(0.5, tolerance=1e-9)
 
 
 def test_run_pipeline_core_priors_reproduce_a_single_track_rescore(tmp_config, make_audio_library):

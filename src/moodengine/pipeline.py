@@ -321,16 +321,24 @@ def extract_embeddings(
     """Embed every discovered audio file under ``config.raw_dir``.
 
     Discovers files, computes a cached :func:`track_embedding` for each, and
-    returns the aligned ``(files, X)`` where ``X`` is ``(n, d)`` float32. Files
-    that fail to decode/embed are logged and skipped, so ``files`` and ``X`` stay
-    row-aligned; ``on_error(path, exc)`` — when given — additionally receives
-    each skipped file, so failures are observable programmatically, not only in
-    the logs. ``on_progress(done, total, path)`` — when given — is called after
-    EVERY file, succeeded or skipped. The file boundary is also the natural
-    cancellation point: an exception raised inside either callback aborts the
-    run cleanly, and the per-file cache makes the next run resume for free.
-    Returns an empty list and an empty ``(0, 0)`` matrix when nothing is found
-    or everything fails.
+    returns the aligned ``(files, X)`` where ``X`` is ``(n, d)`` float32.
+
+    **Two failure families, deliberately handled differently.** A file that fails to decode or
+    embed is logged and skipped, so ``files`` and ``X`` stay row-aligned; ``on_error(path, exc)``
+    — when given — additionally receives each skipped file, so failures are observable
+    programmatically and not only in the logs. A failure of the RUN is raised instead:
+    :class:`~moodengine.exceptions.MissingDependencyError` (the backbone is not installed),
+    :class:`~moodengine.exceptions.ModelLoadError` (the weights cannot be fetched or loaded), and
+    the ``ValueError`` :func:`~moodengine.config.ensure_clap_fusion_supported` raises for a config
+    that would cache irreproducible vectors. None of those is a property of one file — skipping
+    them emitted the same message per track and returned an empty matrix that reads exactly like
+    "no audio found".
+
+    ``on_progress(done, total, path)`` — when given — is called after EVERY file, succeeded or
+    skipped. The file boundary is also the natural cancellation point: an exception raised inside
+    either callback aborts the run cleanly, and the per-file cache makes the next run resume for
+    free. Returns an empty list and an empty ``(0, 0)`` matrix when nothing is found, or when
+    every file failed for a per-file reason.
     """
     embedder = LazyEmbedder(embedder_name, config)
     discovered = _io.discover_audio_files(config.raw_dir, config)
@@ -379,7 +387,8 @@ def fused_embeddings(
     each matrix, scales them by ``config.fusion_weights`` ``(w_m, w_c)`` and
     horizontally stacks them into ``(n, d_mert + d_clap)``. Returns the aligned
     ``(files, X_fused)``. ``on_progress`` / ``on_error`` follow the
-    :func:`extract_embeddings` contract; the ``(done, total)`` counters restart
+    :func:`extract_embeddings` contract, including its split between per-file failures (skipped)
+    and run failures (raised); the ``(done, total)`` counters restart
     for each embedding space (MERT pass first, then CLAP). An empty ``(0, 0)``
     matrix is returned when either space has no usable embeddings or the two
     share no files.
@@ -433,8 +442,12 @@ class PipelineResult:
     (``False`` when labeling was requested but no CLAP embedding succeeded).
 
     ``mood_prior`` is the ``(n_moods,)`` modality-gap offset this run estimated over the whole
-    library and scored against, and ``energy_prior`` / ``valence_prior`` are the matching ``(2,)``
-    offsets for the two attribute axes (all ``None`` when no labelling happened). Keep the three
+    library, and ``energy_prior`` / ``valence_prior`` are the matching ``(2,)`` offsets for the
+    two attribute axes. All three are ``None`` when no labelling happened, when fewer than
+    ``labeling.RECENTER_MIN_N`` rows were labelled (too few for a mean to be an estimate — it
+    would cancel itself out), . When ``config.recenter_labels`` is
+    False they are still returned but were NOT applied to this run's numbers, so a later call
+    reusing them will not reproduce what this run published. Keep the three
     and pass them back as ``prior=`` / ``energy_prior=`` / ``valence_prior=`` when scoring anything
     later against the same vocabularies — that is what makes a track's mood, energy and valence
     reproducible outside this batch. Without them, a follow-up call re-estimates each offset from
@@ -623,7 +636,26 @@ def run_pipeline_core(
             # a caller later scoring one new track, or re-scoring a playlist, would re-estimate
             # the offset from that handful of rows and land on a different label for a track this
             # run already labelled. Returned on PipelineResult.mood_prior for exactly that reason.
-            mood_prior = _labeling.label_prior(X_valid @ np.asarray(mood_lm[1], dtype=np.float32).T)
+            # ...but only once there are enough rows for a mean to BE an estimate. A supplied
+            # prior deliberately bypasses `recenter_similarities`' min_n, so deriving one from a
+            # handful of rows and feeding it straight back subtracts each row's own similarity
+            # from itself: at n=1 that is exactly zero, and every score collapses to the uniform
+            # softmax. Below the floor the priors stay None and the documented small-batch
+            # behaviour applies, which is also what a caller re-scoring one track later gets.
+            enough_for_prior = X_valid.shape[0] >= _labeling.RECENTER_MIN_N
+            if not enough_for_prior:
+                logger.info(
+                    "Only %d labelled row(s) < %d: not estimating recentering priors from them "
+                    "(they would cancel themselves out); PipelineResult priors stay None.",
+                    X_valid.shape[0],
+                    _labeling.RECENTER_MIN_N,
+                )
+
+            mood_prior = (
+                _labeling.label_prior(X_valid @ np.asarray(mood_lm[1], dtype=np.float32).T)
+                if enough_for_prior
+                else None
+            )
             ld = _labeling.label_tracks(
                 X_valid, recenter=recenter, label_matrix=mood_lm, prior=mood_prior
             )
@@ -634,8 +666,12 @@ def run_pipeline_core(
             # `recenter_similarities`' min_n, so it would skip centering entirely).
             energy_lm = _labeling.build_label_matrix(clap_embedder, _labeling.ENERGY_PROMPTS)
             valence_lm = _labeling.build_label_matrix(clap_embedder, _labeling.VALENCE_PROMPTS)
-            energy_prior, valence_prior = _labeling.attribute_priors(
-                X_valid, clap_embedder, energy_matrix=energy_lm, valence_matrix=valence_lm
+            energy_prior, valence_prior = (
+                _labeling.attribute_priors(
+                    X_valid, clap_embedder, energy_matrix=energy_lm, valence_matrix=valence_lm
+                )
+                if enough_for_prior
+                else (None, None)
             )
             attr = _labeling.attribute_scores(
                 X_valid,
@@ -879,16 +915,19 @@ def write_cluster_report(
     # persisted report certify "19 clusters, silhouette 0.28" for a library `run_clustering` has
     # already judged structureless, and the file outlives the log line that said so. So the
     # original-space score and its verdict ship beside it whenever the caller supplied them.
+    # Name the METRIC as well as the space. The two scores can be computed in the SAME space and
+    # still differ — `cluster_metrics` uses sklearn's euclidean default while `silhouette_original`
+    # is always cosine — so labelling both "(original space)" printed what read as a contradiction.
     sil = metrics.get("silhouette")
     space = metrics.get("silhouette_space")
     lines.append(
         f"- **Silhouette:** {f'{float(sil):.3f}' if sil is not None else 'n/a'}"
-        + (f" ({space} space)" if space else "")
+        + (f" ({space} space, euclidean)" if space else "")
     )
     if "silhouette_original" in metrics:
         sil_original = metrics.get("silhouette_original")
         lines.append(
-            "- **Silhouette (original space):** "
+            "- **Silhouette (original space, cosine):** "
             + (f"{float(sil_original):.3f}" if sil_original is not None else "n/a")
         )
     structure = metrics.get("structure")
@@ -898,9 +937,14 @@ def write_cluster_report(
     if structure == "none_detected":
         lines.append(
             "> **No substantial structure.** The original-space silhouette does not support the "
-            "clusters below: they are largely an artifact of the dimensionality reduction, and "
-            "the silhouette above is not evidence to the contrary. Read the sections as a "
-            "partition of a continuum, not as discovered groups."
+            "clusters below"
+            + (
+                ": they are largely an artifact of the dimensionality reduction, and the "
+                "silhouette above is not evidence to the contrary."
+                if space != "original"
+                else ", which were produced in that same space."
+            )
+            + " Read the sections as a partition of a continuum, not as discovered groups."
         )
         lines.append("")
 
