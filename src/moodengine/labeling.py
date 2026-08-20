@@ -35,9 +35,12 @@ logger = logging.getLogger(__name__)
 # Default temperature for the softmax that turns similarities into per-track scores.
 #
 # Read what it actually divides: `score_moods` softmaxes the RECENTERED similarities, not the raw
-# cosines. Raw CLAP audio/text cosines sit in a narrow band (~0.2-0.45), but recentering subtracts
-# each label's mean and roughly halves that spread, so this value is tuned against a quantity one
-# step removed from the one the band describes. It is a spread aesthetic, not a statistical
+# cosines. Measured over 400 DEAM tracks against the shipped vocabulary, raw CLAP audio/text
+# cosines run -0.157 to +0.380 between the 1st and 99th percentiles (full range -0.316 to +0.485)
+# — not the tidy positive band this note used to claim — and recentering trims the mean per-track
+# spread only from 0.302 to 0.260, about 14 %, nowhere near the halving it used to claim. So this
+# value is tuned against a quantity one step removed from the one it describes, and both halves of
+# that description were wrong. It is a spread aesthetic, not a statistical
 # optimum — a 0.95 score does NOT mean "right 95 % of the time"; fitting an honest one is
 # `moodengine.calibration.fit_temperature` on a gold set. The principled starting point, if you
 # want one without gold labels, is `1 / exp(logit_scale_a)` read off the loaded CLAP model: the
@@ -196,10 +199,11 @@ def build_prompt_table(
 # claim, so `mood_affect_consistency` reports the two groups separately rather than pooling them.
 #
 # Measured against DEAM's human ratings over 400 songs, the engine's own labels order by gold
-# arousal about as this table predicts at the extremes — energetic highest at 0.672, dreamy and
-# romantic lowest around 0.32 — with two clear disagreements: tracks the engine calls `tense` have
-# the LOWEST gold arousal of any mood (0.319) where the circumplex puts tense high, and
-# `aggressive` lands mid-range (0.528) rather than near the top. Those are the disagreements this
+# arousal about as this table predicts at the extremes — `energetic` highest at 0.672, `romantic`
+# lowest at 0.317 — with two clear disagreements. Tracks the engine calls `tense` sit at 0.319,
+# among the three LOWEST of any mood, where the circumplex puts tense high; and `aggressive` lands
+# mid-range at 0.528 rather than near the top. Read the first with its sample size: only 10 of the
+# 400 tracks were labelled `tense`, against 36 for `aggressive`. Those are the disagreements this
 # table exists to surface; do not silently "fix" them by moving the coordinates to match.
 MOOD_AFFECT: dict[str, tuple[float, float, str]] = {
     # mood: (valence, arousal, kind)
@@ -698,6 +702,33 @@ def label_tracks(
     )
 
 
+def _resolve_axis_matrix(
+    clap_embedder: SupportsEmbedText,
+    axis_prompts: dict[str, list[str]],
+    label_matrix: tuple[list[str], np.ndarray] | None,
+    poles: list[str],
+) -> NDArray[np.float32]:
+    """The ``(2, d)`` pole matrix for a two-pole axis, built or taken from the caller.
+
+    Shared by :func:`score_axis` and :func:`axis_prior` so the two-pole contract is enforced on
+    every entry point that accepts a prebuilt matrix. Without the width check, handing over a
+    vocabulary of another width — the 18-mood matrix, say — returns a plausible value in [0, 1]
+    with no error at all, and the adjacent ``energy_matrix=`` / ``valence_matrix=`` parameters
+    make that a one-token slip. The check is on the WIDTH, not the pole names: a caller may
+    legitimately score a custom two-pole axis whose names differ from the shipped table.
+    """
+    if label_matrix is None:
+        label_matrix = build_label_matrix(clap_embedder, axis_prompts)
+    matrix = np.asarray(label_matrix[1], dtype=np.float32)  # (2, d): [neg, pos]
+    if matrix.ndim != 2 or matrix.shape[0] != 2:
+        raise ValueError(
+            f"label_matrix must hold exactly 2 pole vectors for axis {poles}; got shape "
+            f"{matrix.shape}. Build it from the SAME two-pole vocabulary you are scoring "
+            "(e.g. ENERGY_PROMPTS for the energy axis)."
+        )
+    return matrix
+
+
 def score_axis(
     audio_embs: np.ndarray,
     clap_embedder: SupportsEmbedText,
@@ -727,9 +758,7 @@ def score_axis(
     X = np.asarray(audio_embs, dtype=np.float32)
     if X.ndim == 1:
         X = X[None, :]
-    if label_matrix is None:
-        label_matrix = build_label_matrix(clap_embedder, axis_prompts)
-    matrix = np.asarray(label_matrix[1], dtype=np.float32)  # (2, d): [neg, pos]
+    matrix = _resolve_axis_matrix(clap_embedder, axis_prompts, label_matrix, poles)
     sims = X @ matrix.T  # (n, 2)
     sims = recenter_similarities(sims, enable=recenter, prior=prior)
     probs = softmax(sims, temperature=temperature, axis=1)
@@ -755,9 +784,8 @@ def axis_prior(
     X = np.asarray(audio_embs, dtype=np.float32)
     if X.ndim == 1:
         X = X[None, :]
-    if label_matrix is None:
-        label_matrix = build_label_matrix(clap_embedder, axis_prompts)
-    return label_prior(X @ np.asarray(label_matrix[1], dtype=np.float32).T)
+    matrix = _resolve_axis_matrix(clap_embedder, axis_prompts, label_matrix, list(axis_prompts))
+    return label_prior(X @ matrix.T)
 
 
 def attribute_priors(
