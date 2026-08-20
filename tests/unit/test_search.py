@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 
 import numpy as np
+import pytest
 from assertpy import assert_that
 
+import moodengine.search as search
 from moodengine.search import (
     _camelot_harm,
     _tempo_compat,
@@ -901,3 +903,23 @@ def test_assume_normalized_actually_skips_the_renormalization():
 
     np.testing.assert_allclose(np.diag(S), [4.0, 9.0], atol=1e-6)  # raw <x, x> = ||x||²
     np.testing.assert_allclose(np.diag(similarity_matrix(X)), 1.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("threshold", [0.5, 0.9, 0.99])
+def test_near_duplicate_pairs_blockwise_equals_single_block(monkeypatch, threshold) -> None:
+    """The row slab now spans only columns j >= start, since every kept pair has j > i >= start.
+    That is a work reduction, not a semantic one: forcing a tiny block size that never divides n
+    evenly must give the same pairs, in the same order, as the single-slab scan."""
+    rng = np.random.default_rng(11)
+    X = rng.standard_normal((37, 6)).astype(np.float32)
+    X[3] = X[2] + 1e-5  # a genuine near-duplicate so the result is not trivially empty
+    names = [f"{i}.wav" for i in range(37)]
+
+    full = near_duplicate_pairs(X, names, threshold=threshold)  # n < block → one slab
+    monkeypatch.setattr(search, "_NEARDUP_BLOCK_ROWS", 5)
+    chunked = near_duplicate_pairs(X, names, threshold=threshold)
+
+    assert_that([(a, b) for a, b, _ in chunked]).is_equal_to([(a, b) for a, b, _ in full])
+    np.testing.assert_allclose(
+        [c for _, _, c in chunked], [c for _, _, c in full], rtol=0.0, atol=2e-6
+    )

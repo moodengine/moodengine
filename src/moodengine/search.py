@@ -76,23 +76,27 @@ def near_duplicate_pairs(
         return []
     Xn = X if assume_normalized else _l2_normalize(X, axis=1)
     thr = float(threshold)
-    cols = np.arange(n)
 
     ii_parts: list[np.ndarray] = []
     jj_parts: list[np.ndarray] = []
     cc_parts: list[np.ndarray] = []
     for start in range(0, n, _NEARDUP_BLOCK_ROWS):
         stop = min(start + _NEARDUP_BLOCK_ROWS, n)
-        sims = Xn[start:stop] @ Xn.T  # (block, n) — the only large allocation
+        # Only columns j > i survive the triangle below, and every row of this slab has
+        # i >= start — so columns 0..start-1 are provably dead. Multiplying and scanning them
+        # was the bulk of the cost on a large library; the slab is (block, n - start), not
+        # (block, n), and shrinks as the scan advances.
+        sims = Xn[start:stop] @ Xn[start:].T  # (block, n - start) — the only large allocation
         # Strict upper triangle → no self, no (b, a) twin; matches scan the block row-major, so the
         # accumulated pairs stay in ascending (i, j) order and the stable sort below is deterministic
         # for a given block size. (Cosines can differ from a full-matrix scan at float32-ULP level —
         # BLAS accumulation order depends on the slab shape.)
-        keep = (sims >= thr) & (cols[None, :] > np.arange(start, stop)[:, None])
+        local_cols = np.arange(start, n)
+        keep = (sims >= thr) & (local_cols[None, :] > np.arange(start, stop)[:, None])
         r, j = np.nonzero(keep)
         if r.size:
             ii_parts.append(r + start)
-            jj_parts.append(j)
+            jj_parts.append(j + start)
             cc_parts.append(sims[r, j])
 
     if not ii_parts:
