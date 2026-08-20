@@ -96,6 +96,13 @@ run (all jobs), at least one approving review, resolved conversations, and a lin
 (squash merge). Keep commit messages conventional — the squash-merge title becomes the
 changelog entry.
 
+CI includes a SonarQube Cloud analysis, and its Quality Gate fails the run when it goes red.
+The gate grades *new* code — everything since the previous release — so a PR is judged on
+what it adds rather than on what it inherited. Analysis settings live in
+`sonar-project.properties` at the repo root, so changing them is a reviewed change like any
+other. Pull requests from forks skip that job: the analysis token is not exposed to them,
+and the code is analysed once the PR merges.
+
 ## Conduct and security
 
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md) (Contributor

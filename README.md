@@ -1,6 +1,8 @@
 # moodengine
 
 [![CI](https://github.com/moodengine/moodengine/actions/workflows/ci.yml/badge.svg)](https://github.com/moodengine/moodengine/actions/workflows/ci.yml)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=moodengine_moodengine&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=moodengine_moodengine)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=moodengine_moodengine&metric=coverage)](https://sonarcloud.io/component_measures?id=moodengine_moodengine&metric=coverage)
 [![License: PolyForm NC 1.0.0](https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
