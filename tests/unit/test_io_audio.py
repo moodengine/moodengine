@@ -13,7 +13,7 @@ from assertpy import assert_that
 from moodengine.config import default_config
 from moodengine.exceptions import AudioDecodeError
 from moodengine.io_audio import (
-    _capped_indices,
+    capped_indices,
     discover_audio_files,
     load_audio,
     segment_waveform,
@@ -175,14 +175,14 @@ def _ramp_windows(sr: int, n_windows: int) -> np.ndarray:
 
 def test_capped_indices_no_cap_returns_all() -> None:
     """No cap needed (count <= cap, or cap <= 0) -> every index is kept, unchanged."""
-    assert_that(_capped_indices(5, 10, "uniform")).is_equal_to([0, 1, 2, 3, 4])
-    assert_that(_capped_indices(5, 0, "head")).is_equal_to([0, 1, 2, 3, 4])
+    assert_that(capped_indices(5, 10, "uniform")).is_equal_to([0, 1, 2, 3, 4])
+    assert_that(capped_indices(5, 0, "head")).is_equal_to([0, 1, 2, 3, 4])
 
 
 def test_capped_indices_head_keeps_first_uniform_spreads() -> None:
     """head -> the first ``cap``; uniform -> ``cap`` windows spread across the whole track."""
-    assert_that(_capped_indices(10, 3, "head")).is_equal_to([0, 1, 2])
-    assert_that(_capped_indices(10, 3, "uniform")).is_equal_to([0, 4, 9])  # linspace(0,9,3) rounded
+    assert_that(capped_indices(10, 3, "head")).is_equal_to([0, 1, 2])
+    assert_that(capped_indices(10, 3, "uniform")).is_equal_to([0, 4, 9])  # linspace(0,9,3) rounded
 
 
 def test_segment_waveform_cap_head_keeps_first_n() -> None:

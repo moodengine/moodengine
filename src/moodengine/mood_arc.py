@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from moodengine.config import Config
-from moodengine.io_audio import _capped_indices, segment_waveform
+from moodengine.io_audio import capped_indices, segment_waveform
 from moodengine.labeling import (
     DEFAULT_TEMPERATURE,
     l2_normalize,
@@ -159,7 +159,7 @@ def segment_bounds(n_samples: int, sr: int, config: Config) -> list[tuple[float,
         spans.append((0, n))
 
     cap = config.max_segments_per_track
-    keep = _capped_indices(len(spans), cap, config.segment_selection)
+    keep = capped_indices(len(spans), cap, config.segment_selection)
     if len(keep) != len(spans):
         spans = [spans[i] for i in keep]
 

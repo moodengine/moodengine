@@ -211,7 +211,7 @@ def test_segment_bounds_respects_cap():
 
 def test_segment_bounds_uniform_cap_selects_same_windows_as_the_pool():
     """Under a biting cap + uniform selection, the displayed bounds are the SAME windows the pool
-    keeps (both route through io_audio._capped_indices), so a mood arc lines up with the track
+    keeps (both route through io_audio.capped_indices), so a mood arc lines up with the track
     vector — and they cover the whole track, not just the first N seconds."""
     cfg = _fine_config(max_segments_per_track=3, segment_selection="uniform")
     sr, n = _SR, _SR * 10  # 10 one-second windows, keep 3 spread across: seconds 0, 4, 9

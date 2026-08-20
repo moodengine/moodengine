@@ -108,7 +108,7 @@ def fit_projection(X: np.ndarray, config: Config) -> tuple[np.ndarray, object]:
     return the PCA/first-dims fallback with an identity reducer. Deterministic for a fixed ``config.seed``.
     """
     X = ensure_finite_2d(X, name="X")
-    method = getattr(config, "projection_method", "umap")
+    method = config.projection_method
     n_samples = X.shape[0]
 
     if n_samples < max(config.umap_n_neighbors, 4):
@@ -820,7 +820,7 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
         # embeddings). Exposed rather than decided because measurement does not settle which wins —
         # the reduced space recovers overlapping blobs better in some regimes and worse in others.
         # It does settle that cosine is degenerate on a layout; see `cluster_spherical_kmeans`.
-        if getattr(config, "cluster_space", "reduced") == "original":
+        if config.cluster_space == "original":
             cluster_input = X
         else:
             cluster_input, _ = reduce_umap(X, config.umap_n_components_cluster, config)
@@ -840,7 +840,7 @@ def run_clustering(X: np.ndarray, method: ClusterMethod, config: Config) -> Clus
     # fit to separate these very points, so the number is circular and reads as real structure even
     # on pure noise. The original-space score is the one a reader can act on, so it ships on every
     # result rather than only inside `compare_spaces`, which was its sole caller.
-    clustered_original = tiny or getattr(config, "cluster_space", "reduced") == "original"
+    clustered_original = tiny or config.cluster_space == "original"
     metrics["silhouette_space"] = "original" if clustered_original else "reduced"
     # Always computed through silhouette_original, INCLUDING on the tiny path where the two spaces
     # coincide. Reusing metrics["silhouette"] there would look free but silently change the metric:
@@ -1109,13 +1109,13 @@ def bootstrap_stability(
     X = np.asarray(X, dtype=np.float32)
     n = X.shape[0]
     if n_boot is None:
-        n_boot = int(getattr(config, "bootstrap_n", 50))
+        n_boot = int(config.bootstrap_n)
 
     # Mirror BOTH paths on which run_clustering clusters the raw embeddings: a tiny input (UMAP
     # skipped) and `cluster_space="original"`. Reducing here when the pipeline does not would
     # score a partition that never ships — the one thing a stability number must not do.
     tiny = n < max(config.umap_n_neighbors, 4)
-    clusters_original = tiny or getattr(config, "cluster_space", "reduced") == "original"
+    clusters_original = tiny or config.cluster_space == "original"
     space_name: ClusterSpace = "original" if clusters_original else "reduced"
 
     zeros: StabilityMetrics = {

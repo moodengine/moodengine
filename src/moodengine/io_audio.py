@@ -20,7 +20,7 @@ from moodengine.exceptions import AudioDecodeError
 PathLike = Union[str, Path]
 
 
-def _capped_indices(count: int, cap: int, selection: SegmentSelection) -> list[int]:
+def capped_indices(count: int, cap: int, selection: SegmentSelection) -> list[int]:
     """Indices of the windows kept when a ``count``-window track exceeds ``cap`` windows.
 
     ``"head"`` keeps the first ``cap`` (the pre-1.0 behavior); ``"uniform"`` keeps up to ``cap``
@@ -106,7 +106,7 @@ def segment_waveform(waveform: np.ndarray, sr: int, config: Config) -> list[np.n
         segments.append(wav.copy())
 
     cap = config.max_segments_per_track
-    keep = _capped_indices(len(segments), cap, config.segment_selection)
+    keep = capped_indices(len(segments), cap, config.segment_selection)
     if len(keep) != len(segments):
         segments = [segments[i] for i in keep]
 

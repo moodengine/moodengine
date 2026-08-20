@@ -204,10 +204,10 @@ def _embedding_cache_extra(embedder, config: Config) -> str:
     or the 24 kHz MERT rate mints a new key instead of silently reusing another setting's vectors.
     """
     extra = f"{config.pooling_mode}_seg{int(config.segment_seconds)}"
-    layer_mode = getattr(config, "mert_layer_weighting", "uniform")
+    layer_mode = config.mert_layer_weighting
     if layer_mode != "uniform":
         extra = f"{extra}_lw-{layer_mode}"
-        layers = getattr(config, "mert_layers", None)
+        layers = config.mert_layers
         if layers:
             extra = f"{extra}-{'.'.join(str(int(i)) for i in layers)}"
     variant = _model_variant_tag(embedder.name, config)
