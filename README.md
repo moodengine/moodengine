@@ -81,7 +81,7 @@ interpreter. Set `requires-python = ">=3.11,!=3.14.1"` (or Poetry's
 |---|---|---|
 | *(none)* | clustering, labeling math, search, eval, viz on precomputed embeddings | numpy/pandas/sklearn/umap/hdbscan/librosa/plotly |
 | `[models]` | embedding real audio with MERT + CLAP | torch, transformers, laion-clap (~GBs, downloads model checkpoints on first use) |
-| `[muq]` | the MuQ-MuLan audio↔text backbone (`embedder="mulan"`) — an alternative to CLAP, not a replacement | muq (needs `[models]` too; weights are CC-BY-NC-4.0, ~5 GB across three hub repos) |
+| `[muq]` | the MuQ-MuLan audio↔text backbone (`embedder_name="mulan"`) — an alternative to CLAP, not a replacement | muq (needs `[models]` too; weights are CC-BY-NC-4.0, ~5 GB across three hub repos) |
 | `[ot]` | optimal-transport journey morphing | POT |
 | `[cluster-graph]` | Leiden community detection | leidenalg, python-igraph |
 | `[pacmap]` | PaCMAP 2-D projection (`projection_method="pacmap"`) | pacmap |
@@ -132,8 +132,10 @@ cluster. The gold-labeling UI (`label_ui.html`) is not part of the pipeline —
 `scripts/05_evaluate.py` writes it, via `viz.build_labeling_ui`.
 
 The clustering space and the labeling model are independent: cluster with
-`embedder_name="mert"`, `"clap"` or `"fused"` — zero-shot labels always come
-from CLAP. Device is auto-detected (CUDA > Apple MPS > CPU). On Apple Silicon,
+`embedder_name="mert"`, `"clap"`, `"mulan"` or `"fused"` — zero-shot labels always
+come from CLAP, including under `"mulan"`, which has its own text tower but is not used
+for labeling here (compare the two text paths with
+`scripts/bench_valence_arousal.py --zeroshot-embedder`). Device is auto-detected (CUDA > Apple MPS > CPU). On Apple Silicon,
 export `PYTORCH_ENABLE_MPS_FALLBACK=1` so any op unsupported by MPS falls back
 to CPU instead of crashing.
 
@@ -162,7 +164,7 @@ to CPU instead of crashing.
 | `mood_arc` | within-track mood trajectory: segment bounds, per-segment embeddings and arc scoring |
 | `novelty`, `signals`, `sequence`, `journey`, `adapt`, `explain`, `feedback` | OOD/near-duplicate detection, BPM/key signals, next-track models, playlist morphing, metric adapters, SHAP explanations, feedback loops |
 | `viz` | self-contained HTML dashboard/scatters, annotation UI, playlist export |
-| `pipeline` | end-to-end orchestration with caching (the only module that writes files) |
+| `pipeline` | end-to-end orchestration with caching (the only module that writes files on its own; `viz` writes only when handed an explicit `out_html`) |
 
 Practical guidance from our own evaluations: cluster in the **CLAP or fused**
 space rather than MERT alone (bootstrap stability strongly favors them), and

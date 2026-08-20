@@ -2,7 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "moodengine"
-abstract: "Music mood embedding, clustering and zero-shot labeling engine (MERT + CLAP): audio to embeddings, mood clusters, calibrated zero-shot labels, search and evaluation."
+abstract: "Music mood embedding, clustering and zero-shot labeling engine (MERT, CLAP and MuQ-MuLan): audio to embeddings, mood clusters, calibrated zero-shot labels, search and evaluation."
 authors:
   - family-names: Pasco
     given-names: Aymeric
