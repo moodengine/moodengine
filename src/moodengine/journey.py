@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from moodengine.exceptions import MissingDependencyError
-from moodengine.pooling import l2_normalize
+from moodengine._math import l2_normalize
 
 
 def path_between(v_a: np.ndarray, v_b: np.ndarray, n: int = 8, *, eps: float = 1e-8) -> np.ndarray:

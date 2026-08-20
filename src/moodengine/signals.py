@@ -301,7 +301,6 @@ def extract_signals(y: np.ndarray, sr: int) -> SignalSet:
 #       (spectral clustering); Nieto & Bello, MSAF (reference recipe, not bundled).
 # --------------------------------------------------------------------------------------------------
 
-_STRUCT_SR: int = 22_050  # documentation: callers should decode at this rate for chroma analysis
 _STRUCT_KERNEL: int = 64  # Foote checkerboard kernel size (beat-sync frames); capped to the SSM
 _STRUCT_MAX_LABELS: int = 6  # upper bound on distinct section clusters
 _STRUCT_N_MFCC: int = 13
