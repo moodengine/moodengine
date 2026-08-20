@@ -700,6 +700,46 @@ def test_axis_prior_is_the_per_pole_mean_cosine(fake_clap) -> None:
     np.testing.assert_allclose(prior, (corpus @ matrix.T).mean(axis=0), atol=1e-6)
 
 
+def test_score_axis_rejects_a_label_matrix_of_the_wrong_width(fake_clap) -> None:
+    """A two-pole axis scored with an 18-mood matrix used to return `probs[:, 1]` — a plausible
+    value in [0, 1] — with no error. The adjacent `energy_matrix=` / `valence_matrix=` parameters
+    make that a one-token slip, and only the prior path happened to catch it."""
+    corpus = l2_normalize(
+        np.random.default_rng(21).standard_normal((6, 8)).astype(np.float32), axis=1
+    )
+    mood_lm = build_label_matrix(fake_clap, DEFAULT_MOOD_PROMPTS)
+
+    with pytest.raises(ValueError, match=r"exactly 2 pole vectors"):
+        score_axis(corpus, fake_clap, ENERGY_PROMPTS, label_matrix=mood_lm)
+
+
+def test_attribute_scores_rejects_a_swapped_width_matrix(fake_clap) -> None:
+    """The same guard reaches the public `attribute_scores` and `attribute_priors` entry points,
+    which is where a caller actually passes the matrices."""
+    corpus = l2_normalize(
+        np.random.default_rng(22).standard_normal((6, 8)).astype(np.float32), axis=1
+    )
+    mood_lm = build_label_matrix(fake_clap, DEFAULT_MOOD_PROMPTS)
+
+    with pytest.raises(ValueError, match=r"exactly 2 pole vectors"):
+        attribute_scores(corpus, fake_clap, energy_matrix=mood_lm)
+    with pytest.raises(ValueError, match=r"exactly 2 pole vectors"):
+        attribute_priors(corpus, fake_clap, valence_matrix=mood_lm)
+
+
+def test_score_axis_accepts_a_custom_two_pole_vocabulary(fake_clap) -> None:
+    """The guard checks the WIDTH, not the pole names: a caller may legitimately score a custom
+    two-pole axis whose names differ from the shipped prompt table."""
+    corpus = l2_normalize(
+        np.random.default_rng(23).standard_normal((6, 8)).astype(np.float32), axis=1
+    )
+    custom = build_label_matrix(fake_clap, {"quiet": ["a quiet track"], "loud": ["a loud track"]})
+
+    out = score_axis(corpus, fake_clap, ENERGY_PROMPTS, label_matrix=custom)
+
+    assert_that(out.shape).is_equal_to((6,))
+
+
 def test_axis_prior_accepts_a_single_row(fake_clap) -> None:
     """A 1-D input is promoted to one row rather than raising — same contract as ``score_axis``."""
     row = l2_normalize(np.random.default_rng(13).standard_normal(8).astype(np.float32), axis=0)
