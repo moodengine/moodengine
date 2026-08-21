@@ -1272,3 +1272,72 @@ def test_cluster_hierarchy_single_cluster_is_empty() -> None:
     assert_that(h0["cluster_ids"]).is_equal_to([])
     assert_that(h0["super_group_of"]).is_equal_to({})
     assert_that(h0["n_super_groups"]).is_equal_to(0)
+
+
+def test_sub_cluster_fits_kmeans_once_per_candidate_k_and_no_more(mocker) -> None:
+    """Pins the REUSE, which no assertion on the returned value can.
+
+    The k-sweep fits KMeans at every candidate k; the old code then re-fit at the winning k, a sixth
+    fit on top of five. Because that refit is deterministic it returns exactly the labels the sweep
+    already had — so the result is identical either way and only the call COUNT distinguishes them.
+    Asserting on the labels alone would leave the optimization free to be reverted silently."""
+    spy = mocker.spy(moodengine.cluster, "cluster_kmeans")
+    rng = np.random.default_rng(11)
+    centres = rng.standard_normal((4, 16)) * 4.0
+    X = (centres[rng.integers(0, 4, 240)] + rng.standard_normal((240, 16)) * 0.4).astype(np.float32)
+
+    sub_cluster(X, default_config(), k_min=2, k_max=6)
+
+    assert_that(spy.call_count).is_equal_to(5)  # k = 2..6, and nothing after
+
+
+def test_sub_cluster_labels_equal_a_fresh_fit_at_the_same_k() -> None:
+    """Reusing the sweep's labels is valid only because `cluster_kmeans` is deterministic in
+    ``(X, k, config.seed)``. That is an assumption the reuse rests on, so it is asserted rather than
+    trusted."""
+    rng = np.random.default_rng(11)
+    centres = rng.standard_normal((4, 16)) * 4.0
+    X = (centres[rng.integers(0, 4, 240)] + rng.standard_normal((240, 16)) * 0.4).astype(np.float32)
+    config = default_config()
+
+    result = sub_cluster(X, config)
+
+    assert_that(
+        np.array_equal(result["sub_labels"], cluster_kmeans(X, result["sub_k"], config))
+    ).is_true()
+
+
+def test_sub_cluster_silhouette_matches_the_public_scorer() -> None:
+    """Both silhouette figures now come from one pairwise pass; they must not drift from it.
+
+    `sub_cluster` derives its overall score as the mean of the per-point samples the per-cluster
+    breakdown already computes, instead of calling `silhouette_original` separately — sklearn
+    defines `silhouette_score` as exactly that mean. Equality is asserted EXACTLY, not within a
+    tolerance, because the two really are the same arithmetic on the same values."""
+    rng = np.random.default_rng(12)
+    centres = rng.standard_normal((3, 24)) * 3.0
+    X = (centres[rng.integers(0, 3, 200)] + rng.standard_normal((200, 24)) * 0.5).astype(np.float32)
+
+    result = sub_cluster(X, default_config())
+
+    labels = result["sub_labels"]
+    assert_that(result["silhouette"]).is_equal_to(silhouette_original(X, labels, metric="cosine"))
+    assert_that(result["per_cluster_silhouette"]).is_equal_to(
+        per_cluster_silhouette(X, labels, metric="cosine")
+    )
+
+
+def test_sub_cluster_survives_a_subset_with_no_separable_k() -> None:
+    """When no k yields two distinct clusters the sweep scores nothing, so there is no fit to reuse.
+
+    All-identical rows are the reachable case — a parent mood whose members are duplicates or
+    re-encodes. The sweep then returns its fallback k with NO labels attached, and `sub_cluster`
+    has to cluster for itself; taking the missing labels at face value would crash here."""
+    X = np.ones((60, 12), dtype=np.float32)
+
+    result = sub_cluster(X, default_config())
+
+    assert_that(result["sub_labels"].shape).is_equal_to((60,))
+    assert_that(sorted(set(result["sub_labels"].tolist()))).is_equal_to([0])  # one sub-mood
+    assert_that(result["silhouette"]).is_none()  # undefined with a single cluster
+    assert_that(result["sub_k"]).is_equal_to(1)
