@@ -291,10 +291,18 @@ _TABLE_COLUMNS: tuple[str, ...] = (
 
 
 def _cell_str(value: object) -> str:
-    """Render a df cell as a compact, HTML-escaped string for a table cell."""
-    if value is None or (isinstance(value, float) and np.isnan(value)):
+    """Render a df cell as a compact, HTML-escaped string for a table cell.
+
+    ``np.floating`` is matched alongside ``float`` because ``np.float64`` IS a ``float`` subclass
+    and ``np.float32`` is not — so without it the same number renders as ``0.262`` from a float64
+    column and ``0.26161215`` from a float32 one, and a float32 NaN renders as the literal
+    ``'nan'`` where a float64 NaN renders as empty. This library is float32 end to end and
+    ``build_dashboard`` takes an arbitrary DataFrame, so both were reachable from a public entry
+    point. Formatting now depends on the VALUE, not on how pandas happened to box it.
+    """
+    if value is None or (isinstance(value, (float, np.floating)) and np.isnan(value)):
         return ""
-    if isinstance(value, float):
+    if isinstance(value, (float, np.floating)):
         text = f"{value:.3f}"
     elif isinstance(value, (list, tuple)):
         text = ", ".join(str(v) for v in value)
@@ -379,22 +387,36 @@ def build_dashboard(
     if show_audio:
         head_cells += "<th>preview</th>"
 
-    # Build the table body.
+    # Build the table body column-wise. `iterrows()` materializes a fresh Series per row, which is
+    # what this loop actually spends its time on once a library is more than a few hundred tracks.
+    #
+    # Which element type the columns yield no longer matters: `_cell_str` formats float32 and
+    # float64 identically, so `tolist()` (Python scalars, and the cheapest of the two) renders
+    # exactly what the row-wise path did. That equivalence is what the dtype fix in `_cell_str`
+    # buys — `iterrows()` unboxed to Python scalars on a MIXED frame but kept `np.float32` on a
+    # homogeneous one, so no single accessor reproduced it before.
     rows_html: list[str] = []
-    for _, row in df.iterrows():
-        cells = "".join(f"<td>{_cell_str(row.get(c))}</td>" for c in columns)
-        if show_audio:
-            path = row.get("path")
-            if path is not None and not (isinstance(path, float) and np.isnan(path)):
-                src = (
-                    _html.escape(Path(str(path)).as_uri())
-                    if Path(str(path)).is_absolute()
-                    else _html.escape(str(path))
-                )
-                cells += f'<td><audio controls preload="none" src="{src}"></audio></td>'
-            else:
-                cells += "<td></td>"
-        rows_html.append(f"<tr>{cells}</tr>")
+    if len(df):
+        per_col = [df[c].tolist() for c in columns]
+        cell_rows = (
+            ["".join(f"<td>{_cell_str(v)}</td>" for v in values) for values in zip(*per_col)]
+            if per_col  # a frame carrying none of _TABLE_COLUMNS still gets its rows
+            else [""] * len(df)
+        )
+        paths = df["path"].tolist() if show_audio else None
+        for i, cells in enumerate(cell_rows):
+            if paths is not None:
+                path = paths[i]
+                if path is not None and not (isinstance(path, float) and np.isnan(path)):
+                    src = (
+                        _html.escape(Path(str(path)).as_uri())
+                        if Path(str(path)).is_absolute()
+                        else _html.escape(str(path))
+                    )
+                    cells += f'<td><audio controls preload="none" src="{src}"></audio></td>'
+                else:
+                    cells += "<td></td>"
+            rows_html.append(f"<tr>{cells}</tr>")
     body_html = "\n".join(rows_html)
 
     page = f"""<!doctype html>

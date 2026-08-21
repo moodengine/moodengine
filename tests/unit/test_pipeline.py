@@ -1010,3 +1010,37 @@ def test_run_pipeline_core_empty_raw_dir_yields_empty_result_with_schema(tmp_con
     assert_that(result.have_labels).is_false()
     assert_that(result.coords2d.shape).is_equal_to((0, 2))
     assert_that(result.profiles).is_equal_to({})
+
+
+def test_build_hover_text_exact_strings() -> None:
+    """Nothing asserted anything about the hover strings; the integration test would catch a crash
+    or a mis-zip, not a wrong string. Covers the substitution for absent optional columns, an empty
+    mood list, NaN energy/valence, and a non-default index."""
+    df = pd.DataFrame(
+        {
+            "filename": ["a.wav", "b.wav", "c.wav"],
+            "mood_top3": [["calm", "dark"], [], ["hyped"]],
+            "mood_top3_scores": [[0.62, 0.31], [], [0.9]],
+            "energy": [0.5, float("nan"), 0.25],
+            "valence": [0.75, 0.4, float("nan")],
+        },
+        index=[7, 8, 9],  # a non-default index must not reach the output
+    )
+
+    hover = pipeline._build_hover_text(df)
+
+    assert_that(hover).is_equal_to(
+        [
+            "a.wav<br>moods: calm 62%, dark 31%<br>energy 0.50 · valence 0.75",
+            "b.wav",  # empty mood list AND NaN energy -> filename only
+            "c.wav<br>moods: hyped 90%",  # NaN valence drops the attribute line
+        ]
+    )
+
+
+def test_build_hover_text_without_the_optional_columns() -> None:
+    """A frame carrying only `filename` must yield bare filenames, not a KeyError: the column-wise
+    read substitutes a column of None where `row.get()` returned None for a missing key."""
+    df = pd.DataFrame({"filename": ["only.wav", "two.wav"]})
+
+    assert_that(pipeline._build_hover_text(df)).is_equal_to(["only.wav", "two.wav"])
