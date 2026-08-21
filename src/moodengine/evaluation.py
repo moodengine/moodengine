@@ -163,7 +163,13 @@ def load_gold(path) -> dict:
     if not p.is_file():
         return {}
     try:
-        data = json.loads(p.read_text())
+        # UTF-8 explicitly, matching `viz.build_labeling_ui`, which WRITES this file with
+        # encoding="utf-8". Reading it back with the platform default made the two disagree on
+        # Windows (cp1252): any non-cp1252 byte — an accented, CJK or emoji filename, which a music
+        # library has in abundance — raised UnicodeDecodeError. That is a subclass of ValueError,
+        # so the guard below swallowed it and returned {}, and the caller saw "no gold labels"
+        # instead of an error. Evaluation then scored against nothing, silently.
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
