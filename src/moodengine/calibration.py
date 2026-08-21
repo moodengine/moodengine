@@ -240,12 +240,37 @@ def _aps_scores(probs: np.ndarray, true_idx: np.ndarray, k_reg: int, lam_reg: fl
             f"{y[bad[:10]].tolist()}); conformal calibration needs a known true mood for every "
             "calibration row — drop the unlabelled rows before calling."
         )
-    order = np.argsort(-P, axis=1, kind="stable")  # moods sorted by prob descending
-    cum = np.cumsum(np.take_along_axis(P, order, axis=1), axis=1)
-    ranks = np.argmax(order == y[:, None], axis=1)  # 0-indexed position of the true mood
-    scores = cum[np.arange(P.shape[0]), ranks]
+    # Non-finite probabilities used to give two different answers to the same broken input: a NaN
+    # ranked below the true mood was silently dropped (argsort pushes NaN last, so the cumulative
+    # sum stopped before it) while a NaN ON the true mood produced NaN. Neither is usable, and the
+    # silent one is the dangerous half — a score missing mass yields a q̂ that is too SMALL, which
+    # is a wrong guarantee rather than a wrong number, exactly the reasoning behind the label guard
+    # above. Refused here instead, in float64: `_validation.ensure_finite_2d` casts to float32 and
+    # would quantize the probabilities this function sums.
+    finite = np.isfinite(P)
+    if not finite.all():
+        rows_bad = np.unique(np.nonzero(~finite)[0])
+        raise ValueError(
+            f"cal_probs contains {int((~finite).sum())} non-finite value(s) (NaN/Inf) in "
+            f"row(s) {rows_bad[:10].tolist()}{'...' if rows_bad.size > 10 else ''}; a conformal "
+            "score cannot be formed from them — drop or repair those rows before calibrating."
+        )
+
+    # The APS score is the probability mass of every mood ranked at least as high as the true one.
+    # `argsort(-P, kind="stable")` ranks by DESCENDING probability, breaking ties toward the SMALLER
+    # column index — so "outranks the true mood" is exactly "greater probability, or equal with a
+    # lower index". Evaluating that predicate directly is the same selection the sort produced, as
+    # a masked row sum: O(n·m) instead of O(n·m log m), and no (n, m) order/cumsum pair.
+    rows = np.arange(P.shape[0])
+    p_true = P[rows, y][:, None]
+    cols = np.arange(P.shape[1])[None, :]
+    outranks = (P > p_true) | ((P == p_true) & (cols <= y[:, None]))
+    scores = np.sum(P, axis=1, where=outranks)
     if lam_reg > 0.0:
-        scores = scores + lam_reg * np.maximum(0.0, (ranks + 1) - int(k_reg))
+        # The true mood is always inside the mask (equal probability, equal index), so the count is
+        # the 1-indexed rank the RAPS penalty wants.
+        rank_true = np.count_nonzero(outranks, axis=1)
+        scores = scores + lam_reg * np.maximum(0.0, rank_true - int(k_reg))
     return scores
 
 

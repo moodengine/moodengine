@@ -12,6 +12,7 @@ import pytest
 from assertpy import assert_that
 
 from moodengine.calibration import (
+    _aps_scores,
     aps_threshold,
     entropy,
     fit_temperature,
@@ -321,6 +322,77 @@ def test_raps_include_all_when_target_unattainable() -> None:
     assert_that(len(prediction_set(row, q, k_reg=0, lam_reg=0.5))).is_equal_to(
         m
     )  # every mood, not a truncated prefix
+
+
+def _aps_scores_by_sorting(probs, true_idx, k_reg=0, lam_reg=0.0):
+    """Reference APS score via an explicit stable argsort — the definition, written the slow way."""
+    P = np.asarray(probs, dtype=np.float64)
+    y = np.asarray(true_idx).astype(int).ravel()
+    order = np.argsort(-P, axis=1, kind="stable")
+    cum = np.cumsum(np.take_along_axis(P, order, axis=1), axis=1)
+    ranks = np.argmax(order == y[:, None], axis=1)
+    scores = cum[np.arange(P.shape[0]), ranks]
+    if lam_reg > 0.0:
+        scores = scores + lam_reg * np.maximum(0.0, (ranks + 1) - int(k_reg))
+    return scores
+
+
+@pytest.mark.parametrize("kind", ["all_uniform", "quarter_quantized"])
+def test_aps_score_reproduces_the_stable_sort_tie_rule(kind) -> None:
+    """The score is a masked row sum, and the mask has to reproduce the sort's tie-break exactly.
+
+    Every other fixture in this file uses continuous softmax rows, where exact ties never occur —
+    so nothing here would catch a tie-rule regression. `argsort(-P, kind='stable')` breaks a tie
+    toward the SMALLER column index, which the mask encodes as ``(P == p_true) & (cols <= y)``.
+    These two fixtures are nothing but ties."""
+    n, m = 200, 12
+    rng = np.random.default_rng(19)
+    if kind == "all_uniform":
+        probs = np.full((n, m), 1.0 / m)  # every mood tied with every other
+    else:
+        counts = rng.integers(0, 5, (n, m)).astype(np.float64)
+        counts[:, 0] = np.maximum(counts[:, 0], 1.0)  # never an all-zero row
+        probs = counts / counts.sum(axis=1, keepdims=True)  # quarters -> many exact ties
+    labels = rng.integers(0, m, n)
+
+    got = _aps_scores(probs, labels, 0, 0.0)
+
+    np.testing.assert_allclose(got, _aps_scores_by_sorting(probs, labels), rtol=0.0, atol=1e-12)
+
+
+def test_raps_rank_penalty_reaches_the_scores() -> None:
+    """The RAPS penalty must be exercised where it changes a SCORE, not only where q̂ is +inf.
+
+    `test_raps_include_all_when_target_unattainable` takes the k>n branch and returns +inf before
+    the scores are used, so the ``lam_reg·max(0, rank − k_reg)`` term itself was unpinned. Here the
+    sample is large enough that q̂ is a real quantile, and the penalty has to lift the scores of
+    rows whose true mood ranks beyond k_reg."""
+    probs, labels = _aps_synthetic(seed=11, n=400, m=10)
+
+    plain = _aps_scores(probs, labels, 0, 0.0)
+    penalised = _aps_scores(probs, labels, 2, 0.5)
+
+    ranks = np.count_nonzero(probs > probs[np.arange(len(labels)), labels][:, None], axis=1) + 1
+    expected = plain + 0.5 * np.maximum(0.0, ranks - 2)
+    np.testing.assert_allclose(penalised, expected, rtol=0.0, atol=1e-12)
+    assert_that(int(np.count_nonzero(penalised > plain))).is_greater_than(0)  # non-vacuous
+    assert_that(float(aps_threshold(probs, labels, 0.9, k_reg=2, lam_reg=0.5))).is_greater_than(
+        float(aps_threshold(probs, labels, 0.9))
+    )
+
+
+def test_aps_threshold_rejects_non_finite_probabilities() -> None:
+    """A NaN row cannot produce a conformal score, and silently dropping it understates q̂.
+
+    The sorted form gave two different answers to the same broken input — a NaN ranked below the
+    true mood vanished from the cumulative sum, a NaN ON the true mood produced NaN — and the
+    silent half is the dangerous one: a score missing mass yields a q̂ that is too small, i.e. a
+    wrong guarantee rather than a wrong number. Same reasoning as the out-of-range label guard."""
+    probs, labels = _aps_synthetic(seed=12, n=20, m=6)
+    probs[3, 2] = np.nan
+
+    with pytest.raises(ValueError, match="non-finite"):
+        aps_threshold(probs, labels, coverage_target=0.9)
 
 
 def test_calibration_module_is_torch_free() -> None:
