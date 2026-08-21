@@ -22,13 +22,24 @@ fallback for the temperature fit, so the module import stays light and torch-fre
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 
 import numpy as np
 
 
+#: Probability floor before the log in :func:`negative_log_likelihood`. Named because
+#: :func:`fit_temperature` has to reproduce it in a form where it is a CEILING on the loss rather
+#: than a floor on the probability, and the two must not drift.
+_PROB_FLOOR: float = 1e-12
+
+
 def _softmax_T(logits: np.ndarray, temperature: float) -> np.ndarray:
-    """Row-wise softmax of ``logits / temperature`` (numerically stable). Internal helper so the fit
-    and the callers share one definition."""
+    """Row-wise softmax of ``logits / temperature`` (numerically stable).
+
+    The readable reference for the temperature objective. :func:`fit_temperature` no longer calls it
+    — it evaluates the same quantity in logsumexp form, without materializing this matrix — so this
+    stays as the definition that form is TESTED against. Deleting it would leave the fast path with
+    nothing to check it against."""
     z = np.asarray(logits, dtype=np.float64) / float(temperature)
     z = z - z.max(axis=1, keepdims=True)
     e = np.exp(z)
@@ -42,14 +53,48 @@ def negative_log_likelihood(probs: np.ndarray, labels: np.ndarray) -> float:
     Returns ``0.0`` on empty input. Never raises. The clip guards ``log(0)`` for a class the model
     assigned zero mass.
     """
-    P = np.asarray(probs, dtype=np.float64)
+    # Gathered in the INPUT dtype, then promoted: only the n true-class probabilities become
+    # float64, not the whole (n, n_classes) block. `labeling.softmax` returns float32, so an
+    # `np.asarray(probs, dtype=np.float64)` here doubled a matrix to read one value per row —
+    # 10.9 MB against 0.6 MB at (20 000, 64). The promotion is exact, so the result is unchanged.
+    P = np.asarray(probs)
     y = np.asarray(labels).astype(int).ravel()
     n = min(P.shape[0], y.shape[0]) if P.ndim == 2 else 0
     if n == 0:
         return 0.0
     idx = np.clip(y[:n], 0, P.shape[1] - 1)
-    p = np.clip(P[np.arange(n), idx], 1e-12, 1.0)
+    p = np.clip(np.asarray(P[np.arange(n), idx], dtype=np.float64), _PROB_FLOOR, 1.0)
     return float(-np.mean(np.log(p)))
+
+
+def _temperature_objective(L: np.ndarray, y: np.ndarray) -> Callable[[float], float]:
+    """Build ``T -> NLL(softmax(L / T))`` at the true class, with everything T-independent hoisted.
+
+    Equivalent to ``negative_log_likelihood(_softmax_T(L, T), y)`` — that is the readable definition
+    and what this is tested against — but evaluated as
+    ``-log p_i == log Σ_j exp(gap_ij / T) - gap_iy / T``, so the row maxima, the stable shift and the
+    true-class gather are computed ONCE rather than on every call. The minimizer evaluates this ~30
+    times under scipy and ~400 times under the golden-section fallback.
+
+    Returned closure is NOT REENTRANT: it reuses one scratch buffer across calls. That is fine for a
+    sequential scalar minimizer and would break the moment anything evaluated it in parallel.
+    """
+    gap = L - L.max(axis=1, keepdims=True)  # (n, m), <= 0
+    true_gap = gap[np.arange(L.shape[0]), np.clip(y, 0, L.shape[1] - 1)]  # (n,)
+    buf = np.empty_like(gap)
+    ceiling = -np.log(_PROB_FLOOR)
+
+    def objective(temp: float) -> float:
+        np.divide(gap, temp, out=buf)
+        np.exp(buf, out=buf)
+        per_row = np.log(buf.sum(axis=1)) - true_gap / temp
+        # `negative_log_likelihood` floors the probability at _PROB_FLOOR before the log, which HERE
+        # is a CEILING on the per-row loss. Transcribing it is load-bearing, not cosmetic: at small T
+        # the gaps blow past it and, without the ceiling, this keeps climbing where the reference has
+        # flattened — which moves the fitted T.
+        return float(np.mean(np.minimum(per_row, ceiling)))
+
+    return objective
 
 
 def fit_temperature(
@@ -73,8 +118,7 @@ def fit_temperature(
     L, y = L[:n], y[:n]
     lo, hi = float(bounds[0]), float(bounds[1])
 
-    def _nll(temp: float) -> float:
-        return negative_log_likelihood(_softmax_T(L, temp), y)
+    _nll = _temperature_objective(L, y)
 
     try:
         from scipy.optimize import minimize_scalar
@@ -114,24 +158,29 @@ def reliability_diagram(
     if n == 0:
         return []
     conf, corr = conf[:n], corr[:n]
-    edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
-    idx = np.clip(np.digitize(conf, edges[1:-1], right=False), 0, int(n_bins) - 1)
-    out: list[dict] = []
-    for b in range(int(n_bins)):
-        mask = idx == b
-        count = int(mask.sum())
-        if count == 0:
-            continue
-        out.append(
-            {
-                "bin_lo": float(edges[b]),
-                "bin_hi": float(edges[b + 1]),
-                "count": count,
-                "mean_confidence": float(conf[mask].mean()),
-                "accuracy": float(corr[mask].mean()),
-            }
-        )
-    return out
+    nb = int(n_bins)
+    if nb < 1:
+        # The per-bin loop this replaced simply never ran for nb <= 0 and returned []. The bincounts
+        # below would instead reject the -1 that `np.clip(..., 0, nb - 1)` produces, so the empty
+        # case is handled here rather than becoming a crash.
+        return []
+    edges = np.linspace(0.0, 1.0, nb + 1)
+    idx = np.clip(np.digitize(conf, edges[1:-1], right=False), 0, nb - 1)
+    # Three grouped reductions instead of a boolean mask per bin: O(n) rather than O(n_bins · n),
+    # which is what makes a fine-grained diagram affordable.
+    counts = np.bincount(idx, minlength=nb)
+    conf_sums = np.bincount(idx, weights=conf, minlength=nb)
+    corr_sums = np.bincount(idx, weights=corr, minlength=nb)
+    return [
+        {
+            "bin_lo": float(edges[b]),
+            "bin_hi": float(edges[b + 1]),
+            "count": int(counts[b]),
+            "mean_confidence": float(conf_sums[b] / counts[b]),
+            "accuracy": float(corr_sums[b] / counts[b]),
+        }
+        for b in np.flatnonzero(counts)  # ascending, so occupied bins keep their order
+    ]
 
 
 def platt_scale(confidences: np.ndarray, correct: np.ndarray) -> tuple[float, float]:
