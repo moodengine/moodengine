@@ -6,6 +6,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+# uv itself is pinned, like every action is. Given no version, setup-uv fetches a manifest from
+# raw.githubusercontent.com on EVERY job to discover "latest": an unpinned network call per job,
+# and the thing that took a whole run down with a bare "fetch failed" in the coverage job. An
+# EXACT version skips that resolution entirely — and it is also what makes the download verified,
+# because setup-uv falls back to the checksum table baked into the action, and for a version that
+# table does not know it SKIPS VALIDATION SILENTLY rather than failing. So the version must be one
+# the pinned action knows: 0.11.27 is the newest in v8.3.1's table. Bump this and the setup-uv SHA
+# together, or the pin quietly stops being verified.
+env:
+  UV_VERSION: "0.11.27"
+
 permissions:
   contents: read
 
@@ -28,6 +39,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python }}
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -53,6 +65,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -104,6 +117,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -138,6 +152,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.11"
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -168,6 +183,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -191,6 +207,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
       - name: Check commit messages
         run: >
           uvx --from commitizen cz check
@@ -251,6 +269,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
