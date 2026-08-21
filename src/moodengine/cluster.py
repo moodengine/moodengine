@@ -383,6 +383,43 @@ def _kpp_cosine_init(Xn: np.ndarray, k: int, rng: np.random.Generator) -> list[i
 _DEGENERATE_COSINE_MEAN: float = 0.9
 
 
+#: Element cap on the ``(n, k)`` one-hot behind the centroid update. ``Config`` bounds
+#: ``kmeans_n_clusters`` only at ``>= 1`` and ``k`` is clamped to ``n``, so ``k == n`` is reachable
+#: — and the one-hot would then be a dense ``(n, n)`` float32, 1.6 GB at 20 000 tracks, exactly the
+#: allocation the hot-path rules forbid. Past this cap the update sorts once and reduces contiguous
+#: slices instead, which costs no memory in ``k`` at all and beats the per-cluster mask loop there.
+#: 16M elements is 64 MiB, i.e. k up to 800 at n = 20 000.
+_ONEHOT_MAX_ELEMENTS: int = 16 * 1024 * 1024
+
+
+def _spherical_centroid_update(Xn: np.ndarray, labels: np.ndarray, C: np.ndarray, k: int) -> None:
+    """Re-seat every spherical k-means centroid on the unit mean of its members, in place.
+
+    One BLAS call replaces the per-cluster ``Xn[labels == j]`` gather: the one-hot's transpose times
+    ``Xn`` is every cluster sum at once. A cluster that is EMPTY, or whose mean is exactly zero,
+    keeps the centroid it had — the emptied-cluster rule the loop this replaces relied on to keep
+    ``k`` distinct centers alive."""
+    counts = np.bincount(labels, minlength=k)
+    if labels.shape[0] * k <= _ONEHOT_MAX_ELEMENTS:
+        one_hot = np.zeros((labels.shape[0], k), dtype=np.float32)
+        one_hot[np.arange(labels.shape[0]), labels] = 1.0
+        sums = one_hot.T @ Xn
+    else:
+        order = np.argsort(labels, kind="stable")
+        bounds = np.concatenate(([0], np.cumsum(counts)))
+        sums = np.zeros((k, Xn.shape[1]), dtype=np.float32)
+        rows = Xn[order]
+        for j in range(k):
+            if counts[j]:
+                sums[j] = rows[bounds[j] : bounds[j + 1]].sum(axis=0)
+    filled = counts > 0
+    means = sums[filled] / counts[filled][:, None]
+    norms = np.linalg.norm(means, axis=1)
+    usable = norms > 0
+    target = np.flatnonzero(filled)[usable]
+    C[target] = means[usable] / norms[usable][:, None]
+
+
 def cluster_spherical_kmeans(
     X: np.ndarray, n_clusters: int, config: Config, max_iter: int = 100, n_init: int = 10
 ) -> np.ndarray:
@@ -414,7 +451,10 @@ def cluster_spherical_kmeans(
 
     # Sampled above ~2k rows: this is a diagnostic, and the full block is O(n²).
     probe = Xn if n <= 2000 else Xn[np.random.default_rng(config.seed).choice(n, 2000, False)]
-    mean_cos = float((probe @ probe.T).mean())
+    # mean(P @ Pᵀ) == ‖Σp‖² / m², because summing every pairwise dot is the dot of the sums. Same
+    # number, without materializing the (2000, 2000) gram the mean immediately collapsed.
+    probe_sum = probe.sum(axis=0, dtype=np.float64)
+    mean_cos = float(probe_sum @ probe_sum) / float(probe.shape[0]) ** 2
     if mean_cos > _DEGENERATE_COSINE_MEAN:
         logger.warning(
             "spherical k-means on a space whose mean pairwise cosine is %.3f: every pair is "
@@ -433,14 +473,7 @@ def cluster_spherical_kmeans(
             if np.array_equal(new_labels, labels):
                 break
             labels = new_labels
-            for j in range(k):
-                members = Xn[labels == j]
-                if members.shape[0] == 0:
-                    continue  # keep the (distinct) init center for an emptied cluster
-                mean = members.mean(axis=0)
-                norm = float(np.linalg.norm(mean))
-                if norm > 0:
-                    C[j] = mean / norm
+            _spherical_centroid_update(Xn, labels, C, k)
         # Objective: total cosine of each point to its own centroid — what the assignment maximizes.
         score = float(np.sum(Xn * C[labels], dtype=np.float64))
         if score > best_score:
@@ -1044,11 +1077,12 @@ def outlier_scores(X: np.ndarray, labels: np.ndarray) -> np.ndarray:
         member_idx = np.flatnonzero(labels == lbl)
         if member_idx.size == 0:
             continue
-        centroid = Xn[member_idx].mean(axis=0)
+        members = Xn[member_idx]  # gathered once: the centroid and the cosines read the same rows
+        centroid = members.mean(axis=0)
         norm = float(np.linalg.norm(centroid))
         if norm > 0:
             centroid = centroid / norm
-        cos = Xn[member_idx] @ centroid
+        cos = members @ centroid
         scores[member_idx] = (1.0 - cos).astype(np.float32)
     return scores
 
