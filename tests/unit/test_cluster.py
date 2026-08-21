@@ -10,6 +10,7 @@ import pytest
 from assertpy import assert_that
 
 import moodengine.cluster
+from moodengine._math import l2_normalize
 from moodengine.cluster import (
     bootstrap_stability,
     cluster_hdbscan,
@@ -412,6 +413,89 @@ def test_spherical_kmeans_quiet_on_a_real_cosine_space(caplog) -> None:
         cluster_spherical_kmeans(X, 3, default_config())
 
     assert_that(caplog.text).does_not_contain("nearly parallel")
+
+
+@pytest.mark.parametrize("d", [8, 64], ids=lambda d: f"d{d}")
+@pytest.mark.parametrize("seed", [0, 1, 2], ids=lambda s: f"seed{s}")
+def test_spherical_kmeans_recovers_separated_blobs_exactly(d, seed) -> None:
+    """The centroid update had NOTHING pinning it — a wrong one still returns a plausible partition.
+
+    On angularly separated blobs the correct update recovers them exactly, so the returned
+    partition is a real assertion about the arithmetic rather than about plausibility. Deliberately
+    NOT run on degenerate geometry: where the mean pairwise cosine is near 1 the function itself
+    warns that the assignment turns on float residue, and any partition there is arbitrary."""
+    rng = np.random.default_rng(seed)
+    k = 4
+    centres = rng.standard_normal((k, d)) * 6.0
+    truth = np.repeat(np.arange(k), 60)
+    X = (centres[truth] + rng.standard_normal((k * 60, d)) * 0.1).astype(np.float32)
+
+    labels = cluster_spherical_kmeans(X, k, default_config(), n_init=5)
+
+    # A permutation of the blob ids is fine; splitting or merging a blob is not.
+    recovered = {int(b): set(np.flatnonzero(labels == b).tolist()) for b in np.unique(labels)}
+    expected = {int(b): set(np.flatnonzero(truth == b).tolist()) for b in range(k)}
+    assert_that(sorted(map(sorted, recovered.values()))).is_equal_to(
+        sorted(map(sorted, expected.values()))
+    )
+
+
+@pytest.mark.parametrize("force_fallback", [False, True], ids=["one-hot", "large-k-fallback"])
+def test_spherical_centroid_update_seats_each_centroid_on_its_unit_member_mean(
+    monkeypatch, force_fallback
+) -> None:
+    """The centroid update itself, asserted against its definition rather than through Lloyd.
+
+    Reached through `cluster_spherical_kmeans` alone, a broken update still returns a plausible
+    partition — un-normalized centroids, for instance, recover well-separated blobs perfectly well
+    while biasing every assignment toward the longest mean. So the three properties are pinned
+    directly: the value, the unit norm the cosine assignment depends on, and the emptied-cluster
+    rule that keeps ``k`` distinct centres alive.
+
+    The large-k branch exists so a big ``k`` never allocates a dense ``(n, k)`` one-hot — ``Config``
+    bounds ``kmeans_n_clusters`` only at ``>= 1`` and ``k`` is clamped to ``n``, so ``k == n`` is
+    reachable and the one-hot would be ``(n, n)``, 1.6 GB at 20 000 tracks. It is only taken on
+    inputs too big for a unit test, so the cap is lowered to reach it."""
+    rng = np.random.default_rng(4)
+    Xn = rng.standard_normal((300, 16)).astype(np.float32)
+    Xn /= np.linalg.norm(Xn, axis=1, keepdims=True)
+    k = 12
+    labels = rng.integers(0, k, 300)
+    labels[labels == 5] = 4  # cluster 5 left empty on purpose
+    seed_centroids = Xn[:k].copy()
+    if force_fallback:
+        monkeypatch.setattr(moodengine.cluster, "_ONEHOT_MAX_ELEMENTS", 1)
+
+    centroids = seed_centroids.copy()
+    moodengine.cluster._spherical_centroid_update(Xn, labels, centroids, k)
+
+    filled = [j for j in range(k) if np.any(labels == j)]
+    for j in filled:
+        member_mean = Xn[labels == j].mean(axis=0)
+        expected = member_mean / np.linalg.norm(member_mean)
+        np.testing.assert_allclose(centroids[j], expected, rtol=0.0, atol=2e-6)
+    norms = np.linalg.norm(centroids[filled], axis=1)
+    np.testing.assert_allclose(norms, np.ones(len(filled)), rtol=0.0, atol=2e-6)
+    assert_that(np.array_equal(centroids[5], seed_centroids[5])).is_true()  # empty kept intact
+
+
+def test_spherical_degeneracy_probe_matches_the_explicit_gram() -> None:
+    """The probe reports mean(P @ Pᵀ) without building the gram; the two must agree.
+
+    ``mean(P @ Pᵀ) == ‖Σp‖² / m²`` because summing every pairwise dot is the dot of the sums. The
+    threshold it feeds is 0.9, so the identity has to hold far tighter than that — it does, by
+    orders of magnitude, on both an ordinary and a near-degenerate space."""
+    for maker in (
+        lambda r: r.standard_normal((400, 32)),
+        lambda r: np.ones((400, 32)) + 0.001 * r.standard_normal((400, 32)),
+    ):
+        P = l2_normalize(maker(np.random.default_rng(0)).astype(np.float32), axis=1)
+        explicit = float((P @ P.T).mean())
+        sums = P.sum(axis=0, dtype=np.float64)
+
+        identity = float(sums @ sums) / float(P.shape[0]) ** 2
+
+        assert_that(abs(explicit - identity)).is_less_than(1e-6)
 
 
 def test_spherical_kmeans_restarts_never_lose_to_a_single_draw() -> None:
