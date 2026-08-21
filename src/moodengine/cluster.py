@@ -651,17 +651,35 @@ def select_kmeans_k(
     silhouette. Returns ``(best_k, {k: silhouette})``. Falls back to ``(1, {})``
     for fewer than 3 samples (silhouette is undefined). Deterministic.
     """
+    best_k, scores, _ = _sweep_kmeans_k(X, config, k_min, k_max)
+    return best_k, scores
+
+
+def _sweep_kmeans_k(
+    X: np.ndarray, config: Config, k_min: int, k_max: int
+) -> tuple[int, dict[int, float], np.ndarray | None]:
+    """:func:`select_kmeans_k`, additionally returning the labels of the winning fit.
+
+    The sweep already clusters at every ``k``; handing back the winner's labels lets
+    :func:`sub_cluster` skip re-fitting KMeans at the ``k`` that was just chosen. ``cluster_kmeans``
+    is deterministic in ``(X, k, config.seed)``, so the reused labels are the ones a re-fit would
+    produce. The third element is ``None`` when NO ``k`` yielded two distinct clusters — the
+    fallback branch below never scored a fit, so there is nothing to reuse and the caller must
+    cluster itself.
+    """
     X = np.asarray(X, dtype=np.float32)
     n_samples = X.shape[0]
     if n_samples < 3:
-        return 1, {}
+        return 1, {}, None
     hi = min(int(k_max), n_samples - 1)
     lo = max(2, int(k_min))
     scores: dict[int, float] = {}
+    labels_by_k: dict[int, np.ndarray] = {}
     for k in range(lo, hi + 1):
         labels = cluster_kmeans(X, k, config)
         if len(set(labels.tolist())) < 2:
             continue
+        labels_by_k[k] = labels
         try:
             # Silhouette is O(n²·d): sample it above 2k points — the k RANKING it
             # drives is stable under sampling, and the full pass costs minutes at
@@ -678,9 +696,9 @@ def select_kmeans_k(
         except Exception:
             continue
     if not scores:
-        return min(lo, max(1, n_samples)), {}
+        return min(lo, max(1, n_samples)), {}, None
     best_k = max(scores, key=lambda k: scores[k])
-    return best_k, scores
+    return best_k, scores, labels_by_k[best_k]
 
 
 def cluster_metrics(X: np.ndarray, labels: np.ndarray) -> ClusterMetrics:
@@ -1007,6 +1025,20 @@ def per_cluster_silhouette(
     ``None`` (not calculable) when there are fewer than 2 non-noise clusters / samples, or that cluster
     has fewer than 2 members (a singleton's silhouette is not meaningful). Never raises on degenerate
     input (style of :func:`silhouette_original`). Deterministic; pure sklearn."""
+    return _silhouette_summary(X, labels, metric)[1]
+
+
+def _silhouette_summary(
+    X: np.ndarray, labels: np.ndarray, metric: str = "cosine"
+) -> tuple[float | None, dict[int, float | None]]:
+    """Overall AND per-cluster silhouette from ONE ``silhouette_samples`` pass.
+
+    sklearn's ``silhouette_score`` is defined as the mean of ``silhouette_samples``, so a caller
+    that wants both — :func:`sub_cluster` does — was paying the O(m²·d) pairwise pass twice. The
+    mean returned here is bitwise equal to :func:`silhouette_original` on the same input (verified
+    across sizes, widths and noise-bearing labels), which is why that function is left alone: it
+    also serves callers who pass ``sample_size``, and a sampled estimate is a different quantity.
+    """
     from sklearn.metrics import silhouette_samples
 
     X = np.asarray(X, dtype=np.float32)
@@ -1016,16 +1048,16 @@ def per_cluster_silhouette(
     lab_nn = labels[mask]
     uniq = sorted(set(lab_nn.tolist()))
     if lab_nn.size < 2 or len(uniq) < 2:
-        return {int(c): None for c in uniq}
+        return None, {int(c): None for c in uniq}
     try:
         samples = silhouette_samples(X_nn, lab_nn, metric=metric)
     except Exception:  # noqa: BLE001 — degenerate geometry must not raise
-        return {int(c): None for c in uniq}
-    out: dict[int, float | None] = {}
+        return None, {int(c): None for c in uniq}
+    per_cluster: dict[int, float | None] = {}
     for c in uniq:
         members = lab_nn == c
-        out[int(c)] = float(samples[members].mean()) if int(members.sum()) >= 2 else None
-    return out
+        per_cluster[int(c)] = float(samples[members].mean()) if int(members.sum()) >= 2 else None
+    return float(samples.mean()), per_cluster
 
 
 def sub_cluster(X: np.ndarray, config: Config, k_min: int = 2, k_max: int = 6) -> SubClusterResult:
@@ -1048,14 +1080,22 @@ def sub_cluster(X: np.ndarray, config: Config, k_min: int = 2, k_max: int = 6) -
             "medoids": cluster_medoids(X, labels),
             "per_cluster_silhouette": per_cluster_silhouette(X, labels, metric="cosine"),
         }
-    best_k, _ = select_kmeans_k(X, config, k_min=k_min, k_max=k_max)
-    labels = cluster_kmeans(X, max(1, int(best_k)), config)
+    best_k, _, best_labels = _sweep_kmeans_k(X, config, k_min, k_max)
+    # The sweep already fit KMeans at this k; re-fitting it was a sixth fit on top of the five it
+    # paid for. `None` means no k produced two distinct clusters, so nothing was scored to reuse.
+    labels = (
+        best_labels if best_labels is not None else cluster_kmeans(X, max(1, int(best_k)), config)
+    )
+    # Both silhouette figures come from ONE pairwise pass — the overall score is the mean of the
+    # per-point samples the per-cluster breakdown already needs. At the reduced-space widths this
+    # function is normally called with, that duplicate pass was over half its total runtime.
+    overall, per_cluster = _silhouette_summary(X, labels, metric="cosine")
     return {
         "sub_labels": labels,
         "sub_k": int(len(set(labels.tolist()))),
-        "silhouette": silhouette_original(X, labels, metric="cosine"),
+        "silhouette": overall,
         "medoids": cluster_medoids(X, labels),
-        "per_cluster_silhouette": per_cluster_silhouette(X, labels, metric="cosine"),
+        "per_cluster_silhouette": per_cluster,
     }
 
 
