@@ -289,6 +289,59 @@ def test_cluster_mood_profiles_precomputed_matrix_equals_embedder_path() -> None
     assert_that(via_matrix).is_equal_to(via_embedder)
 
 
+def test_cluster_mood_profiles_gives_each_cluster_its_own_rows() -> None:
+    """Each profile must come from ITS members: rolling the per-cluster means must fail."""
+    embedder = _FakeCLAP(dim=8)
+    names, matrix = build_label_matrix(embedder, DEFAULT_MOOD_PROMPTS)
+    first, second = 0, 1
+    # Six rows per cluster, each an exact copy of one mood direction, so the batch mean
+    # sits between the two and each cluster contrasts toward its own mood.
+    audio = np.vstack([np.tile(matrix[first], (6, 1)), np.tile(matrix[second], (6, 1))])
+    labels = np.array([0] * 6 + [1] * 6)
+
+    profiles = cluster_mood_profiles(audio, labels, label_matrix=(names, matrix))
+
+    assert_that(profiles[0][0][0]).is_equal_to(names[first])
+    assert_that(profiles[1][0][0]).is_equal_to(names[second])
+
+
+def test_cluster_mood_profiles_refuses_a_single_cluster_spanning_the_batch() -> None:
+    """Batch-mean centering makes that profile identically zero — refuse, don't rank noise."""
+    rng = np.random.default_rng(7)
+    audio = l2_normalize(rng.standard_normal((12, 8)).astype(np.float32), axis=1)
+    lm = build_label_matrix(_FakeCLAP(dim=8), DEFAULT_MOOD_PROMPTS)
+    one_cluster = np.zeros(12, dtype=int)
+
+    with pytest.raises(ValueError, match="single cluster"):
+        cluster_mood_profiles(audio, one_cluster, label_matrix=lm)
+
+
+def test_cluster_mood_profiles_profiles_one_cluster_when_the_offset_is_not_the_batch() -> None:
+    """The three ways one cluster is well defined: a prior, no recentering, or n < 5."""
+    rng = np.random.default_rng(8)
+    audio = l2_normalize(rng.standard_normal((12, 8)).astype(np.float32), axis=1)
+    names, matrix = build_label_matrix(_FakeCLAP(dim=8), DEFAULT_MOOD_PROMPTS)
+    one_cluster = np.zeros(12, dtype=int)
+    # A prior estimated on a DIFFERENT reference corpus: the offset is external to this
+    # batch, so the single cluster contrasts against it instead of against itself.
+    reference = l2_normalize(rng.standard_normal((40, 8)).astype(np.float32), axis=1)
+    fixed_offset = label_prior(reference @ matrix.T)
+
+    with_prior = cluster_mood_profiles(
+        audio, one_cluster, label_matrix=(names, matrix), prior=fixed_offset
+    )
+    without_recentering = cluster_mood_profiles(
+        audio, one_cluster, label_matrix=(names, matrix), recenter=False
+    )
+    below_min_n = cluster_mood_profiles(
+        audio[:4], np.zeros(4, dtype=int), label_matrix=(names, matrix)
+    )
+
+    assert_that(with_prior[0]).is_length(3)
+    assert_that(without_recentering[0]).is_length(3)
+    assert_that(below_min_n[0]).is_length(3)
+
+
 def test_labeling_without_embedder_or_matrix_raises() -> None:
     """Neither an embedder nor a matrix → a clear ValueError, not an AttributeError."""
     audio = np.ones((2, 4), dtype=np.float32)

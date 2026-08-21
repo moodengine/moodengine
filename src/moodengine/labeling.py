@@ -869,7 +869,12 @@ def cluster_mood_profiles(
     each cluster, and returns ``{cluster_id: [(mood, mean_score), ...]}`` with the
     ``top_k`` moods per cluster (noise cluster -1 included when present). When
     ``recenter`` (and n>=5), the per-mood similarities are centered via
-    :func:`recenter_similarities` before averaging. ``label_matrix`` accepts a
+    :func:`recenter_similarities` before averaging, which makes every profile a
+    CONTRAST against the batch — and a single cluster spanning the whole batch has no
+    contrast to report, so that combination raises :class:`ValueError` rather than
+    ranking the rounding noise it would otherwise produce. Pass ``prior`` (a fixed
+    offset, so the contrast is against it rather than against this batch) or
+    ``recenter=False`` to profile one cluster. ``label_matrix`` accepts a
     precomputed ``(mood_names, matrix)`` pair as returned by
     :func:`build_label_matrix` — same contract as in :func:`label_tracks`: the
     embedder is then never consulted and may be ``None``; with neither, raises
@@ -880,6 +885,24 @@ def cluster_mood_profiles(
     if X.ndim == 1:
         X = X[None, :]
     labels = np.asarray(cluster_labels).astype(int)
+    # One group covering the whole batch has NO contrast to report when the centering
+    # offset is the batch's own mean: cluster mean minus batch mean is then zero by
+    # construction, so the averaged similarities are float rounding noise and ranking
+    # them returns arbitrary moods. Measured on the same generator at 1e-8 magnitude,
+    # the top-3 came back ['dreamy', 'energetic', 'uplifting'] at n=5,
+    # ['jazzy', 'groovy', 'dark'] at n=100 and ['uplifting', 'dark', 'calm'] at
+    # n=2000 — three different answers, none of them evidence. sklearn's
+    # silhouette_score refuses the same degeneracy for the same reason. Both escapes
+    # stay valid at one cluster: a `prior` makes the offset external to the batch, and
+    # `recenter=False` removes it. Below RECENTER_MIN_N no centering happens at all,
+    # so the profile is well defined there and the guard must not fire.
+    if recenter and prior is None and X.shape[0] >= RECENTER_MIN_N and len(np.unique(labels)) == 1:
+        raise ValueError(
+            "cannot profile a single cluster spanning the whole batch while recentering "
+            "on the batch mean: every cluster mean is then zero by construction and the "
+            "ranking would be rounding noise. Pass prior=label_prior(...) to center on a "
+            "fixed offset, or recenter=False to rank raw similarities."
+        )
     mood_names, mood_matrix = _resolve_label_matrix(clap_embedder, prompts, label_matrix)
     # Cluster profiles aggregate the CENTERED similarities (comparable across
     # moods), not the per-track softmax probabilities.
