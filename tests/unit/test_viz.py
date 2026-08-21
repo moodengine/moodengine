@@ -333,7 +333,7 @@ def test_build_dashboard_renders_a_homogeneous_float32_frame_like_a_mixed_one(tm
     f32_html = build_dashboard(float32_frame, out_html=tmp_path / "a.html")
     mixed_html = build_dashboard(mixed_frame, out_html=tmp_path / "b.html")
 
-    for page in (f32_html.read_text(), mixed_html.read_text()):
+    for page in (f32_html.read_text(encoding="utf-8"), mixed_html.read_text(encoding="utf-8")):
         assert_that(page).contains("<td>0.250</td>")
         assert_that(page).does_not_contain("0.25000000")
 
@@ -344,8 +344,10 @@ def test_build_dashboard_keeps_its_row_guards(tmp_path) -> None:
     empty = pd.DataFrame({"filename": [], "energy": []})
     no_table_cols = pd.DataFrame({"zzz": [1, 2, 3]})
 
-    empty_page = build_dashboard(empty, out_html=tmp_path / "e.html").read_text()
-    bare_page = build_dashboard(no_table_cols, out_html=tmp_path / "n.html").read_text()
+    empty_page = build_dashboard(empty, out_html=tmp_path / "e.html").read_text(encoding="utf-8")
+    bare_page = build_dashboard(no_table_cols, out_html=tmp_path / "n.html").read_text(
+        encoding="utf-8"
+    )
 
     # One `<tr>` is the table header, so an empty frame has exactly that and no body rows.
     assert_that(empty_page.count("<tr>")).is_equal_to(1)
