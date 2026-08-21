@@ -13,6 +13,14 @@ MUST stay clean.
 `uses: actions/checkout@9c091bb...dddfe3e0 # v7.0.0`. Never a floating tag (`@v7`) or a
 branch. Bump the SHA and the comment together, after checking the upstream release.
 
+**Pin `uv` itself too, via the `UV_VERSION` workflow-level env each `setup-uv` step reads.** With no
+version, setup-uv resolves "latest" by fetching a manifest from `raw.githubusercontent.com` on every
+job — an unpinned network call per job, and a real source of run failures. The version must be one
+the *pinned* setup-uv knows: it verifies the download against a checksum table baked into the
+action, and for an unknown version it skips validation **silently** rather than failing. So
+`UV_VERSION` and the setup-uv SHA move together — raising one without the other leaves the pin
+unverified with nothing to say so.
+
 **Least-privilege tokens.**
 - Every workflow declares top-level `permissions: contents: read`. Elevate per-*job*, never
   globally, and only to what that job needs (e.g. the artifact-publish job gets
