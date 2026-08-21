@@ -1091,3 +1091,53 @@ def test_compose_deterministic_and_no_mutation() -> None:
     v2 = compose_mood_vector(M, names, [("m0", 1.0), ("m3", -0.5)])
     np.testing.assert_array_equal(v1, v2)
     np.testing.assert_array_equal(M, before)
+
+
+def test_mood_affect_consistency_breaks_worst_mood_ties_by_first_appearance() -> None:
+    """Two moods with an identical mean gap must come back in frame order, not alphabetically.
+
+    `sorted` is stable and the accumulator is insertion-ordered, so the tie rule today is FIRST
+    APPEARANCE. Nothing pinned it: flipping the sort key to break ties alphabetically passes the
+    entire suite. It matters because `worst_moods` is what an adopter reads to decide which mood to
+    investigate, and because the obvious way to speed this function up — grouping the gaps with
+    `np.bincount` — silently reorders ties into VOCABULARY order. This test blocks that.
+
+    The later-sorting mood is placed first on purpose, so an alphabetical tie-break would give the
+    opposite answer."""
+    names = sorted(MOOD_AFFECT)
+    late, early = names[-1], names[0]
+    delta = 0.25
+    df = pd.DataFrame(
+        {
+            "top_mood": [late, early],  # `late` appears FIRST
+            # gap = max(|expected_arousal - energy|, |expected_valence - valence|), so putting the
+            # whole offset on energy gives both rows exactly `delta`.
+            "energy": [MOOD_AFFECT[late][1] + delta, MOOD_AFFECT[early][1] + delta],
+            "valence": [MOOD_AFFECT[late][0], MOOD_AFFECT[early][0]],
+        }
+    )
+
+    worst = mood_affect_consistency(df)["worst_moods"]
+
+    assert_that([m for m, _ in worst]).is_equal_to([late, early])
+    assert_that(worst[0][1]).is_close_to(worst[1][1], tolerance=1e-12)  # the tie is real
+
+
+def test_mood_affect_consistency_drops_unknown_moods_and_non_finite_axes() -> None:
+    """The keep mask is now three vectorized conditions instead of a per-row comprehension.
+
+    `and` short-circuited past the finiteness checks for a mood outside the vocabulary; `&` does
+    not. The outcome must be identical — a row is scored only when its mood is known AND both axes
+    are finite — so every combination is asserted here rather than assumed."""
+    known = sorted(MOOD_AFFECT)[0]
+    df = pd.DataFrame(
+        {
+            "top_mood": [known, known, known, "not_a_mood", "not_a_mood"],
+            "energy": [0.5, float("nan"), 0.5, 0.5, float("nan")],
+            "valence": [0.5, 0.5, float("nan"), 0.5, 0.5],
+        }
+    )
+
+    result = mood_affect_consistency(df)
+
+    assert_that(result["n_scored"]).is_equal_to(1)  # only the all-known, all-finite row
