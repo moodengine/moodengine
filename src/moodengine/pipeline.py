@@ -851,17 +851,32 @@ def run_pipeline(
 
 
 def _build_hover_text(df: pd.DataFrame) -> list[str]:
-    """Per-point hover strings: filename + top-k moods (as %) + energy/valence."""
+    """Per-point hover strings: filename + top-k moods (as %) + energy/valence.
+
+    Read column-wise: ``iterrows()`` rebuilds a Series per track, and this runs over the whole
+    library every time ``write_artifacts`` has labels. A column that is absent becomes a column of
+    ``None``, reproducing what ``row.get()`` returned for a missing key. Every value is cast through
+    ``float()`` before formatting, so the element type the columns yield cannot change the strings.
+    """
+    n = len(df)
+
+    def column(name: str) -> list[Any]:
+        return df[name].tolist() if name in df.columns else [None] * n
+
     hover: list[str] = []
-    for _, row in df.iterrows():
-        parts = [str(row["filename"])]
-        moods = row.get("mood_top3") or []
-        scores = row.get("mood_top3_scores") or []
+    for filename, moods, scores, energy, valence in zip(
+        df["filename"].tolist(),
+        column("mood_top3"),
+        column("mood_top3_scores"),
+        column("energy"),
+        column("valence"),
+    ):
+        parts = [str(filename)]
+        moods = moods if moods is not None else []
+        scores = scores if scores is not None else []
         if len(moods):
             pieces = [f"{m} {float(s) * 100:.0f}%" for m, s in zip(moods, scores)]
             parts.append("moods: " + ", ".join(pieces))
-        energy = row.get("energy")
-        valence = row.get("valence")
         if energy is not None and valence is not None and pd.notna(energy) and pd.notna(valence):
             parts.append(f"energy {float(energy):.2f} · valence {float(valence):.2f}")
         hover.append("<br>".join(parts))

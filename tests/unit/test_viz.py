@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from assertpy import assert_that
 
 from moodengine.viz import (
+    _cell_str,
     build_dashboard,
     export_m3u,
     export_playlists,
@@ -302,3 +303,50 @@ def test_export_m3u_missing_columns_returns_empty(tmp_path) -> None:
     assert_that(
         export_m3u(pd.DataFrame({"cluster": [0], "filename": ["a.wav"]}), tmp_path)
     ).is_equal_to([])
+
+
+# --------------------------------------------------------------------------- #
+# cell formatting (dtype-independent) + the column-wise table body
+# --------------------------------------------------------------------------- #
+def test_cell_str_formats_float32_like_float64() -> None:
+    """`np.float64` is a `float` subclass and `np.float32` is not, so the two used to render
+    differently from the same number — 0.262 against 0.26161215, and '' against the literal 'nan'
+    for a missing value. `build_dashboard` takes an arbitrary DataFrame from a public entry point
+    in a float32 library, so both were reachable."""
+    assert_that(_cell_str(np.float32(0.26161215))).is_equal_to(_cell_str(np.float64(0.26161215)))
+    assert_that(_cell_str(np.float32(0.26161215))).is_equal_to("0.262")
+    assert_that(_cell_str(np.float32("nan"))).is_equal_to("")
+    assert_that(_cell_str(np.float16(0.5))).is_equal_to("0.500")
+
+
+def test_build_dashboard_renders_a_homogeneous_float32_frame_like_a_mixed_one(tmp_path) -> None:
+    """The same numbers must render the same whether pandas boxes them as float32 or as float.
+
+    A homogeneous float32 frame is exactly the shape this library produces, and it is the case
+    that used to render eight decimal places per cell while a mixed frame rendered three."""
+    values = np.array([[0.25, 0.5], [0.125, 0.75]], dtype=np.float32)
+    float32_frame = pd.DataFrame(values, columns=["energy", "valence"])
+    mixed_frame = pd.DataFrame(
+        {"filename": ["a", "b"], "energy": values[:, 0], "valence": values[:, 1].astype(np.float64)}
+    )
+
+    f32_html = build_dashboard(float32_frame, out_html=tmp_path / "a.html")
+    mixed_html = build_dashboard(mixed_frame, out_html=tmp_path / "b.html")
+
+    for page in (f32_html.read_text(), mixed_html.read_text()):
+        assert_that(page).contains("<td>0.250</td>")
+        assert_that(page).does_not_contain("0.25000000")
+
+
+def test_build_dashboard_keeps_its_row_guards(tmp_path) -> None:
+    """The column-wise body must still emit rows for the shapes that have no table columns, and
+    none at all for an empty frame — `zip(*[])` silently drops every row otherwise."""
+    empty = pd.DataFrame({"filename": [], "energy": []})
+    no_table_cols = pd.DataFrame({"zzz": [1, 2, 3]})
+
+    empty_page = build_dashboard(empty, out_html=tmp_path / "e.html").read_text()
+    bare_page = build_dashboard(no_table_cols, out_html=tmp_path / "n.html").read_text()
+
+    # One `<tr>` is the table header, so an empty frame has exactly that and no body rows.
+    assert_that(empty_page.count("<tr>")).is_equal_to(1)
+    assert_that(bare_page.count("<tr>")).is_equal_to(1 + 3)
