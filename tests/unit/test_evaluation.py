@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -714,3 +715,44 @@ def test_evaluation_module_is_torch_free() -> None:
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert_that(r.returncode).described_as(r.stderr).is_equal_to(0)
+
+
+def test_load_gold_reads_utf8_regardless_of_the_platform_encoding(tmp_path) -> None:
+    """The gold file is WRITTEN as UTF-8 by `viz.build_labeling_ui`; it must be READ as UTF-8 too.
+
+    Reading it with the platform default made writer and reader disagree on Windows (cp1252): any
+    non-cp1252 byte — an accented, CJK or emoji filename, which a music library has in abundance —
+    raised `UnicodeDecodeError`. That is a subclass of `ValueError`, so this function's own
+    `except (OSError, ValueError)` swallowed it and returned `{}`. The caller then saw "no gold
+    labels" rather than an error and scored against nothing, silently.
+
+    Run in a subprocess under `PYTHONWARNDEFAULTENCODING=1`, which makes CPython emit an
+    `EncodingWarning` for any text read that omits `encoding=`. The filter is installed AFTER the
+    imports so only this call is in scope — third-party modules open files unencoded at import time
+    and are not this test's business. That makes the check deterministic on every platform, rather
+    than a test that could only ever fail on the Windows CI leg."""
+    import subprocess
+    import sys
+
+    gold = tmp_path / "gold.json"
+    gold.write_text(
+        json.dumps({"café_日本_🎵.wav": {"moods": ["calm"], "energy": 0.4, "valence": 0.6}}),
+        encoding="utf-8",
+    )
+    code = (
+        "import warnings\n"
+        "from moodengine.evaluation import load_gold\n"
+        "with warnings.catch_warnings():\n"
+        "    warnings.simplefilter('error', EncodingWarning)\n"
+        f"    data = load_gold(r'{gold}')\n"
+        "assert list(data) == ['café_日本_🎵.wav'], data\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONWARNDEFAULTENCODING": "1", "PYTHONIOENCODING": "utf-8"},
+    )
+
+    assert_that(result.returncode).described_as(result.stderr[-800:]).is_equal_to(0)
