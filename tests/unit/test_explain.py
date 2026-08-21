@@ -14,6 +14,7 @@ from assertpy import assert_that
 from moodengine.exceptions import MissingDependencyError
 from moodengine.explain import (
     Counterfactual,
+    _prune_deltas,
     SignalSurrogate,
     counterfactual,
     fit_signal_surrogate,
@@ -294,6 +295,79 @@ def test_counterfactual_flips_prediction():
     assert_that(cf.found).is_true()
     flipped = int(np.argmax(surr.model.predict_proba((x + cf.deltas).reshape(1, -1))[0]))
     assert_that(flipped).is_equal_to(target)  # the CF actually flips the surrogate
+
+
+def test_prune_deltas_reverts_sequentially_not_against_the_original():
+    """The minimality pass carries the reverted state forward; testing each revert against the
+    ORIGINAL deltas silently breaks the flip it promises.
+
+    On an OR target, a counterfactual that moved BOTH signals has two deltas that are each
+    individually redundant — reverting either alone still satisfies the OR. Judged in one batch,
+    both look removable and reverting both lands back where it started, so `counterfactual` would
+    return `found=True` with deltas that no longer flip the surrogate, against its docstring.
+    Sequentially, dropping the first makes the second load-bearing and it survives.
+
+    Asserted on `_prune_deltas` directly because the greedy search stops the instant the prediction
+    flips: on every fixture tried it reaches the target in ONE grid move, so a two-delta input never
+    arises through the public entry point and the contract would go untested there."""
+    grid = np.linspace(-2.0, 2.0, 21)
+    S = np.array([[a, b] for a in grid for b in grid], dtype=np.float64)
+    y = ((S[:, 0] > 0.0) | (S[:, 1] > 0.0)).astype(int)
+    surr = fit_signal_surrogate(S, y, ["a", "b"], ["calm", "energetic"], kind="tree")
+    x = np.array([-2.0, -2.0])
+    both_moved = np.array([4.0, 4.0])  # each move alone already satisfies the OR
+    assert_that(int(np.argmax(surr.model.predict_proba(x.reshape(1, -1))[0]))).is_equal_to(0)
+
+    pruned = _prune_deltas(surr, x, both_moved, 1)
+
+    assert_that(int(np.count_nonzero(pruned))).is_equal_to(1)  # one dropped, one kept
+    still = int(np.argmax(surr.model.predict_proba((x + pruned).reshape(1, -1))[0]))
+    assert_that(still).is_equal_to(1)  # and what remains still flips
+
+
+def test_python_and_numpy_rounding_are_not_interchangeable_at_12_places():
+    """Guards the comprehension in `counterfactual` against being "simplified" to `np.round`.
+
+    The search rounds each candidate probability with Python's `round()` before comparing, and the
+    obvious tidy-up — rounding the whole probability vector with `np.round` — is NOT equivalent:
+    `np.round` computes `rint(v · 1e12) / 1e12` while CPython rounds decimally. Measured over 2
+    million random doubles in [0, 1], the two disagree on 79 of them (about 1 in 25 000), each by a
+    full 1e-12.
+
+    That is exactly the scale the rounding exists to erase, so a disagreement can turn a tie into a
+    non-tie and select a different signal. No end-to-end test can reliably catch it — the collision
+    has to land on a candidate that is also tied — so the premise is pinned here instead."""
+    disagreeing = 0.6276576012985
+
+    assert_that(round(disagreeing, 12)).is_not_equal_to(float(np.round(disagreeing, 12)))
+    assert_that(abs(round(disagreeing, 12) - float(np.round(disagreeing, 12)))).is_close_to(
+        1e-12, tolerance=1e-15
+    )
+
+
+def test_counterfactual_breaks_an_exact_probability_tie_by_distance():
+    """When several grid values give the SAME P(target), the nearest one must win.
+
+    Making near-ties tie is the entire reason the search rounds the probability before comparing,
+    and the tie is then broken by MAD-weighted distance. A decision tree produces exact ties for
+    free: every value on one side of a split sits in the same leaf and scores identically, so the
+    winner is decided purely by the distance term."""
+    grid = np.linspace(-3.0, 3.0, 300)
+    S = np.column_stack([grid, np.zeros_like(grid)])
+    y = (grid > 0.0).astype(int)
+    surr = fit_signal_surrogate(S, y, ["split", "inert"], ["calm", "energetic"], kind="tree")
+    mad = np.ones(2)
+    bounds = np.array([[-3.0, 3.0], [-3.0, 3.0]])
+    x = np.array([-3.0, 0.0])  # far below the split, read as mood 0
+
+    cf = counterfactual(surr, x, 1, mad=mad, bounds=bounds)
+
+    assert_that(cf.found).is_true()
+    # Every grid value above the split ties on probability, so the smallest crossing move wins —
+    # and the inert signal, which changes nothing, must not be touched at all.
+    assert_that(float(cf.deltas[1])).is_equal_to(0.0)
+    crossing = [v for v in np.linspace(-3.0, 3.0, 9) if v > 0.0]
+    assert_that(float(x[0] + cf.deltas[0])).is_close_to(min(crossing), tolerance=1e-9)
 
 
 def test_counterfactual_is_deterministic():

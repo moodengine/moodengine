@@ -372,11 +372,17 @@ class Counterfactual:
     deltas: np.ndarray  # (n_features,) perturbation applied to x
 
 
+def _weighted_dists(rows: np.ndarray, b: np.ndarray, mad: np.ndarray) -> np.ndarray:
+    """MAD-weighted L1 distance of every row of ``rows`` (m, d) to ``b`` (d,). Returns (m,)."""
+    scale = np.where(mad > _EPS, mad, 1.0)
+    return np.sum(np.abs(rows - b) / scale, axis=1)
+
+
 def _weighted_dist(a: np.ndarray, b: np.ndarray, mad: np.ndarray) -> float:
     """Wachter's MAD-weighted L1 distance — robust, per-signal-scaled, so a 5-BPM move and a
-    0.1-valence move are comparable."""
-    scale = np.where(mad > _EPS, mad, 1.0)
-    return float(np.sum(np.abs(a - b) / scale))
+    0.1-valence move are comparable. Delegates to :func:`_weighted_dists` so the scalar and
+    batched forms cannot drift apart."""
+    return float(_weighted_dists(np.asarray(a).reshape(1, -1), b, mad)[0])
 
 
 def counterfactual(
@@ -421,23 +427,44 @@ def counterfactual(
 
     lo, hi = bounds[:, 0], bounds[:, 1]
     grids = [np.unique(np.concatenate([np.linspace(lo[f], hi[f], 9), [x[f]]])) for f in range(nf)]
+    # The whole grid, flattened once, in the order the nested loops visited it: feature ascending,
+    # then grid value ascending (np.unique sorts). That order is load-bearing — the search keeps the
+    # FIRST candidate of an equal key — so it is fixed here rather than rebuilt per step.
+    feature_of = np.concatenate(
+        [np.full(g.shape[0], f, dtype=np.intp) for f, g in enumerate(grids)]
+    )
+    value_of = np.concatenate(grids)
 
     cur = x.copy()
     for _ in range(int(max_iter)):
         base_p = prob_target(cur)
-        best: tuple[tuple[float, float], np.ndarray] | None = None  # (key, candidate) — paired
-        for f in range(nf):
-            for val in grids[f]:
-                if val == cur[f]:
-                    continue
-                cand = cur.copy()
-                cand[f] = val
-                key = (-round(prob_target(cand), 12), _weighted_dist(cand, x, mad))
-                if best is None or key < best[0]:
-                    best = (key, cand)
-        if best is None or (-best[0][0]) <= base_p:  # no strictly-improving single-signal move
+        movable = (
+            value_of != cur[feature_of]
+        )  # a candidate equal to the current value is not a move
+        if not movable.any():
             break
-        cur = best[1]
+        rows, cols = np.flatnonzero(movable), feature_of[movable]
+        # One predict_proba over the entire candidate grid instead of one call per candidate. Rows
+        # are scored independently — see SupportsPredictProba, whose row-independence requirement
+        # this shares with surrogate_shap. Envelope: a (9·nf, nf) float64 block, which is the same
+        # bound the per-candidate loop already implied in TIME.
+        candidates = np.repeat(cur[None, :], rows.shape[0], axis=0)
+        candidates[np.arange(rows.shape[0]), cols] = value_of[movable]
+        probs = np.asarray(surr.model.predict_proba(candidates), dtype=np.float64)[:, target_idx]
+        # Python's round(), NOT np.round(): the rounding is here to make near-ties TIE, and
+        # np.round's rint(v·1e12)/1e12 disagrees with CPython's decimal rounding on roughly 1 double
+        # in 20 000 — enough to break a tie and pick a different signal. The grid is ~9·nf wide, so
+        # the comprehension costs nothing next to the model call above.
+        keys = np.fromiter(
+            (-round(float(p), 12) for p in probs), dtype=np.float64, count=probs.size
+        )
+        dists = _weighted_dists(candidates, x, mad)
+        # lexsort's LAST key is primary, and it is stable — so this reproduces the tuple comparison
+        # `(-p, dist)` with the earliest candidate winning an exact tie, exactly as `key < best[0]`.
+        winner = int(np.lexsort((dists, keys))[0])
+        if -keys[winner] <= base_p:  # no strictly-improving single-signal move
+            break
+        cur = candidates[winner]
         if pred(cur) == target_idx:
             deltas = _prune_deltas(surr, x, cur - x, target_idx)
             return Counterfactual(found=True, deltas=deltas)
