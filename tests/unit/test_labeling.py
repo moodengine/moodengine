@@ -428,6 +428,43 @@ def test_score_axis_rejects_non_two_pole() -> None:
         score_axis(np.zeros((1, 4), dtype=np.float32), embedder, {"only": ["p"]})
 
 
+def test_attribute_scores_reads_each_axis_from_its_own_vocabulary() -> None:
+    """Energy must come from ENERGY_PROMPTS and valence from VALENCE_PROMPTS — nothing pinned it.
+
+    Swapping the two prompt sets inside `attribute_scores` — which hands every adopter their
+    energy under the name valence and vice versa — passes the ENTIRE default suite. The existing
+    coverage checks the columns exist and sit in [0, 1], which a swap preserves exactly.
+
+    Pinned two ways, because either alone is escapable. Structurally, each column must equal
+    `score_axis` on the corresponding vocabulary; semantically, a track placed ON a pole must
+    score toward that pole and leave the OTHER axis alone — which still holds if `score_axis` is
+    ever refactored away."""
+    embedder = _FakeCLAP(dim=16)
+    energy_lm = build_label_matrix(embedder, ENERGY_PROMPTS)
+    valence_lm = build_label_matrix(embedder, VALENCE_PROMPTS)
+    # Row order is the prompt dict's insertion order: [negative pole, positive pole].
+    high_energy, positive_valence = energy_lm[1][1], valence_lm[1][1]
+    audio = np.vstack([high_energy, positive_valence]).astype(np.float32)
+
+    df = attribute_scores(audio, embedder, recenter=False)
+
+    np.testing.assert_allclose(
+        df["energy"].to_numpy(),
+        score_axis(audio, embedder, ENERGY_PROMPTS, recenter=False),
+        rtol=0.0,
+        atol=2e-6,
+    )
+    np.testing.assert_allclose(
+        df["valence"].to_numpy(),
+        score_axis(audio, embedder, VALENCE_PROMPTS, recenter=False),
+        rtol=0.0,
+        atol=2e-6,
+    )
+    # Row 0 sits on the high-energy pole, row 1 on the positive-valence pole.
+    assert_that(float(df["energy"][0])).is_greater_than(float(df["energy"][1]))
+    assert_that(float(df["valence"][1])).is_greater_than(float(df["valence"][0]))
+
+
 def test_attribute_scores_columns_and_range() -> None:
     """``attribute_scores`` yields energy & valence columns in [0, 1]."""
     rng = np.random.default_rng(3)
