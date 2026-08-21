@@ -12,7 +12,10 @@ import pytest
 from assertpy import assert_that
 
 from moodengine.calibration import (
+    _PROB_FLOOR,
     _aps_scores,
+    _softmax_T,
+    _temperature_objective,
     aps_threshold,
     entropy,
     fit_temperature,
@@ -393,6 +396,130 @@ def test_aps_threshold_rejects_non_finite_probabilities() -> None:
 
     with pytest.raises(ValueError, match="non-finite"):
         aps_threshold(probs, labels, coverage_target=0.9)
+
+
+@pytest.mark.parametrize("temperature", [1e-3, 0.01, 0.5, 1.0, 3.0, 100.0])
+@pytest.mark.parametrize("scale", [0.3, 30.0], ids=["flat-logits", "peaked-logits"])
+def test_temperature_objective_equals_the_readable_definition(temperature, scale) -> None:
+    """The fast objective must equal ``negative_log_likelihood(_softmax_T(L, T), y)`` at every T.
+
+    `fit_temperature` no longer builds a softmax per evaluation; it uses the logsumexp identity. The
+    risk that buys is silent: `negative_log_likelihood` floors the probability at ``_PROB_FLOOR``
+    before the log, which in logsumexp form is a CEILING on the per-row loss, and forgetting to
+    transcribe it changes nothing until the gaps get large relative to T.
+
+    The peaked-logits × small-T cells are where it bites, and it is not subtle there — with the
+    ceiling the objective is ~26.5, without it ~56 800. Pinning the objective rather than the
+    returned T is deliberate: T comes out of a minimizer, and in a flat basin two numerically
+    equivalent objectives converge to slightly different points, so asserting on T would be both
+    weaker and flakier."""
+    rng = np.random.default_rng(1)
+    logits = rng.standard_normal((300, 18)) * scale
+    labels = rng.integers(0, 18, 300)
+
+    objective = _temperature_objective(logits, labels)
+
+    reference = negative_log_likelihood(_softmax_T(logits, temperature), labels)
+    assert_that(objective(temperature)).is_close_to(reference, tolerance=1e-9)
+
+
+def test_temperature_objective_saturates_at_the_probability_floor() -> None:
+    """Non-vacuity guard for the test above: prove the ceiling is actually reached somewhere.
+
+    Without this, the equality test could pass forever on data where the clip never engages and the
+    transcription is untested. Here it is engaged and dominant."""
+    rng = np.random.default_rng(1)
+    logits = rng.standard_normal((300, 18)) * 30.0
+    labels = rng.integers(0, 18, 300)
+    gaps = logits - logits.max(axis=1, keepdims=True)
+    unclipped = np.log(np.exp(gaps / 1e-3).sum(axis=1)) - gaps[np.arange(300), labels] / 1e-3
+
+    assert_that(bool((unclipped > -np.log(_PROB_FLOOR)).any())).is_true()  # the clip engages
+    assert_that(float(unclipped.mean())).is_greater_than(1000.0)  # and dominates if dropped
+    assert_that(_temperature_objective(logits, labels)(1e-3)).is_less_than(
+        -np.log(_PROB_FLOOR) + 1e-9
+    )
+
+
+@pytest.mark.parametrize("n_bins", [0, 1, 2, 10, 50])
+def test_reliability_diagram_handles_every_bin_count(n_bins) -> None:
+    """Nothing exercised ``n_bins`` other than 10, and the grouped form breaks at 0.
+
+    The per-bin loop this replaced simply never ran for ``n_bins <= 0`` and returned ``[]``. A
+    bincount instead receives the ``-1`` that ``np.clip(digitize, 0, n_bins - 1)`` produces and
+    rejects it, so the empty case needs an explicit guard — which would have shipped unnoticed."""
+    rng = np.random.default_rng(4)
+    confidences = rng.random(500)
+    correct = (rng.random(500) < confidences).astype(float)
+
+    bins = reliability_diagram(confidences, correct, n_bins=n_bins)
+
+    assert_that(bins).is_instance_of(list)
+    assert_that(len(bins)).is_less_than_or_equal_to(max(n_bins, 0))
+    assert_that(sum(b["count"] for b in bins)).is_equal_to(0 if n_bins < 1 else 500)
+    assert_that([b["bin_lo"] for b in bins]).is_equal_to(sorted(b["bin_lo"] for b in bins))
+    for b in bins:
+        assert_that(b["count"]).is_greater_than(0)  # occupied bins only
+        assert_that(b["mean_confidence"]).is_between(b["bin_lo"] - 1e-12, b["bin_hi"] + 1e-12)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["float32", "float64"])
+def test_negative_log_likelihood_is_dtype_independent(dtype) -> None:
+    """float32 probabilities must give the same number as float64 ones.
+
+    `labeling.softmax` returns float32, so that is the realistic input — and no test passed one. The
+    function gathers the true-class probabilities BEFORE promoting to float64 rather than promoting
+    the whole matrix, which is what keeps the allocation proportional to n instead of n x n_classes;
+    the promotion is exact, so the value must not move."""
+    rng = np.random.default_rng(6)
+    z = rng.standard_normal((400, 12))
+    e = np.exp(z - z.max(axis=1, keepdims=True))
+    probs = (e / e.sum(axis=1, keepdims=True)).astype(dtype)
+    labels = rng.integers(0, 12, 400)
+
+    value = negative_log_likelihood(probs, labels)
+
+    expected = float(
+        -np.mean(
+            np.log(
+                np.clip(
+                    np.asarray(probs, dtype=np.float64)[np.arange(400), labels], _PROB_FLOOR, 1.0
+                )
+            )
+        )
+    )
+    assert_that(value).is_equal_to(expected)  # exact: promotion after the gather changes nothing
+
+
+def test_negative_log_likelihood_allocation_does_not_grow_with_the_class_count() -> None:
+    """The reason this function gathers before promoting — and the only way to pin it.
+
+    Reading n true-class probabilities out of an (n, n_classes) float32 matrix does not require
+    promoting the matrix. Doing so anyway costs 8 bytes per entry for values that are never read:
+    measured at n=20 000, promoting first peaks at 1.9 MB for 8 classes and 10.9 MB for 64, while
+    gathering first is flat at 0.64 MB for both.
+
+    Asserted as a RATIO across two class counts rather than an absolute byte figure, so it does not
+    depend on the allocator: the correct implementation is flat (1.0x) and the regression scales
+    with n_classes (5.7x over this pair), which leaves the 2x threshold a wide margin."""
+    import tracemalloc
+
+    def peak_bytes(n_classes: int) -> int:
+        rng = np.random.default_rng(0)
+        z = rng.standard_normal((20_000, n_classes))
+        e = np.exp(z - z.max(axis=1, keepdims=True))
+        probs = (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
+        labels = rng.integers(0, n_classes, 20_000)
+        negative_log_likelihood(probs, labels)  # warm any lazy allocation
+        tracemalloc.start()
+        negative_log_likelihood(probs, labels)
+        measured = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return measured
+
+    narrow, wide = peak_bytes(8), peak_bytes(64)
+
+    assert_that(wide).is_less_than(2 * narrow)
 
 
 def test_calibration_module_is_torch_free() -> None:
