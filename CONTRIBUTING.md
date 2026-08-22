@@ -19,8 +19,11 @@ uv run ruff format . && uv run ruff check .
 
 Optional stacks — all five extras: `uv sync --extra models` (torch backbones, several
 GB), `--extra ot`, `--extra cluster-graph`, `--extra pacmap`, `--extra explain`. The CI
-`test-extras` job installs the last four together; `models` is manual-only. Real-model
-tests: `uv run pytest -m model`.
+`test-extras` job installs the last four plus `--group torch-cpu`, a CI-only dependency
+group holding a CPU-only torch: several tests in `test_sequence` / `test_adapt_*` are
+guarded by `importorskip("torch")` and need a torch present to run at all, but not the
+`models` backbones. `models` itself stays manual-only. Real-model tests:
+`uv run pytest -m model`.
 
 Note that this is the *development* setup, cloning the repository. moodengine is
 published to no package index; consuming it from another project goes through a git
