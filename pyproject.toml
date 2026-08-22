@@ -191,9 +191,46 @@ src = ["src", "tests", "scripts"]
 [tool.mypy]
 files = ["src/moodengine"]
 python_version = "3.11"
+# The staged-strictness plan this file has referred to since the start, now actually staged:
+# `strict` is ON, and every module still carrying pre-strict debt is named in the override
+# below. That list can only ever SHRINK — a module not on it is strict, so a new module is
+# strict from its first commit without anyone remembering to opt it in. The previous
+# arrangement (default mode plus an intention) had the opposite property.
+strict = true
 
 # The scientific stack is largely untyped or stub-less; silence only the import
 # errors, never the checks on our own code.
+# The five strict checks the engine has not finished paying off, disabled ONLY for the modules
+# that still owe them. Counted at the time of writing: 30 no-untyped-def, 27 type-arg,
+# 21 no-any-return, 5 no-untyped-call, 4 attr-defined, over these modules. Six modules are
+# already clean and are deliberately absent: _typing, _validation, exceptions, feedback,
+# io_audio, config. Take a module OFF this list when it goes green; never add one.
+[[tool.mypy.overrides]]
+module = [
+    "moodengine.pipeline",
+    "moodengine.evaluation",
+    "moodengine.sequence",
+    "moodengine.labeling",
+    "moodengine.calibration",
+    "moodengine.adapt",
+    "moodengine.pooling",
+    "moodengine.explain",
+    "moodengine.cluster",
+    "moodengine.search",
+    "moodengine.mood_arc",
+    "moodengine.novelty",
+    "moodengine.journey",
+    "moodengine._math",
+    "moodengine.__init__",
+    "moodengine.embeddings.*",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_any_generics = false
+disallow_untyped_calls = false
+warn_return_any = false
+no_implicit_reexport = false
+
 [[tool.mypy.overrides]]
 module = [
     "sklearn.*",
@@ -245,6 +282,11 @@ DEP004 = ["typer"]
 
 [tool.coverage.run]
 source = ["moodengine"]
+# Branch coverage, not just line coverage. 1130 branches in this package were invisible to the
+# gate: a line executes, so it counts, whether or not both sides of its `if` were ever taken.
+# Turning it on costs about two points of the headline number and makes 119 partially-taken
+# branches visible instead of counting as covered.
+branch = true
 # clap.py / mert.py / mulan.py are pure torch wrappers with no unit tests by contract
 # (they run only under the opt-in `-m model` suite) — counting their guaranteed-0% lines
 # in the default-suite denominator would make the floor dishonest, not stricter.
@@ -267,7 +309,13 @@ show_missing = true
 # CI job, whose data is merged with this one into the report Sonar imports — so the
 # project number is the union, while this floor stays a floor on the torch-free suite
 # alone. Raise it only when a measured, sustained gain backs it.
-fail_under = 80
+#
+# 80 -> 83, and the number it gates now includes branches. Measured on the real light
+# install: 86.92% line-only, 85.0% once the 1130 branches count. At 80 a five-point
+# regression passed silently, which is not a floor. 83 keeps about two points of slack for
+# churn against the branch-aware figure — the same margin the line-only setting used to
+# have, re-derived rather than carried over, because the two numbers are not comparable.
+fail_under = 83
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
