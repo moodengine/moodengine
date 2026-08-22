@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import hashlib
 
+import hypothesis.extra.numpy as npst
+import hypothesis.strategies as st
 import numpy as np
 import pytest
 from assertpy import assert_that
+from hypothesis import assume, given
 
 import moodengine.search as search
 from moodengine.search import (
@@ -1075,3 +1078,74 @@ def test_find_neighbours_mmr_equals_the_harmonic_greedy_with_both_weights_at_zer
     # Zeroed weights build no table at all, rather than a row of zeros added at every greedy
     # step — a value assertion cannot see that difference, since 0.0 * anything cancels either way.
     assert_that(bonus.call_count).is_equal_to(0)
+
+
+# --------------------------------------------------------------------------- #
+# Properties — the retrieval contracts stated over generated libraries rather
+# than one fixture. find_similar, similarity_matrix and near_duplicate_pairs
+# together carried 41 surviving mutants.
+# --------------------------------------------------------------------------- #
+
+_LIBRARY = npst.arrays(
+    dtype=np.float32,
+    shape=npst.array_shapes(min_dims=2, max_dims=2, min_side=2, max_side=10),
+    elements=st.floats(-20.0, 20.0, width=32, allow_nan=False, allow_infinity=False),
+)
+
+
+@given(X=_LIBRARY, top_k=st.integers(1, 12))
+def test_find_similar_never_returns_the_query_and_respects_top_k(X: np.ndarray, top_k: int) -> None:
+    """Self-exclusion and the k cap are the two promises every caller builds on.
+
+    A query that returns itself scores a perfect 1.0 and pushes a real neighbour out of the list,
+    which reads as a good result rather than a bug.
+    """
+    names = [f"t{i}.wav" for i in range(X.shape[0])]
+
+    out = find_similar(0, X, names, top_k=top_k)
+
+    assert_that(len(out)).is_less_than_or_equal_to(min(top_k, X.shape[0] - 1))
+    assert_that([n for n, _ in out]).does_not_contain(names[0])
+    assert_that(len(set(n for n, _ in out))).is_equal_to(len(out))  # no repeats
+
+
+@given(X=_LIBRARY, top_k=st.integers(1, 12))
+def test_find_similar_returns_cosines_in_descending_order(X: np.ndarray, top_k: int) -> None:
+    """Scores are real cosines, so they are bounded, and the list is ranked."""
+    names = [f"t{i}.wav" for i in range(X.shape[0])]
+
+    scores = [s for _, s in find_similar(0, X, names, top_k=top_k)]
+
+    assert_that(all(-1.0001 <= s <= 1.0001 for s in scores)).is_true()
+    assert_that(all(a >= b - 1e-6 for a, b in zip(scores, scores[1:]))).is_true()
+
+
+@given(X=_LIBRARY)
+def test_similarity_matrix_is_symmetric_with_a_unit_diagonal(X: np.ndarray) -> None:
+    """It is a cosine block: symmetric by construction, and every row is similar to itself.
+
+    A zero row is the exception the eps floor creates — its self-similarity is 0, not 1.
+    """
+    S = similarity_matrix(X)
+    non_zero = np.linalg.norm(X, axis=1) > 1e-8
+    assume(bool(non_zero.any()))
+
+    np.testing.assert_allclose(S, S.T, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(np.diag(S)[non_zero], 1.0, rtol=1e-3, atol=1e-3)
+
+
+@given(X=_LIBRARY, threshold=st.floats(0.5, 0.999))
+def test_near_duplicate_pairs_are_ordered_and_clear_the_threshold(
+    X: np.ndarray, threshold: float
+) -> None:
+    """Every reported pair is (i < j) and genuinely at or above the threshold.
+
+    The ordering is what stops the same duplicate being reported twice, and the threshold is the
+    whole meaning of the result — a pair below it is a false positive a caller would act on.
+    """
+    names = [f"t{i}.wav" for i in range(X.shape[0])]
+
+    pairs = near_duplicate_pairs(X, names, threshold=threshold)
+
+    assert_that(all(names.index(a) < names.index(b) for a, b, _ in pairs)).is_true()
+    assert_that(all(sim >= threshold - 1e-5 for _, _, sim in pairs)).is_true()
