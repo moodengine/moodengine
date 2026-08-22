@@ -15,6 +15,8 @@ Deterministic; torch-free (the deep-learning stack is never imported here).
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from moodengine.exceptions import MissingDependencyError
@@ -87,7 +89,8 @@ def ot_morph(
 
     .. note::
        ``filenames`` is accepted and never read — the return is row POSITIONS, not names. It is
-       kept for signature stability and should be removed; pass ``[]``.
+       kept for signature stability and is deprecated; pass ``[]``. A non-empty value emits a
+       :class:`DeprecationWarning`.
 
     (opt-in). Requires POT (``import ot`` is LAZY → ``ImportError`` when it isn't installed, which the
     caller can catch to degrade gracefully). Pure numpy + POT, deterministic.
@@ -106,6 +109,18 @@ def ot_morph(
         import ot  # noqa: PLC0415 — lazy on purpose: keeps SLERP mode POT-free
     except ImportError as exc:
         raise MissingDependencyError("ot_morph", "POT", "ot") from exc
+
+    if filenames:
+        # A deprecation nobody can observe is not a deprecation — the repo's rule is one minor
+        # version with a DeprecationWarning, then removal. Raised only when the caller actually
+        # passes names, so the documented `[]` form stays silent.
+        warnings.warn(
+            "ot_morph(filenames=...) is deprecated and will be removed in a future minor "
+            "release; the parameter is unused because the return is row positions, not names. "
+            "Pass [] instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     Xn = l2_normalize(np.asarray(X, dtype=np.float64), axis=1)
     a = l2_normalize(np.asarray(v_a, dtype=np.float64).reshape(-1), axis=-1)
@@ -284,6 +299,43 @@ def smooth_order(X: np.ndarray, start: int | None = None) -> list[int]:
     return _two_opt_path(cost, int(start) if start is not None else _cheapest_nn_start(cost))
 
 
+def _relax_mask(dp: np.ndarray, parent: np.ndarray, cost: np.ndarray, mask: int, n: int) -> None:
+    """Relax every edge leaving the states of one visited-set ``mask``, in place.
+
+    Called once per mask (``2^n`` times, and ``n`` is capped at :data:`_EXACT_ORDER_MAX`), so the
+    two inner loops stay here rather than becoming per-edge calls.
+    """
+    for j in range(n):
+        here = dp[mask, j]
+        if not np.isfinite(here) or not (mask >> j) & 1:
+            continue
+
+        for nxt in range(n):
+            if (mask >> nxt) & 1:
+                continue
+            nmask = mask | (1 << nxt)
+            cand = here + cost[j, nxt]
+            if cand < dp[nmask, nxt]:
+                dp[nmask, nxt] = cand
+                parent[nmask, nxt] = j
+
+
+def _reconstruct_tour(parent: np.ndarray, full: int, end: int) -> list[int]:
+    """Walk the parent pointers back from ``end`` over the full mask, returning the tour forwards.
+
+    A state is reachable only from a seeded singleton, so ``parent == -1`` terminates the walk at
+    whichever allowed origin won — no separate record of the chosen start is needed.
+    """
+    tour, mask, node = [], full, end
+    while node != -1:
+        tour.append(node)
+        prev = int(parent[mask, node])
+        mask ^= 1 << node
+        node = prev
+
+    return [int(i) for i in tour[::-1]]
+
+
 def _held_karp_path(cost: np.ndarray, starts: list[int]) -> list[int]:
     """Exact minimum-cost open Hamiltonian path by subset DP, over the allowed start nodes.
 
@@ -298,38 +350,21 @@ def _held_karp_path(cost: np.ndarray, starts: list[int]) -> list[int]:
     """
     n = cost.shape[0]
     full = 1 << n
-    # dp[mask][j] = cheapest path visiting exactly `mask`, opening at any allowed start, ending at
-    # `j`. A state is reachable only from a seeded singleton, so `parent == -1` still terminates
-    # the reconstruction at whichever origin won.
+    # dp[mask][j] = cheapest path visiting exactly `mask`, opening at any allowed start, ending
+    # at `j`.
     dp = np.full((full, n), np.inf)
     parent = np.full((full, n), -1, dtype=np.int32)
     for origin in starts:
         dp[1 << origin, origin] = 0.0
 
     for mask in range(full):
-        for j in range(n):
-            here = dp[mask, j]
-            if not np.isfinite(here) or not (mask >> j) & 1:
-                continue
-            for nxt in range(n):
-                if (mask >> nxt) & 1:
-                    continue
-                nmask = mask | (1 << nxt)
-                cand = here + cost[j, nxt]
-                if cand < dp[nmask, nxt]:
-                    dp[nmask, nxt] = cand
-                    parent[nmask, nxt] = j
+        _relax_mask(dp, parent, cost, mask, n)
 
     end = int(np.argmin(dp[full - 1]))
     if not np.isfinite(dp[full - 1, end]):  # pragma: no cover — unreachable for a finite cost
         return list(range(n))
-    tour, mask, node = [], full - 1, end
-    while node != -1:
-        tour.append(node)
-        prev = int(parent[mask, node])
-        mask ^= 1 << node
-        node = prev
-    return [int(i) for i in tour[::-1]]
+
+    return _reconstruct_tour(parent, full - 1, end)
 
 
 #: Working-memory budget for the all-starts nearest-neighbour sweep in

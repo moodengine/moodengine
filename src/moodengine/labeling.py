@@ -944,6 +944,24 @@ def name_clusters(cluster_labels: np.ndarray, top_moods: list[str]) -> dict:
     return named
 
 
+def _mean_top1_minus_top2(label_df: pd.DataFrame) -> float:
+    """Mean gap between each row's best and second-best mood score.
+
+    A row with fewer than two scores contributes 0.0 rather than being dropped: the metric is a
+    mean over TRACKS, so skipping the thin rows would quietly raise it on exactly the batches
+    where confidence is least established.
+    """
+    if "mood_topk_scores" not in label_df:
+        return 0.0
+
+    margins = []
+    for scores in label_df["mood_topk_scores"]:
+        seq = list(scores) if scores is not None else []
+        margins.append(float(seq[0] - seq[1]) if len(seq) >= 2 else 0.0)
+
+    return float(np.mean(margins)) if margins else 0.0
+
+
 def labeling_quality_metrics(label_df: pd.DataFrame, mood_names: list[str] | None = None) -> dict:
     """Health metrics for a :func:`label_tracks` output — three temperature-invariant, two not.
 
@@ -969,13 +987,6 @@ def labeling_quality_metrics(label_df: pd.DataFrame, mood_names: list[str] | Non
     n_distinct = len(counts)
     max_share = (max(counts.values()) / n) if n else 0.0
 
-    margins: list[float] = []
-    if "mood_topk_scores" in label_df:
-        for scores in label_df["mood_topk_scores"]:
-            seq = list(scores) if scores is not None else []
-            margins.append(float(seq[0] - seq[1]) if len(seq) >= 2 else 0.0)
-    mean_margin = float(np.mean(margins)) if margins else 0.0
-
     top_scores = [
         float(s)
         for s in (label_df["top_score"] if "top_score" in label_df else [])
@@ -987,6 +998,6 @@ def labeling_quality_metrics(label_df: pd.DataFrame, mood_names: list[str] | Non
         "n_distinct_top_moods": int(n_distinct),
         "top_mood_histogram": {m: int(c) for m, c in counts.items()},
         "max_mood_share": float(max_share),
-        "mean_top1_minus_top2": mean_margin,
+        "mean_top1_minus_top2": _mean_top1_minus_top2(label_df),
         "mean_top_score": mean_top_score,
     }

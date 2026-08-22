@@ -24,6 +24,43 @@ def _stable_softmax(x: np.ndarray) -> np.ndarray:
     return (e / e.sum()).astype(np.float32, copy=False)
 
 
+def _subset_layer_indices(n_layers: int, layers: tuple[int, ...] | None) -> list[int]:
+    """Layer indices for ``mode='subset'``: the requested ones, else the middle third.
+
+    Out-of-range indices are dropped, but a ``layers`` tuple selecting NO valid layer raises
+    rather than falling back to all of them. The cache key still spells the subset that was asked
+    for (`_lw-subset-20.21`), so a silent fallback would persist a full-uniform vector under a
+    name claiming otherwise, and every later run would serve it.
+    """
+    if not layers:
+        middle = list(range(n_layers // 3, 2 * n_layers // 3 + 1))
+        return [i for i in middle if 0 <= i < n_layers] or list(range(n_layers))
+
+    idx = sorted({int(i) for i in layers if 0 <= int(i) < n_layers})
+    if not idx:
+        raise ValueError(
+            f"mert_layers={tuple(layers)!r} selects no valid layer: the model produced "
+            f"{n_layers} layers, so indices must be in [0, {n_layers}). Pass indices in "
+            f"range, or use mert_layer_weighting='uniform' if you meant all of them."
+        )
+    return idx
+
+
+def _layer_softmax_weights(n_layers: int, layer_weights: tuple[float, ...] | None) -> np.ndarray:
+    """Softmax over ``layer_weights`` for ``mode='weighted'``, one logit per layer.
+
+    A missing or mis-sized tuple raises: a silent uniform fallback would return a numerically
+    different result from the one asked for.
+    """
+    if layer_weights is None or len(layer_weights) != n_layers:
+        got = "None" if layer_weights is None else str(len(layer_weights))
+        raise ValueError(
+            f"layer_weights has {got} entries but the model produced {n_layers} layers; "
+            f"mode='weighted' needs one logit per layer (it never falls back silently)"
+        )
+    return _stable_softmax(np.asarray(layer_weights, dtype=np.float32))
+
+
 def weight_layers(
     frame_emb: np.ndarray,
     mode: LayerWeighting,
@@ -60,31 +97,10 @@ def weight_layers(
     if mode == "uniform":
         return frame_emb.mean(axis=0).astype(np.float32, copy=False)
     if mode == "subset":
-        if layers:
-            idx = sorted({int(i) for i in layers if 0 <= int(i) < n_layers})
-            if not idx:
-                # Every requested index is out of range, so "subset" would quietly become
-                # "uniform" — and the cache key still spells the subset that was asked for
-                # (`_lw-subset-20.21`), so the full-uniform vector is persisted under a name
-                # claiming otherwise and every later run serves it. The `weighted` branch below
-                # already refuses its own version of this; refuse here for the same reason.
-                raise ValueError(
-                    f"mert_layers={tuple(layers)!r} selects no valid layer: the model produced "
-                    f"{n_layers} layers, so indices must be in [0, {n_layers}). Pass indices in "
-                    f"range, or use mert_layer_weighting='uniform' if you meant all of them."
-                )
-        else:
-            idx = list(range(n_layers // 3, 2 * n_layers // 3 + 1))
-            idx = [i for i in idx if 0 <= i < n_layers] or list(range(n_layers))
+        idx = _subset_layer_indices(n_layers, layers)
         return frame_emb[idx].mean(axis=0).astype(np.float32, copy=False)
     if mode == "weighted":
-        if layer_weights is None or len(layer_weights) != n_layers:
-            got = "None" if layer_weights is None else str(len(layer_weights))
-            raise ValueError(
-                f"layer_weights has {got} entries but the model produced {n_layers} layers; "
-                f"mode='weighted' needs one logit per layer (it never falls back silently)"
-            )
-        w = _stable_softmax(np.asarray(layer_weights, dtype=np.float32))
+        w = _layer_softmax_weights(n_layers, layer_weights)
         return np.tensordot(w, frame_emb, axes=([0], [0])).astype(np.float32, copy=False)
     raise ValueError(f"unknown layer weighting mode: {mode!r}")
 
