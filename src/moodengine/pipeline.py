@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Mapping
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -531,28 +531,8 @@ def run_pipeline_core(
 
     # Degenerate guard: nothing to cluster/label, but keep the full schema.
     if n == 0:
-        df = pd.DataFrame(
-            {
-                "filename": pd.Series([], dtype=str),
-                "path": pd.Series([], dtype=str),
-                "cluster": pd.Series([], dtype=int),
-                "x": pd.Series([], dtype=float),
-                "y": pd.Series([], dtype=float),
-                "is_medoid": pd.Series([], dtype=bool),
-                "outlier_score": pd.Series([], dtype=float),
-            }
-        )
-        if with_labels:
-            df["top_mood"] = pd.Series([], dtype=str)
-            df["top_score"] = pd.Series([], dtype=float)
-            df["mood_top3"] = pd.Series([], dtype=object)
-            df["mood_top3_scores"] = pd.Series([], dtype=object)
-            df["energy"] = pd.Series([], dtype=float)
-            df["valence"] = pd.Series([], dtype=float)
-            df["cluster_mood"] = pd.Series([], dtype=str)
-            df["cluster_profile"] = pd.Series([], dtype=str)
         return PipelineResult(
-            assignments=df,
+            assignments=_empty_assignments(with_labels),
             labels=np.empty(0, dtype=int),
             coords2d=np.empty((0, 2), dtype=np.float32),
             metrics=_cluster.cluster_metrics(np.empty((0, 0)), np.empty(0)),
@@ -608,118 +588,13 @@ def run_pipeline_core(
             # labeling has nothing to score against, so emit blank label columns
             # rather than crashing on a (n, 0) @ (n_moods, d) shape mismatch.
             logger.warning("No CLAP audio embeddings available; skipping mood labels.")
-            df["top_mood"] = ""
-            df["top_score"] = float("nan")
-            df["mood_top3"] = [[] for _ in range(n)]
-            df["mood_top3_scores"] = [[] for _ in range(n)]
-            df["energy"] = float("nan")
-            df["valence"] = float("nan")
-            df["cluster_mood"] = ""
-            df["cluster_profile"] = ""
-            profiles = {}
+            _attach_blank_labels(df, n)
         else:
-            recenter = config.recenter_labels
-            # The mood label matrix costs a text-encoder forward over the whole
-            # prompt vocabulary — build it once and share it between per-track
-            # labels and cluster profiles instead of paying it twice.
-            mood_lm = _labeling.build_label_matrix(clap_embedder, _labeling.DEFAULT_MOOD_PROMPTS)
-
-            # Score ONLY the rows whose CLAP embedding succeeded: a zero row would
-            # both receive fabricated labels and bias the per-mood recentering
-            # means for every real track.
-            valid_idx = np.flatnonzero(clap_valid)
-            X_valid = clap_X if clap_valid.all() else clap_X[valid_idx]
-
-            # Estimate the modality-gap offset ONCE, over the whole library, and pass it
-            # explicitly from here on. Letting each call fall back to its own batch mean would
-            # give the same numbers on this pass (the batch IS the library) but nothing to reuse:
-            # a caller later scoring one new track, or re-scoring a playlist, would re-estimate
-            # the offset from that handful of rows and land on a different label for a track this
-            # run already labelled. Returned on PipelineResult.mood_prior for exactly that reason.
-            # ...but only once there are enough rows for a mean to BE an estimate. A supplied
-            # prior deliberately bypasses `recenter_similarities`' min_n, so deriving one from a
-            # handful of rows and feeding it straight back subtracts each row's own similarity
-            # from itself: at n=1 that is exactly zero, and every score collapses to the uniform
-            # softmax. Below the floor the priors stay None and the documented small-batch
-            # behaviour applies, which is also what a caller re-scoring one track later gets.
-            enough_for_prior = X_valid.shape[0] >= _labeling.RECENTER_MIN_N
-            if not enough_for_prior:
-                logger.info(
-                    "Only %d labelled row(s) < %d: not estimating recentering priors from them "
-                    "(they would cancel themselves out); PipelineResult priors stay None.",
-                    X_valid.shape[0],
-                    _labeling.RECENTER_MIN_N,
-                )
-
-            mood_prior = (
-                _labeling.label_prior(X_valid @ np.asarray(mood_lm[1], dtype=np.float32).T)
-                if enough_for_prior
-                else None
-            )
-            ld = _labeling.label_tracks(
-                X_valid, recenter=recenter, label_matrix=mood_lm, prior=mood_prior
-            )
-            # Same for the two attribute axes. They carry their own modality-gap offsets — a
-            # separate vocabulary each — so `mood_prior` does not cover them, and leaving them on
-            # the batch fallback made `energy` and `valence` the only shipped columns a later
-            # single-track re-score could not reproduce (that path is also below
-            # `recenter_similarities`' min_n, so it would skip centering entirely).
-            energy_lm = _labeling.build_label_matrix(clap_embedder, _labeling.ENERGY_PROMPTS)
-            valence_lm = _labeling.build_label_matrix(clap_embedder, _labeling.VALENCE_PROMPTS)
-            energy_prior, valence_prior = (
-                _labeling.attribute_priors(
-                    X_valid, clap_embedder, energy_matrix=energy_lm, valence_matrix=valence_lm
-                )
-                if enough_for_prior
-                else (None, None)
-            )
-            attr = _labeling.attribute_scores(
-                X_valid,
-                clap_embedder,
-                recenter=recenter,
-                energy_prior=energy_prior,
-                valence_prior=valence_prior,
-                energy_matrix=energy_lm,
-                valence_matrix=valence_lm,
-            )
-
-            # Scatter back into full-length columns; failed rows get the same
-            # sentinels as the all-failed path (blank mood, NaN scores, empty lists).
-            top_mood = np.full(n, "", dtype=object)
-            top_mood[valid_idx] = ld["top_mood"].astype(str).to_numpy()
-            top_score = np.full(n, np.nan, dtype=float)
-            top_score[valid_idx] = ld["top_score"].astype(float).to_numpy()
-            top3: list[list] = [[] for _ in range(n)]
-            top3_scores: list[list] = [[] for _ in range(n)]
-            for pos, row in enumerate(valid_idx):
-                top3[row] = ld["mood_topk"].iloc[pos]
-                top3_scores[row] = ld["mood_topk_scores"].iloc[pos]
-            energy = np.full(n, np.nan, dtype=float)
-            energy[valid_idx] = attr["energy"].astype(float).to_numpy()
-            valence = np.full(n, np.nan, dtype=float)
-            valence[valid_idx] = attr["valence"].astype(float).to_numpy()
-
-            df["top_mood"] = [str(v) for v in top_mood]
-            df["top_score"] = top_score
-            df["mood_top3"] = top3
-            df["mood_top3_scores"] = top3_scores
-            df["energy"] = energy
-            df["valence"] = valence
-
-            profiles = _labeling.cluster_mood_profiles(
-                X_valid,
-                labels[valid_idx],
-                recenter=recenter,
-                label_matrix=mood_lm,
-                prior=mood_prior,
-            )
-            cluster_mood = {cid: (profs[0][0] if profs else "") for cid, profs in profiles.items()}
-            cluster_profile = {
-                cid: ", ".join(f"{m} {s:.2f}" for m, s in profs) for cid, profs in profiles.items()
-            }
-            df["cluster_mood"] = df["cluster"].map(cluster_mood).fillna("").astype(str)
-            df["cluster_profile"] = df["cluster"].map(cluster_profile).fillna("").astype(str)
-
+            labelled = _attach_labels(df, clap_X, clap_valid, clap_embedder, labels, config, n)
+            profiles = labelled.profiles
+            mood_prior = labelled.mood_prior
+            energy_prior = labelled.energy_prior
+            valence_prior = labelled.valence_prior
             have_labels = True
 
     return PipelineResult(
@@ -738,6 +613,210 @@ def run_pipeline_core(
     )
 
 
+class _LabelOutcome(NamedTuple):
+    """What the labeling pass produced besides the columns it wrote onto the frame.
+
+    ``profiles`` maps each cluster id to its ranked ``(mood, score)`` profile; the three priors
+    are the modality-gap offsets estimated over the whole batch, or None when it held fewer than
+    ``labeling.RECENTER_MIN_N`` rows (see :func:`_attach_labels`).
+    """
+
+    profiles: dict[int, list[tuple[str, float]]]
+    mood_prior: NDArray[np.float32] | None
+    energy_prior: NDArray[np.float32] | None
+    valence_prior: NDArray[np.float32] | None
+
+
+def _empty_assignments(with_labels: bool) -> pd.DataFrame:
+    """The zero-row assignments frame, carrying the full column schema and its dtypes.
+
+    Same columns (and dtypes) a populated run produces, so a consumer that found no audio still
+    sees the shape it would have got with audio instead of a frame with no columns at all.
+    """
+    df = pd.DataFrame(
+        {
+            "filename": pd.Series([], dtype=str),
+            "path": pd.Series([], dtype=str),
+            "cluster": pd.Series([], dtype=int),
+            "x": pd.Series([], dtype=float),
+            "y": pd.Series([], dtype=float),
+            "is_medoid": pd.Series([], dtype=bool),
+            "outlier_score": pd.Series([], dtype=float),
+        }
+    )
+    if with_labels:
+        df["top_mood"] = pd.Series([], dtype=str)
+        df["top_score"] = pd.Series([], dtype=float)
+        df["mood_top3"] = pd.Series([], dtype=object)
+        df["mood_top3_scores"] = pd.Series([], dtype=object)
+        df["energy"] = pd.Series([], dtype=float)
+        df["valence"] = pd.Series([], dtype=float)
+        df["cluster_mood"] = pd.Series([], dtype=str)
+        df["cluster_profile"] = pd.Series([], dtype=str)
+    return df
+
+
+def _attach_blank_labels(df: pd.DataFrame, n: int) -> None:
+    """Write the label columns for a run where NO row could be scored, in place.
+
+    The same sentinels a single failed row gets (blank mood, NaN scores, empty lists), so the
+    two situations are indistinguishable to a consumer — both mean "no label", and neither
+    fabricates one from a zero vector.
+    """
+    df["top_mood"] = ""
+    df["top_score"] = float("nan")
+    df["mood_top3"] = [[] for _ in range(n)]
+    df["mood_top3_scores"] = [[] for _ in range(n)]
+    df["energy"] = float("nan")
+    df["valence"] = float("nan")
+    df["cluster_mood"] = ""
+    df["cluster_profile"] = ""
+
+
+def _scatter_label_columns(
+    df: pd.DataFrame,
+    ld: pd.DataFrame,
+    attr: pd.DataFrame,
+    valid_idx: NDArray[np.intp],
+    n: int,
+) -> None:
+    """Scatter the scored rows back into full-length label columns, in place.
+
+    ``ld`` / ``attr`` hold one row per SCORED track (``valid_idx`` says which frame row each
+    belongs to); the rows in between get the same sentinels as the all-failed path (blank mood,
+    NaN scores, empty lists).
+    """
+    top_mood = np.full(n, "", dtype=object)
+    top_mood[valid_idx] = ld["top_mood"].astype(str).to_numpy()
+    top_score = np.full(n, np.nan, dtype=float)
+    top_score[valid_idx] = ld["top_score"].astype(float).to_numpy()
+    top3: list[list] = [[] for _ in range(n)]
+    top3_scores: list[list] = [[] for _ in range(n)]
+    for pos, row in enumerate(valid_idx):
+        top3[row] = ld["mood_topk"].iloc[pos]
+        top3_scores[row] = ld["mood_topk_scores"].iloc[pos]
+    energy = np.full(n, np.nan, dtype=float)
+    energy[valid_idx] = attr["energy"].astype(float).to_numpy()
+    valence = np.full(n, np.nan, dtype=float)
+    valence[valid_idx] = attr["valence"].astype(float).to_numpy()
+
+    df["top_mood"] = [str(v) for v in top_mood]
+    df["top_score"] = top_score
+    df["mood_top3"] = top3
+    df["mood_top3_scores"] = top3_scores
+    df["energy"] = energy
+    df["valence"] = valence
+
+
+def _attach_cluster_profile_columns(
+    df: pd.DataFrame, profiles: dict[int, list[tuple[str, float]]]
+) -> None:
+    """Broadcast each cluster's dominant mood and ranked profile onto its rows, in place.
+
+    A cluster absent from ``profiles`` (nothing in it could be scored) gets the empty string,
+    never NaN — the two columns are declared as text.
+    """
+    cluster_mood = {cid: (profs[0][0] if profs else "") for cid, profs in profiles.items()}
+    cluster_profile = {
+        cid: ", ".join(f"{m} {s:.2f}" for m, s in profs) for cid, profs in profiles.items()
+    }
+    df["cluster_mood"] = df["cluster"].map(cluster_mood).fillna("").astype(str)
+    df["cluster_profile"] = df["cluster"].map(cluster_profile).fillna("").astype(str)
+
+
+def _attach_labels(
+    df: pd.DataFrame,
+    clap_X: np.ndarray,
+    clap_valid: NDArray[np.bool_],
+    clap_embedder: SupportsEmbedText,
+    labels: NDArray[np.int_],
+    config: Config,
+    n: int,
+) -> _LabelOutcome:
+    """Score the usable CLAP rows, write every label column onto ``df``, return profiles+priors.
+
+    ``clap_X`` is ``(n, d)`` aligned to ``df``'s rows with ``clap_valid`` flagging the ones whose
+    embedding succeeded; ``labels`` is the ``(n,)`` cluster assignment. ``n`` is ``len(df)``.
+    Mutates ``df`` in place (the caller owns it) and returns everything that does NOT live on the
+    frame.
+    """
+    recenter = config.recenter_labels
+    # The mood label matrix costs a text-encoder forward over the whole
+    # prompt vocabulary — build it once and share it between per-track
+    # labels and cluster profiles instead of paying it twice.
+    mood_lm = _labeling.build_label_matrix(clap_embedder, _labeling.DEFAULT_MOOD_PROMPTS)
+
+    # Score ONLY the rows whose CLAP embedding succeeded: a zero row would
+    # both receive fabricated labels and bias the per-mood recentering
+    # means for every real track.
+    valid_idx = np.flatnonzero(clap_valid)
+    X_valid = clap_X if clap_valid.all() else clap_X[valid_idx]
+
+    # Estimate the modality-gap offset ONCE, over the whole library, and pass it
+    # explicitly from here on. Letting each call fall back to its own batch mean would
+    # give the same numbers on this pass (the batch IS the library) but nothing to reuse:
+    # a caller later scoring one new track, or re-scoring a playlist, would re-estimate
+    # the offset from that handful of rows and land on a different label for a track this
+    # run already labelled. Returned on PipelineResult.mood_prior for exactly that reason.
+    # ...but only once there are enough rows for a mean to BE an estimate. A supplied
+    # prior deliberately bypasses `recenter_similarities`' min_n, so deriving one from a
+    # handful of rows and feeding it straight back subtracts each row's own similarity
+    # from itself: at n=1 that is exactly zero, and every score collapses to the uniform
+    # softmax. Below the floor the priors stay None and the documented small-batch
+    # behaviour applies, which is also what a caller re-scoring one track later gets.
+    enough_for_prior = X_valid.shape[0] >= _labeling.RECENTER_MIN_N
+    if not enough_for_prior:
+        logger.info(
+            "Only %d labelled row(s) < %d: not estimating recentering priors from them "
+            "(they would cancel themselves out); PipelineResult priors stay None.",
+            X_valid.shape[0],
+            _labeling.RECENTER_MIN_N,
+        )
+
+    mood_prior = (
+        _labeling.label_prior(X_valid @ np.asarray(mood_lm[1], dtype=np.float32).T)
+        if enough_for_prior
+        else None
+    )
+    ld = _labeling.label_tracks(X_valid, recenter=recenter, label_matrix=mood_lm, prior=mood_prior)
+    # Same for the two attribute axes. They carry their own modality-gap offsets — a
+    # separate vocabulary each — so `mood_prior` does not cover them, and leaving them on
+    # the batch fallback made `energy` and `valence` the only shipped columns a later
+    # single-track re-score could not reproduce (that path is also below
+    # `recenter_similarities`' min_n, so it would skip centering entirely).
+    energy_lm = _labeling.build_label_matrix(clap_embedder, _labeling.ENERGY_PROMPTS)
+    valence_lm = _labeling.build_label_matrix(clap_embedder, _labeling.VALENCE_PROMPTS)
+    energy_prior, valence_prior = (
+        _labeling.attribute_priors(
+            X_valid, clap_embedder, energy_matrix=energy_lm, valence_matrix=valence_lm
+        )
+        if enough_for_prior
+        else (None, None)
+    )
+    attr = _labeling.attribute_scores(
+        X_valid,
+        clap_embedder,
+        recenter=recenter,
+        energy_prior=energy_prior,
+        valence_prior=valence_prior,
+        energy_matrix=energy_lm,
+        valence_matrix=valence_lm,
+    )
+
+    _scatter_label_columns(df, ld, attr, valid_idx, n)
+
+    profiles = _labeling.cluster_mood_profiles(
+        X_valid,
+        labels[valid_idx],
+        recenter=recenter,
+        label_matrix=mood_lm,
+        prior=mood_prior,
+    )
+    _attach_cluster_profile_columns(df, profiles)
+
+    return _LabelOutcome(profiles, mood_prior, energy_prior, valence_prior)
+
+
 def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict[str, Path]:
     """Persist the artifact set for ``result`` and return ``{name: path}``.
 
@@ -753,6 +832,15 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
     out = Path(out_dir) if out_dir is not None else Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # One name per artifact, built once. These filenames ARE the published contract — a caller
+    # globs for them — so they are stated here rather than repeated at each write site, where a
+    # rename could reach the file but not the `written` key that advertises it.
+    assignments_path = out / "assignments.parquet"
+    clusters_path = out / "clusters.html"
+    mood_space_path = out / "mood_space.html"
+    report_path = out / "cluster_report.md"
+    dashboard_path = out / "dashboard.html"
+
     df = result.assignments
     filenames = df["filename"].astype(str).tolist()
     moods = df["top_mood"].astype(str).tolist() if result.have_labels else None
@@ -760,8 +848,8 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
 
     written: dict[str, Path] = {}
 
-    df.to_parquet(out / "assignments.parquet", index=False)
-    written["assignments"] = out / "assignments.parquet"
+    df.to_parquet(assignments_path, index=False)
+    written["assignments"] = assignments_path
 
     _viz.plot_clusters(
         result.coords2d,
@@ -769,10 +857,10 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
         filenames,
         moods=moods,
         title="Mood clusters",
-        out_html=out / "clusters.html",
+        out_html=clusters_path,
         hover_text=hover,
     )
-    written["clusters_html"] = out / "clusters.html"
+    written["clusters_html"] = clusters_path
 
     if result.have_labels:
         _viz.plot_attributes(
@@ -782,9 +870,9 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
             filenames,
             moods=moods,
             title="Mood space (valence × energy)",
-            out_html=out / "mood_space.html",
+            out_html=mood_space_path,
         )
-        written["mood_space_html"] = out / "mood_space.html"
+        written["mood_space_html"] = mood_space_path
     elif result.labels_requested:
         # Labels requested but unavailable: still emit an empty scatter so the
         # artifact set is stable for downstream consumers.
@@ -794,9 +882,9 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
             [],
             [],
             title="Mood space (valence × energy)",
-            out_html=out / "mood_space.html",
+            out_html=mood_space_path,
         )
-        written["mood_space_html"] = out / "mood_space.html"
+        written["mood_space_html"] = mood_space_path
 
     written["report"] = write_cluster_report(
         df,
@@ -804,12 +892,12 @@ def write_artifacts(result: PipelineResult, out_dir: Path | None = None) -> dict
         result.metrics,
         config,
         result.method,
-        out_path=out / "cluster_report.md",
+        out_path=report_path,
     )
 
     # Restitution / UX: a self-contained dashboard + per-cluster .m3u playlists.
-    _viz.build_dashboard(df, out / "dashboard.html", audio_dir=config.raw_dir)
-    written["dashboard"] = out / "dashboard.html"
+    _viz.build_dashboard(df, dashboard_path, audio_dir=config.raw_dir)
+    written["dashboard"] = dashboard_path
     for m3u in _viz.export_m3u(df, out):
         written[m3u.stem] = m3u
 
@@ -914,54 +1002,8 @@ def write_cluster_report(
     metrics = metrics or {}
     profiles = profiles or {}
     has_df = df is not None and len(df) > 0 and "cluster" in df.columns
-    has_energy = has_df and "energy" in df.columns
-    has_valence = has_df and "valence" in df.columns
 
-    lines: list[str] = ["# Mood cluster report", ""]
-    lines.append(f"- **Method:** {method}")
-    n_tracks = int(len(df)) if df is not None else 0
-    lines.append(f"- **Tracks:** {n_tracks}")
-    lines.append(f"- **Clusters:** {metrics.get('n_clusters', 0)}")
-    noise_ratio = metrics.get("noise_ratio")
-    if noise_ratio is not None:
-        lines.append(f"- **Noise ratio:** {float(noise_ratio):.2%}")
-    # The headline silhouette is scored in whichever space the clustering ran in — the UMAP layout
-    # on the default path, a space fit to separate these very points. Reported alone it lets a
-    # persisted report certify "19 clusters, silhouette 0.28" for a library `run_clustering` has
-    # already judged structureless, and the file outlives the log line that said so. So the
-    # original-space score and its verdict ship beside it whenever the caller supplied them.
-    # Name the METRIC as well as the space. The two scores can be computed in the SAME space and
-    # still differ — `cluster_metrics` uses sklearn's euclidean default while `silhouette_original`
-    # is always cosine — so labelling both "(original space)" printed what read as a contradiction.
-    sil = metrics.get("silhouette")
-    space = metrics.get("silhouette_space")
-    lines.append(
-        f"- **Silhouette:** {f'{float(sil):.3f}' if sil is not None else 'n/a'}"
-        + (f" ({space} space, euclidean)" if space else "")
-    )
-    if "silhouette_original" in metrics:
-        sil_original = metrics.get("silhouette_original")
-        lines.append(
-            "- **Silhouette (original space, cosine):** "
-            + (f"{float(sil_original):.3f}" if sil_original is not None else "n/a")
-        )
-    structure = metrics.get("structure")
-    if structure is not None:
-        lines.append(f"- **Structure:** {structure}")
-    lines.append("")
-    if structure == "none_detected":
-        lines.append(
-            "> **No substantial structure.** The original-space silhouette does not support the "
-            "clusters below"
-            + (
-                ": they are largely an artifact of the dimensionality reduction, and the "
-                "silhouette above is not evidence to the contrary."
-                if space != "original"
-                else ", which were produced in that same space."
-            )
-            + " Read the sections as a partition of a continuum, not as discovered groups."
-        )
-        lines.append("")
+    lines = _report_summary_lines(df, metrics, method)
 
     if not has_df:
         lines.append("_No tracks to report._")
@@ -974,41 +1016,152 @@ def write_cluster_report(
     cluster_ids = [c for c in cluster_ids if c != -1] + ([-1] if -1 in cluster_ids else [])
 
     for cid in cluster_ids:
-        rows = df[df["cluster"] == cid]
-        heading = "noise" if cid == -1 else f"Cluster {cid}"
-        lines.append(f"## {heading}")
-        lines.append("")
-        lines.append(f"- **Size:** {len(rows)}")
-
-        if "cluster_mood" in df.columns and len(rows):
-            mood = str(rows["cluster_mood"].iloc[0])
-            if mood:
-                lines.append(f"- **Dominant mood:** {mood}")
-
-        profs = profiles.get(cid) or profiles.get(int(cid)) or []
-        if profs:
-            ranked = ", ".join(f"{m} {float(s):.2f}" for m, s in profs)
-            lines.append(f"- **Mood profile:** {ranked}")
-
-        if has_energy and len(rows):
-            mean_e = float(pd.to_numeric(rows["energy"], errors="coerce").mean())
-            if pd.notna(mean_e):
-                lines.append(f"- **Mean energy:** {mean_e:.2f}")
-        if has_valence and len(rows):
-            mean_v = float(pd.to_numeric(rows["valence"], errors="coerce").mean())
-            if pd.notna(mean_v):
-                lines.append(f"- **Mean valence:** {mean_v:.2f}")
-
-        if "filename" in df.columns:
-            examples = rows["filename"].astype(str).tolist()[:6]
-            if examples:
-                lines.append("- **Examples:**")
-                for fn in examples:
-                    lines.append(f"  - {fn}")
-        lines.append("")
+        lines.extend(_cluster_section_lines(df, cid, profiles))
 
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
+
+
+def _silhouette_lines(metrics: Mapping[str, Any]) -> list[str]:
+    """The silhouette bullet(s) and the structure verdict, in report order.
+
+    Every field is read with ``.get``, so a caller passing bare ``cluster_metrics`` output gets
+    just the headline line.
+    """
+    # The headline silhouette is scored in whichever space the clustering ran in — the UMAP layout
+    # on the default path, a space fit to separate these very points. Reported alone it lets a
+    # persisted report certify "19 clusters, silhouette 0.28" for a library `run_clustering` has
+    # already judged structureless, and the file outlives the log line that said so. So the
+    # original-space score and its verdict ship beside it whenever the caller supplied them.
+    # Name the METRIC as well as the space. The two scores can be computed in the SAME space and
+    # still differ — `cluster_metrics` uses sklearn's euclidean default while `silhouette_original`
+    # is always cosine — so labelling both "(original space)" printed what read as a contradiction.
+    sil = metrics.get("silhouette")
+    space = metrics.get("silhouette_space")
+    lines = [
+        f"- **Silhouette:** {f'{float(sil):.3f}' if sil is not None else 'n/a'}"
+        + (f" ({space} space, euclidean)" if space else "")
+    ]
+    if "silhouette_original" in metrics:
+        sil_original = metrics.get("silhouette_original")
+        lines.append(
+            "- **Silhouette (original space, cosine):** "
+            + (f"{float(sil_original):.3f}" if sil_original is not None else "n/a")
+        )
+    structure = metrics.get("structure")
+    if structure is not None:
+        lines.append(f"- **Structure:** {structure}")
+    return lines
+
+
+def _structure_caveat_lines(metrics: Mapping[str, Any]) -> list[str]:
+    """The opening blockquote for a library judged structureless; empty for any other verdict.
+
+    It opens the report because the per-cluster sections below read as discovered groups, and a
+    persisted file outlives the log line that said they are not.
+    """
+    if metrics.get("structure") != "none_detected":
+        return []
+    space = metrics.get("silhouette_space")
+    return [
+        "> **No substantial structure.** The original-space silhouette does not support the "
+        "clusters below"
+        + (
+            ": they are largely an artifact of the dimensionality reduction, and the "
+            "silhouette above is not evidence to the contrary."
+            if space != "original"
+            else ", which were produced in that same space."
+        )
+        + " Read the sections as a partition of a continuum, not as discovered groups.",
+        "",
+    ]
+
+
+def _report_summary_lines(
+    df: pd.DataFrame | None, metrics: Mapping[str, Any], method: str
+) -> list[str]:
+    """Title plus the run-level bullets: method, track count, cluster count, noise, silhouette."""
+    lines: list[str] = ["# Mood cluster report", ""]
+    lines.append(f"- **Method:** {method}")
+    n_tracks = int(len(df)) if df is not None else 0
+    lines.append(f"- **Tracks:** {n_tracks}")
+    lines.append(f"- **Clusters:** {metrics.get('n_clusters', 0)}")
+    noise_ratio = metrics.get("noise_ratio")
+    if noise_ratio is not None:
+        lines.append(f"- **Noise ratio:** {float(noise_ratio):.2%}")
+    lines.extend(_silhouette_lines(metrics))
+    lines.append("")
+    lines.extend(_structure_caveat_lines(metrics))
+    return lines
+
+
+def _mean_attribute_line(rows: pd.DataFrame, column: str) -> str | None:
+    """``- **Mean <column>:** x.xx`` over ``rows``, or None when there is no number to print.
+
+    None covers three cases that must all read the same in the report — the column is absent, the
+    cluster is empty, or every value in it is NaN (which is what a track whose CLAP embedding
+    failed leaves behind). Printing "Mean energy: nan" would look like a computed result.
+    """
+    if column not in rows.columns or not len(rows):
+        return None
+    mean = float(pd.to_numeric(rows[column], errors="coerce").mean())
+    if not pd.notna(mean):
+        return None
+    return f"- **Mean {column}:** {mean:.2f}"
+
+
+def _dominant_mood_line(rows: pd.DataFrame) -> str | None:
+    """``- **Dominant mood:** <mood>``, or None when the column, the rows or the value is absent.
+
+    Read off the first row: ``cluster_mood`` is broadcast per cluster, so every row carries the
+    same value.
+    """
+    if "cluster_mood" not in rows.columns or not len(rows):
+        return None
+    mood = str(rows["cluster_mood"].iloc[0])
+    return f"- **Dominant mood:** {mood}" if mood else None
+
+
+def _mood_profile_line(profiles: Mapping[int, list[tuple[str, float]]], cid: int) -> str | None:
+    """``- **Mood profile:** <mood> <score>, ...``, or None when this cluster has no profile."""
+    profs = profiles.get(cid) or profiles.get(int(cid)) or []
+    if not profs:
+        return None
+    return "- **Mood profile:** " + ", ".join(f"{m} {float(s):.2f}" for m, s in profs)
+
+
+def _example_lines(rows: pd.DataFrame) -> list[str]:
+    """Up to six example filenames as a nested bullet list; empty when there are none.
+
+    Six is a readability cap, not a sample: the report is meant to be skimmed, and a 500-track
+    cluster would otherwise bury every other section.
+    """
+    if "filename" not in rows.columns:
+        return []
+    examples = rows["filename"].astype(str).tolist()[:6]
+    if not examples:
+        return []
+    return ["- **Examples:**"] + [f"  - {fn}" for fn in examples]
+
+
+def _cluster_section_lines(
+    df: pd.DataFrame, cid: int, profiles: Mapping[int, list[tuple[str, float]]]
+) -> list[str]:
+    """One cluster's section: heading, size, then whichever optional bullets have content."""
+    rows = df[df["cluster"] == cid]
+    heading = "noise" if cid == -1 else f"Cluster {cid}"
+
+    lines = [f"## {heading}", "", f"- **Size:** {len(rows)}"]
+    optional = (
+        _dominant_mood_line(rows),
+        _mood_profile_line(profiles, cid),
+        _mean_attribute_line(rows, "energy"),
+        _mean_attribute_line(rows, "valence"),
+    )
+    lines.extend(line for line in optional if line is not None)
+    lines.extend(_example_lines(rows))
+    lines.append("")
+    return lines
 
 
 def compare_spaces(
