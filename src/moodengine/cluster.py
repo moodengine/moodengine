@@ -1312,7 +1312,13 @@ def bootstrap_stability(
 
     ``n_boot`` defaults to ``config.bootstrap_n``. Returns ``{'mean_ari', 'std_ari',
     'mean_ami', 'mean_noise_agreement', 'n_boot', 'space'}``; degenerate inputs yield zeros.
-    Deterministic given ``config.seed``.
+
+    Deterministic given ``config.seed`` for any input with real spread. The one exception is a
+    matrix whose rows are BIT-IDENTICAL under ``cluster_space='reduced'``: the kNN graph is then
+    all-zero distances, and UMAP's layout on it varies between runs even with ``random_state``
+    set — measured here at ``mean_ari`` 0.583 / 0.061 / 0.581 over three identical calls. No
+    embedding matrix produces that, so this is a statement about the guarantee's edge rather than
+    a caveat on real use; ``cluster_space='original'`` is deterministic throughout.
     """
     X = np.asarray(X, dtype=np.float32)
     n = X.shape[0]
