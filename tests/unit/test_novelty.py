@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import logging
 
+import hypothesis.extra.numpy as npst
+import hypothesis.strategies as st
 import numpy as np
 import pytest
 from assertpy import assert_that
+from hypothesis import given
 
 import moodengine.novelty as novelty
 from moodengine.novelty import knn_distance_scores, mahalanobis_scores
@@ -238,3 +241,53 @@ def test_knn_prefilter_guard_falls_back_when_chunking_would_not_narrow_the_row()
         want = src.copy()
         want.partition(want.shape[1] - 10, axis=1)
         assert_that(np.array_equal(np.sort(got, axis=1), np.sort(want[:, -10:], axis=1))).is_true()
+
+
+# --------------------------------------------------------------------------- #
+# Properties — mahalanobis_scores alone carried 48 surviving mutants, the most
+# of any function outside calibration.
+# --------------------------------------------------------------------------- #
+
+_EMB = npst.arrays(
+    dtype=np.float32,
+    shape=npst.array_shapes(min_dims=2, max_dims=2, min_side=2, max_side=10),
+    elements=st.floats(-50.0, 50.0, width=32, allow_nan=False, allow_infinity=False),
+)
+
+
+@given(X=_EMB)
+def test_mahalanobis_scores_are_non_negative_and_finite(X: np.ndarray) -> None:
+    """A Mahalanobis distance is a norm under a positive-definite metric: never below zero.
+
+    The shrinkage term exists to keep the covariance invertible, so a non-finite score means it
+    failed on a degenerate input rather than that the input was unusual.
+    """
+    scores = mahalanobis_scores(X)
+
+    assert_that(scores.shape).is_equal_to((X.shape[0],))
+    assert_that(bool(np.all(scores >= 0.0))).is_true()
+    assert_that(bool(np.isfinite(scores).all())).is_true()
+
+
+@given(X=_EMB)
+def test_mahalanobis_scores_are_invariant_to_row_order(X: np.ndarray) -> None:
+    """The score of a row depends on the distribution, not on where the row sits in the matrix.
+
+    A caller shuffling its library must get the same per-track novelty back, permuted.
+    """
+    order = np.arange(X.shape[0])[::-1]
+
+    scores = mahalanobis_scores(X)
+    shuffled = mahalanobis_scores(X[order])
+
+    np.testing.assert_allclose(shuffled, scores[order], rtol=1e-4, atol=1e-5)
+
+
+@given(X=_EMB, k=st.integers(1, 6))
+def test_knn_distance_scores_are_non_negative_and_finite(X: np.ndarray, k: int) -> None:
+    """A distance to a neighbour cannot be negative, whatever k is relative to n."""
+    scores = knn_distance_scores(X, k=k)
+
+    assert_that(scores.shape).is_equal_to((X.shape[0],))
+    assert_that(bool(np.all(scores >= 0.0))).is_true()
+    assert_that(bool(np.isfinite(scores).all())).is_true()

@@ -1,8 +1,11 @@
 """Tests for moodengine._math — the shared numeric primitives."""
 
+import hypothesis.extra.numpy as npst
+import hypothesis.strategies as st
 import numpy as np
 import pytest
 from assertpy import assert_that
+from hypothesis import assume, given
 
 from moodengine import labeling, pooling
 from moodengine._math import is_constant_series, l2_normalize
@@ -102,3 +105,73 @@ def test_is_constant_series_treats_too_short_a_series_as_constant() -> None:
 def test_is_constant_series_handles_an_all_zero_series() -> None:
     """Scale 0 must not make the threshold meaningless — all-zero is constant, not undefined."""
     assert_that(is_constant_series(np.zeros(5))).is_true()
+
+
+# --------------------------------------------------------------------------- #
+# Properties — stated over generated inputs rather than chosen ones
+# --------------------------------------------------------------------------- #
+
+
+_FINITE_MATRIX = npst.arrays(
+    dtype=np.float32,
+    shape=npst.array_shapes(min_dims=2, max_dims=2, min_side=1, max_side=12),
+    elements=st.floats(-1e4, 1e4, width=32, allow_nan=False, allow_infinity=False),
+)
+
+
+_EPS = 1e-8  # the documented norm floor in l2_normalize
+
+
+@given(X=_FINITE_MATRIX)
+def test_l2_normalize_rows_above_the_eps_floor_are_unit_norm(X: np.ndarray) -> None:
+    """Any row whose norm clears the eps floor comes out at unit norm.
+
+    Stated over generated matrices rather than one fixture, because the property is meant to hold
+    for every shape and magnitude — including the wide, near-degenerate ones a real embedding
+    matrix produces.
+    """
+    out = l2_normalize(X, axis=1)
+    above = np.linalg.norm(X, axis=1) >= _EPS
+    assume(bool(above.any()))
+
+    np.testing.assert_allclose(np.linalg.norm(out[above], axis=1), 1.0, rtol=1e-4, atol=1e-4)
+
+
+@given(X=_FINITE_MATRIX)
+def test_l2_normalize_scales_a_sub_eps_row_by_one_over_eps_instead_of_normalizing(
+    X: np.ndarray,
+) -> None:
+    """The documented trade: below the floor the row is SCALED, not normalized.
+
+    Hypothesis found this by itself — a single-column row of 1.16e-12 has a norm four orders
+    under the floor, so it divides by eps and lands at 1.16e-4, not at 1. That is what keeps the
+    operation finite for a zero vector, and nothing pinned it before.
+    """
+    out = l2_normalize(X, axis=1)
+    below = np.linalg.norm(X, axis=1) < _EPS
+    assume(bool(below.any()))
+
+    np.testing.assert_allclose(out[below], X[below] / _EPS, rtol=1e-4, atol=1e-9)
+
+
+@given(X=_FINITE_MATRIX)
+def test_l2_normalize_is_idempotent_above_the_eps_floor(X: np.ndarray) -> None:
+    """Normalizing an already-normalized row is a no-op, so callers can be defensive for free.
+
+    Only above the floor: a sub-eps row is scaled rather than normalized on the first pass, so a
+    second pass legitimately moves it again.
+    """
+    once = l2_normalize(X, axis=1)
+    above = np.linalg.norm(X, axis=1) >= _EPS
+    assume(bool(above.any()))
+
+    np.testing.assert_allclose(l2_normalize(once, axis=1)[above], once[above], rtol=1e-5, atol=1e-6)
+
+
+@given(X=_FINITE_MATRIX)
+def test_l2_normalize_always_returns_finite_float32(X: np.ndarray) -> None:
+    """The dtype contract holds for every input, and the eps floor keeps the result finite."""
+    out = l2_normalize(X, axis=1)
+
+    assert_that(out.dtype).is_equal_to(np.dtype(np.float32))
+    assert_that(bool(np.isfinite(out).all())).is_true()
