@@ -43,6 +43,120 @@ def _cluster_color(label: int, order: dict[int, int]) -> str:
     return _PALETTE[order[label] % len(_PALETTE)]
 
 
+def _as_coords2d(coords2d: np.ndarray) -> np.ndarray:
+    """``coords2d`` as a float ``(n, 2)`` array, folding a flat or single-column input into pairs.
+
+    Degenerate SIZES degrade rather than raise (the module contract), so an empty input becomes
+    ``(0, 2)`` instead of erroring on the reshape.
+    """
+    coords = np.asarray(coords2d, dtype=float)
+    if coords.ndim != 2 or (coords.size and coords.shape[1] < 2):
+        return coords.reshape(-1, 2) if coords.size else coords.reshape(0, 2)
+    return coords
+
+
+def _cluster_order(labels_arr: np.ndarray) -> tuple[list[int], dict[int, int]]:
+    """The ascending cluster ids and their palette positions, noise (``-1``) excluded from both.
+
+    Ascending order is what makes colors and legend deterministic; it also puts ``-1`` first, and
+    plotly draws in add order, so noise ends up UNDER the colored points.
+    """
+    unique = sorted({int(v) for v in labels_arr.tolist()})
+    non_noise = [c for c in unique if c != -1]
+    return unique, {c: i for i, c in enumerate(non_noise)}
+
+
+def _trace_name(cluster: int) -> str:
+    """Legend entry for one cluster; ``-1`` reads as ``noise``, never as ``cluster -1``."""
+    return "noise" if cluster == -1 else f"cluster {cluster}"
+
+
+def _at(seq: Optional[Sequence[object]], i: int) -> Optional[object]:
+    """``seq[i]`` when the sequence exists and is long enough, else ``None``.
+
+    Every hover field is optional AND may be shorter than the coordinate array, so the
+    ragged-input rule lives here once instead of being re-spelled at each lookup.
+    """
+    if seq is None or i >= len(seq):
+        return None
+    return seq[i]
+
+
+def _point_hover(
+    i: int,
+    files: Sequence[str],
+    mood_list: Optional[Sequence[str]],
+    hover_list: Optional[Sequence[str]],
+) -> str:
+    """Hover string for point ``i``: an explicit ``hover_text`` entry wins, else filename + mood."""
+    override = _at(hover_list, i)
+    if override is not None:
+        return str(override)
+
+    name = _at(files, i)
+    mood = _at(mood_list, i)
+    if mood is not None:
+        return f"{name if name is not None else ''}<br>mood: {mood}"
+    return str(name if name is not None else "")
+
+
+def _attr_hover(
+    i: int, files: Sequence[str], mood_list: Optional[Sequence[str]], v: np.ndarray, e: np.ndarray
+) -> str:
+    """Hover string for the valence x energy scatter: filename, optional mood, then the coords."""
+    name = _at(files, i)
+    parts = [str(name if name is not None else "")]
+
+    mood = _at(mood_list, i)
+    if mood is not None:
+        parts.append(f"mood: {mood}")
+
+    parts.append(f"valence={v[i]:.2f} energy={e[i]:.2f}")
+    return "<br>".join(parts)
+
+
+def _medoid_trace(
+    coords: np.ndarray, medoids: set[int], files: Sequence[str], n: int
+) -> Optional[go.Scatter]:
+    """Black-outlined diamond overlay for the cluster representatives, or ``None`` when there is
+    nothing valid to draw — a non-integer or out-of-range member is dropped, never raised on."""
+    med_idx = np.array(
+        sorted(i for i in medoids if isinstance(i, (int, np.integer)) and 0 <= i < n),
+        dtype=int,
+    )
+    if med_idx.size == 0:
+        return None
+
+    return go.Scatter(
+        x=coords[med_idx, 0],
+        y=coords[med_idx, 1],
+        mode="markers",
+        name="medoid",
+        marker={
+            "symbol": "diamond",
+            "color": "rgba(0,0,0,0)",
+            "size": 16,
+            "line": {"width": 2, "color": "#000000"},
+        },
+        text=[f"medoid<br>{_at(files, i) if _at(files, i) is not None else ''}" for i in med_idx],
+        hoverinfo="text",
+    )
+
+
+def _write_html(fig: go.Figure, out_html: Optional[PathLike]) -> None:
+    """Write ``fig`` as a standalone self-contained page, or do nothing when no path is given.
+
+    The ``out_html=None`` default is what keeps this module pure by default: file output is opt-in
+    (see the module docstring), so plotting never touches the filesystem unless asked.
+    """
+    if out_html is None:
+        return
+
+    out = Path(out_html)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(out), include_plotlyjs=True, full_html=True)
+
+
 def plot_clusters(
     coords2d: np.ndarray,
     labels: Sequence[int],
@@ -66,86 +180,44 @@ def plot_clusters(
     Returns the :class:`plotly.graph_objects.Figure`. Degenerate inputs (empty,
     all-noise, missing moods/hover) are handled gracefully.
     """
-    coords = np.asarray(coords2d, dtype=float)
-    if coords.ndim != 2 or (coords.size and coords.shape[1] < 2):
-        coords = coords.reshape(-1, 2) if coords.size else coords.reshape(0, 2)
+    coords = _as_coords2d(coords2d)
     n = coords.shape[0]
 
     labels_arr = np.asarray(list(labels), dtype=int) if len(labels) else np.empty(0, dtype=int)
     files = list(filenames)
     mood_list = list(moods) if moods is not None else None
     hover_list = list(hover_text) if hover_text is not None else None
-
-    # Stable cluster ordering (ascending) so colors/legend are deterministic.
-    unique = sorted({int(v) for v in labels_arr.tolist()})
-    non_noise = [c for c in unique if c != -1]
-    order = {c: i for i, c in enumerate(non_noise)}
+    unique, order = _cluster_order(labels_arr)
 
     fig = go.Figure()
-    # Draw noise last so real clusters sit on top? Plotly draws in add order;
-    # iterate ascending which puts -1 first (under the colored points).
     for cluster in unique:
-        mask = labels_arr == cluster
-        idx = np.flatnonzero(mask)
-        # Only plot points that have coordinates; guards against a labels/coords
-        # length mismatch so we degrade gracefully instead of raising IndexError.
+        # Only points that have coordinates: a labels/coords length mismatch degrades to a
+        # shorter trace instead of raising IndexError.
+        idx = np.flatnonzero(labels_arr == cluster)
         idx = idx[idx < n]
         if idx.size == 0:
             continue
-        name = "noise" if cluster == -1 else f"cluster {cluster}"
-        hover = []
-        for i in idx:
-            if hover_list is not None and i < len(hover_list) and hover_list[i] is not None:
-                hover.append(str(hover_list[i]))
-                continue
-            fn = files[i] if i < len(files) else ""
-            if mood_list is not None and i < len(mood_list) and mood_list[i] is not None:
-                hover.append(f"{fn}<br>mood: {mood_list[i]}")
-            else:
-                hover.append(str(fn))
+
         fig.add_trace(
             go.Scatter(
                 x=coords[idx, 0],
                 y=coords[idx, 1],
                 mode="markers",
-                name=name,
-                marker=dict(
-                    color=_cluster_color(cluster, order),
-                    size=9,
-                    line=dict(width=0.5, color="#ffffff"),
-                ),
-                text=hover,
+                name=_trace_name(cluster),
+                marker={
+                    "color": _cluster_color(cluster, order),
+                    "size": 9,
+                    "line": {"width": 0.5, "color": "#ffffff"},
+                },
+                text=[_point_hover(int(i), files, mood_list, hover_list) for i in idx],
                 hoverinfo="text",
             )
         )
 
-    # Overdraw cluster representatives (medoids) so they stand out.
     if medoids:
-        med_idx = np.array(
-            sorted(i for i in medoids if isinstance(i, (int, np.integer)) and 0 <= i < n),
-            dtype=int,
-        )
-        if med_idx.size:
-            med_hover = []
-            for i in med_idx:
-                fn = files[i] if i < len(files) else ""
-                med_hover.append(f"medoid<br>{fn}")
-            fig.add_trace(
-                go.Scatter(
-                    x=coords[med_idx, 0],
-                    y=coords[med_idx, 1],
-                    mode="markers",
-                    name="medoid",
-                    marker=dict(
-                        symbol="diamond",
-                        color="rgba(0,0,0,0)",
-                        size=16,
-                        line=dict(width=2, color="#000000"),
-                    ),
-                    text=med_hover,
-                    hoverinfo="text",
-                )
-            )
+        overlay = _medoid_trace(coords, medoids, files, n)
+        if overlay is not None:
+            fig.add_trace(overlay)  # added last, so the representatives sit on top
 
     fig.update_layout(
         title=title,
@@ -154,11 +226,7 @@ def plot_clusters(
         legend_title="cluster",
         template="plotly_white",
     )
-
-    if out_html is not None:
-        out = Path(out_html)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(out), include_plotlyjs=True, full_html=True)
+    _write_html(fig, out_html)
 
     return fig
 
@@ -187,9 +255,7 @@ def plot_attributes(
     files = list(filenames)
     mood_list = list(moods) if moods is not None else None
 
-    unique = sorted({int(x) for x in labels_arr.tolist()})
-    non_noise = [c for c in unique if c != -1]
-    order = {c: i for i, c in enumerate(non_noise)}
+    unique, order = _cluster_order(labels_arr)
 
     fig = go.Figure()
     for cluster in unique:
@@ -197,26 +263,19 @@ def plot_attributes(
         idx = idx[idx < n]
         if idx.size == 0:
             continue
-        hover = []
-        for i in idx:
-            fn = files[i] if i < len(files) else ""
-            parts = [str(fn)]
-            if mood_list is not None and i < len(mood_list) and mood_list[i] is not None:
-                parts.append(f"mood: {mood_list[i]}")
-            parts.append(f"valence={v[i]:.2f} energy={e[i]:.2f}")
-            hover.append("<br>".join(parts))
+
         fig.add_trace(
             go.Scatter(
                 x=v[idx],
                 y=e[idx],
                 mode="markers",
-                name="noise" if cluster == -1 else f"cluster {cluster}",
-                marker=dict(
-                    color=_cluster_color(cluster, order),
-                    size=10,
-                    line=dict(width=0.5, color="#ffffff"),
-                ),
-                text=hover,
+                name=_trace_name(cluster),
+                marker={
+                    "color": _cluster_color(cluster, order),
+                    "size": 10,
+                    "line": {"width": 0.5, "color": "#ffffff"},
+                },
+                text=[_attr_hover(int(i), files, mood_list, v, e) for i in idx],
                 hoverinfo="text",
             )
         )
@@ -225,18 +284,71 @@ def plot_attributes(
     fig.add_vline(x=0.5, line_width=1, line_dash="dot", line_color="#cccccc")
     fig.update_layout(
         title=title,
-        xaxis=dict(title="valence  (dark/negative → bright/positive)", range=[0, 1]),
-        yaxis=dict(title="energy  (calm/low → intense/high)", range=[0, 1]),
+        xaxis={"title": "valence  (dark/negative → bright/positive)", "range": [0, 1]},
+        yaxis={"title": "energy  (calm/low → intense/high)", "range": [0, 1]},
         legend_title="cluster",
         template="plotly_white",
     )
-
-    if out_html is not None:
-        out = Path(out_html)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.write_html(str(out), include_plotlyjs=True, full_html=True)
+    _write_html(fig, out_html)
 
     return fig
+
+
+def _prepare_playlist_dir(out_dir: PathLike, pattern: str) -> Path:
+    """Create ``out_dir`` and clear the playlists a previous run left there.
+
+    Stale files are removed rather than overwritten, because a re-clustering can produce FEWER
+    clusters than last time — the leftovers would otherwise read as current.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    for old in out.glob(pattern):
+        old.unlink()
+
+    return out
+
+
+def _has_columns(df: Optional[pd.DataFrame], *columns: str) -> bool:
+    """``df`` is a non-empty frame carrying every one of ``columns``.
+
+    The exporters promise an empty result rather than an exception on a frame they cannot group,
+    so this is the single place that decides "nothing to write".
+    """
+    return df is not None and len(df) > 0 and all(c in df.columns for c in columns)
+
+
+def _cluster_mood(sub: pd.DataFrame, has_mood: bool) -> str:
+    """The cluster's mood label, or ``""`` when absent — a NaN cell reads as absent, not ``'nan'``."""
+    if not has_mood or not len(sub):
+        return ""
+
+    value = sub["cluster_mood"].iloc[0]
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    return str(value)
+
+
+def _m3u_suffix(mood: str, cluster: int) -> str:
+    """Filename suffix for one cluster's playlist, in precedence order.
+
+    A mood wins when there is one, so a labelled noise cluster reads by its mood rather than as
+    ``_noise``; ``_noise`` is the fallback for an unlabelled ``-1``; everything else gets nothing.
+    """
+    if mood:
+        return f"_{_slugify(mood)}"
+    if cluster == -1:
+        return "_noise"
+    return ""
+
+
+def _track_paths(sub: pd.DataFrame) -> list[str]:
+    """The cluster's track paths as strings, dropping the missing ones (``None`` / NaN)."""
+    return [
+        str(p)
+        for p in sub["path"].tolist()
+        if p is not None and not (isinstance(p, float) and np.isnan(p))
+    ]
 
 
 def export_playlists(df: pd.DataFrame, out_dir: PathLike) -> list[Path]:
@@ -247,25 +359,15 @@ def export_playlists(df: pd.DataFrame, out_dir: PathLike) -> list[Path]:
     ``cluster_-1_noise.txt``. Each file lists the cluster's filenames, one per
     line. Returns the list of written :class:`pathlib.Path` (ascending by cluster).
     """
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    # Clear stale playlists from a previous run (which may have had more/other
-    # clusters) so the directory always reflects the current clustering.
-    for old in out.glob("cluster_*.txt"):
-        old.unlink()
-
-    if df is None or len(df) == 0 or "cluster" not in df.columns or "filename" not in df.columns:
+    out = _prepare_playlist_dir(out_dir, "cluster_*.txt")
+    if not _has_columns(df, "cluster", "filename"):
         return []
 
     written: list[Path] = []
     clusters = sorted({int(c) for c in df["cluster"].tolist()})
     for cluster in clusters:
         names = df.loc[df["cluster"] == cluster, "filename"].astype(str).tolist()
-        if cluster == -1:
-            fname = "cluster_-1_noise.txt"
-        else:
-            fname = f"cluster_{cluster:02d}.txt"
+        fname = "cluster_-1_noise.txt" if cluster == -1 else f"cluster_{cluster:02d}.txt"
         path = out / fname
         path.write_text("\n".join(names) + ("\n" if names else ""), encoding="utf-8")
         written.append(path)
@@ -343,83 +445,83 @@ def _scatter_figs(df: pd.DataFrame) -> tuple[Optional[go.Figure], Optional[go.Fi
     return attr_fig, umap_fig
 
 
-def build_dashboard(
-    df: pd.DataFrame,
-    out_html: PathLike,
-    title: str = "Mood explorer",
-    audio_dir: Optional[PathLike] = None,
-) -> Path:
-    """Write ONE self-contained HTML dashboard (inline CSS+JS, no external/CDN).
+def _plots_html(df: pd.DataFrame) -> str:
+    """The two scatter sections as HTML, or a stand-in line when neither can be built.
 
-    Combines a valence×energy scatter, a UMAP cluster scatter, and a
-    sortable/text-filterable table of the tracks (filename, cluster, cluster_mood,
-    top_mood, top_score, mood_top3, energy, valence). When ``audio_dir`` is given,
-    each row gets an inline ``<audio controls>`` whose ``src`` is the track ``path``
-    (``file://``) so the user can preview it; missing paths degrade gracefully.
-
-    Robust to missing columns and empty frames. Returns the written :class:`Path`.
+    Only the FIRST figure inlines plotly.js; the second reuses it. Two inlined copies would roughly
+    double a page that is already the largest artefact this module writes.
     """
-    out = Path(out_html)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
     attr_fig, umap_fig = _scatter_figs(df)
 
-    # First plot inlines plotly.js; the second reuses it (include_plotlyjs=False).
-    plot_blocks: list[str] = []
-    first = True
+    blocks: list[str] = []
     for label, fig in (("Mood space (valence × energy)", attr_fig), ("UMAP clusters", umap_fig)):
         if fig is None:
             continue
-        inc = "inline" if first else False
-        body = fig.to_html(full_html=False, include_plotlyjs=inc)
-        plot_blocks.append(f'<section class="plot"><h2>{_html.escape(label)}</h2>{body}</section>')
-        first = False
-    plots_html = "\n".join(plot_blocks) or "<p>No plottable columns available.</p>"
+        body = fig.to_html(full_html=False, include_plotlyjs="inline" if not blocks else False)
+        blocks.append(f'<section class="plot"><h2>{_html.escape(label)}</h2>{body}</section>')
 
-    show_audio = audio_dir is not None and "path" in df.columns
-    columns = [c for c in _TABLE_COLUMNS if c in df.columns]
+    return "\n".join(blocks) or "<p>No plottable columns available.</p>"
 
-    # Build the table head.
-    head_cells = "".join(
+
+def _table_head(columns: Sequence[str], show_audio: bool) -> str:
+    """Header cells, each wired to the client-side sort by its column index."""
+    cells = "".join(
         f'<th onclick="sortTable({i})">{_html.escape(c)}</th>' for i, c in enumerate(columns)
     )
-    if show_audio:
-        head_cells += "<th>preview</th>"
+    return cells + "<th>preview</th>" if show_audio else cells
 
-    # Build the table body column-wise. `iterrows()` materializes a fresh Series per row, which is
-    # what this loop actually spends its time on once a library is more than a few hundred tracks.
-    #
-    # Which element type the columns yield no longer matters: `_cell_str` formats float32 and
-    # float64 identically, so `tolist()` (Python scalars, and the cheapest of the two) renders
-    # exactly what the row-wise path did. That equivalence is what the dtype fix in `_cell_str`
-    # buys — `iterrows()` unboxed to Python scalars on a MIXED frame but kept `np.float32` on a
-    # homogeneous one, so no single accessor reproduced it before.
-    rows_html: list[str] = []
-    if len(df):
-        per_col = [df[c].tolist() for c in columns]
-        cell_rows = (
-            ["".join(f"<td>{_cell_str(v)}</td>" for v in values) for values in zip(*per_col)]
-            if per_col  # a frame carrying none of _TABLE_COLUMNS still gets its rows
-            else [""] * len(df)
-        )
-        paths = df["path"].tolist() if show_audio else None
-        for i, cells in enumerate(cell_rows):
-            if paths is not None:
-                path = paths[i]
-                if path is not None and not (isinstance(path, float) and np.isnan(path)):
-                    src = (
-                        _html.escape(Path(str(path)).as_uri())
-                        if Path(str(path)).is_absolute()
-                        else _html.escape(str(path))
-                    )
-                    cells += f'<td><audio controls preload="none" src="{src}"></audio></td>'
-                else:
-                    cells += "<td></td>"
-            rows_html.append(f"<tr>{cells}</tr>")
-    body_html = "\n".join(rows_html)
 
-    page = f"""<!doctype html>
+def _audio_cell(path: object) -> str:
+    """One ``<audio>`` cell for a track ``path``, or an empty cell when the path is missing.
+
+    An absolute path becomes a ``file://`` URI so the browser can actually open it; a relative one
+    is emitted as given, since resolving it here would guess at the reader's working directory.
+    """
+    if path is None or (isinstance(path, float) and np.isnan(path)):
+        return "<td></td>"
+
+    as_path = Path(str(path))
+    src = _html.escape(as_path.as_uri() if as_path.is_absolute() else str(path))
+    return f'<td><audio controls preload="none" src="{src}"></audio></td>'
+
+
+def _table_rows(df: pd.DataFrame, columns: Sequence[str], show_audio: bool) -> str:
+    """The table body, built COLUMN-wise.
+
+    ``iterrows()`` materializes a fresh Series per row, which is what this loop actually spends its
+    time on once a library is more than a few hundred tracks. Which element type the columns yield
+    no longer matters: ``_cell_str`` formats float32 and float64 identically, so ``tolist()``
+    (Python scalars, and the cheaper of the two) renders exactly what the row-wise path did. That
+    equivalence is what the dtype fix in ``_cell_str`` buys — ``iterrows()`` unboxed to Python
+    scalars on a MIXED frame but kept ``np.float32`` on a homogeneous one, so no single accessor
+    reproduced it before.
+    """
+    if not len(df):
+        return ""
+
+    per_col = [df[c].tolist() for c in columns]
+    cell_rows = (
+        ["".join(f"<td>{_cell_str(v)}</td>" for v in values) for values in zip(*per_col)]
+        if per_col  # a frame carrying none of _TABLE_COLUMNS still gets its rows
+        else [""] * len(df)
+    )
+
+    if not show_audio:
+        return "\n".join(f"<tr>{cells}</tr>" for cells in cell_rows)
+
+    paths = df["path"].tolist()
+    return "\n".join(
+        f"<tr>{cells}{_audio_cell(paths[i])}</tr>" for i, cells in enumerate(cell_rows)
+    )
+
+
+def _dashboard_page(title: str, plots_html: str, head_cells: str, body_html: str) -> str:
+    """The whole self-contained page: inline CSS, the plots, the table, and the filter/sort JS.
+
+    Everything is inlined on purpose — no CDN, no external asset — so the file still opens from a
+    local disk with no network, which is the point of handing someone a single HTML artefact.
+    """
+    return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -484,6 +586,38 @@ function sortTable(col) {{
 </body>
 </html>
 """
+
+
+def build_dashboard(
+    df: pd.DataFrame,
+    out_html: PathLike,
+    title: str = "Mood explorer",
+    audio_dir: Optional[PathLike] = None,
+) -> Path:
+    """Write ONE self-contained HTML dashboard (inline CSS+JS, no external/CDN).
+
+    Combines a valence×energy scatter, a UMAP cluster scatter, and a
+    sortable/text-filterable table of the tracks (filename, cluster, cluster_mood,
+    top_mood, top_score, mood_top3, energy, valence). When ``audio_dir`` is given,
+    each row gets an inline ``<audio controls>`` whose ``src`` is the track ``path``
+    (``file://``) so the user can preview it; missing paths degrade gracefully.
+
+    Robust to missing columns and empty frames. Returns the written :class:`Path`.
+    """
+    out = Path(out_html)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    show_audio = audio_dir is not None and "path" in df.columns
+    columns = [c for c in _TABLE_COLUMNS if c in df.columns]
+
+    page = _dashboard_page(
+        title,
+        _plots_html(df),
+        _table_head(columns, show_audio),
+        _table_rows(df, columns, show_audio),
+    )
+
     out.write_text(page, encoding="utf-8")
     return out
 
@@ -496,14 +630,8 @@ def export_m3u(df: pd.DataFrame, out_dir: PathLike) -> list[Path]:
     ``df`` needs at least ``'cluster'`` and ``'path'`` columns; missing columns or
     an empty frame yield an empty list. Robust; returns paths ascending by cluster.
     """
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-
-    # Clear stale playlists from a previous run.
-    for old in out.glob("cluster_*.m3u"):
-        old.unlink()
-
-    if df is None or len(df) == 0 or "cluster" not in df.columns or "path" not in df.columns:
+    out = _prepare_playlist_dir(out_dir, "cluster_*.m3u")
+    if not _has_columns(df, "cluster", "path"):
         return []
 
     has_mood = "cluster_mood" in df.columns
@@ -511,19 +639,10 @@ def export_m3u(df: pd.DataFrame, out_dir: PathLike) -> list[Path]:
     clusters = sorted({int(c) for c in df["cluster"].tolist()})
     for cluster in clusters:
         sub = df[df["cluster"] == cluster]
-        mood = ""
-        if has_mood and len(sub):
-            mv = sub["cluster_mood"].iloc[0]
-            mood = "" if mv is None or (isinstance(mv, float) and np.isnan(mv)) else str(mv)
-        suffix = f"_{_slugify(mood)}" if mood else ("_noise" if cluster == -1 else "")
-        fname = f"cluster_{cluster}{suffix}.m3u"
-        paths = [
-            str(p)
-            for p in sub["path"].tolist()
-            if p is not None and not (isinstance(p, float) and np.isnan(p))
-        ]
-        lines = ["#EXTM3U"] + paths
-        path = out / fname
+        mood = _cluster_mood(sub, has_mood)
+        path = out / f"cluster_{cluster}{_m3u_suffix(mood, cluster)}.m3u"
+
+        lines = ["#EXTM3U"] + _track_paths(sub)
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         written.append(path)
 
@@ -550,6 +669,9 @@ def build_labeling_ui(
     a Blob entirely client-side (no backend), making evaluation falsifiable.
 
     Robust to ragged ``paths`` / empty inputs. Returns the written :class:`Path`.
+
+    ``audio_dir`` is accepted for symmetry with :func:`build_dashboard`, whose trailing parameter
+    it mirrors, and is never read: every ``<audio>`` src here comes from ``paths``.
     """
     out = Path(out_html)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -558,7 +680,11 @@ def build_labeling_ui(
     path_list = [str(p) for p in paths]
     mood_list = [str(m) for m in moods]
 
-    mood_json = _json.dumps(mood_list)
+    # `<` escaped to its \u003c form before the JSON reaches the <script> element. json.dumps
+    # leaves `/` alone, so a mood containing `</script>` would otherwise CLOSE the script tag and
+    # everything after it would be parsed as markup. Escaping `<` covers every way out of a script
+    # element, and it is invisible to the client: JSON.parse restores the original character.
+    mood_json = _json.dumps(mood_list).replace("<", "\\u003c")
 
     cards: list[str] = []
     for i, fn in enumerate(files):
