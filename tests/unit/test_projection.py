@@ -12,11 +12,13 @@ raises on degenerate input.
 from __future__ import annotations
 
 import logging
+from typing import get_args
 
 import numpy as np
 import pytest
 from assertpy import assert_that
 
+from moodengine._typing import ProjectionMethod
 from moodengine.cluster import (
     ProjectionMethodUnavailable,
     fit_projection,
@@ -119,8 +121,11 @@ def test_pacmap_without_the_package_raises_projection_unavailable():
 
     if importlib.util.find_spec("pacmap") is not None:
         pytest.skip("pacmap is installed — the unavailable-path test does not apply")
+    X = _blobs()
+    config = _cfg(projection_method="pacmap")
+
     with pytest.raises(ProjectionMethodUnavailable) as exc:
-        fit_projection(_blobs(), _cfg(projection_method="pacmap"))
+        fit_projection(X, config)
     assert_that(exc.value.method).is_equal_to(
         "pacmap"
     )  # method-named, clear error (no silent fallback)
@@ -153,6 +158,21 @@ def test_procrustes_disparity_is_none_on_degenerate_input_and_never_raises():
     ).is_close_to(0.0, tolerance=1e-9)
 
 
-def test_unknown_projection_method_raises_value_error():
-    with pytest.raises(ValueError, match=r"projection_method must be one of"):
-        fit_projection(_blobs(), _cfg(projection_method="tsne"))
+def test_every_declared_projection_method_is_exercised_here() -> None:
+    """A member added to ``ProjectionMethod`` must not slip in untested.
+
+    ``fit_projection`` dispatches on the method name and ends in an exhaustiveness
+    guard. ``Config.__post_init__`` already rejects anything outside the alias, so no
+    caller can reach that guard — which also means nothing would notice a NEW member
+    being added to the alias and never wired into the dispatch. Each member below has
+    its own test in this module; this pins that correspondence, so growing the alias
+    fails here instead of silently shipping an unreachable-by-accident method.
+
+    (This replaced a test that asserted ``fit_projection`` rejects an unknown method.
+    It never called ``fit_projection`` at all: ``_cfg(projection_method="tsne")`` raises
+    inside the ``pytest.raises`` block, so it was re-testing ``Config`` validation that
+    ``test_config.py`` already parametrizes.)
+    """
+    exercised_in_this_module = {"umap", "densmap", "pacmap"}
+
+    assert_that(set(get_args(ProjectionMethod))).is_equal_to(exercised_in_this_module)
