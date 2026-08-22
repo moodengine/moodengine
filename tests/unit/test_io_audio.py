@@ -83,9 +83,29 @@ def test_load_audio_config_parameter_is_optional(tmp_path) -> None:
     _write_sine(wav_path, sr, seconds=0.5)
 
     without_config = load_audio(wav_path, target_sr=sr)
-    with_config = load_audio(wav_path, target_sr=sr, config=default_config())
+    with pytest.deprecated_call():
+        with_config = load_audio(wav_path, target_sr=sr, config=default_config())
 
     np.testing.assert_array_equal(without_config, with_config)
+
+
+def test_load_audio_without_config_emits_no_deprecation(tmp_path, recwarn) -> None:
+    """The supported two-argument form must stay silent.
+
+    A deprecation that fires on the call everyone is being moved TO is noise, and noise is what
+    gets a warning filtered out wholesale.
+    """
+    sr = 16_000
+    wav_path = tmp_path / "quiet.wav"
+    _write_sine(wav_path, sr, seconds=0.5)
+
+    load_audio(wav_path, target_sr=sr)
+
+    # Filtered on OUR message: `recwarn` also records third-party DeprecationWarnings
+    # (audioread's aifc/sunau shims), which say nothing about this call.
+    ours = [w for w in recwarn if "load_audio(" in str(w.message)]
+
+    assert_that(ours).is_empty()
 
 
 def test_segment_waveform_exact_count_no_overlap() -> None:

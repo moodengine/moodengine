@@ -7,6 +7,8 @@ yields mono float32 at a requested sample rate; segmentation is deterministic.
 
 from __future__ import annotations
 
+import warnings
+
 from pathlib import Path
 from typing import Union
 
@@ -48,8 +50,19 @@ def load_audio(path: PathLike, target_sr: int, config: Config | None = None) -> 
     reactions (re-scan the library vs flag the file as damaged), so they are
     two different types. ``config`` is unused and kept only so existing
     3-argument callers keep working; it is deprecated and will be removed in a
-    future minor release.
+    future minor release. Passing it emits a :class:`DeprecationWarning`.
     """
+    if config is not None:
+        # A deprecation nobody can observe is not a deprecation — the repo's own rule is one
+        # minor version with a DeprecationWarning, then removal. Raised only when the caller
+        # actually passes something, so the two-argument form stays silent.
+        warnings.warn(
+            "load_audio(config=...) is deprecated and will be removed in a future minor "
+            "release; the parameter is unused. Call load_audio(path, target_sr) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     if not Path(path).is_file():
         raise FileNotFoundError(f"audio file not found: {path}")
     try:
