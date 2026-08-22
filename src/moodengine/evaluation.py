@@ -280,6 +280,76 @@ def ccc_components(pred: np.ndarray, gold: np.ndarray) -> tuple[float, float, in
     return rho, float(2.0 / (v + 1.0 / v + u**2)), n
 
 
+def _top_mood_accuracy(df: pd.DataFrame, gold: dict, rows: list[tuple[int, str]]) -> float:
+    """Share of matched rows whose predicted top mood is among that track's gold moods.
+
+    A gold entry that is not a dict contributes an empty mood list rather than raising: the gold
+    set is hand-written, and one malformed record must not take the whole evaluation down.
+    """
+    top_moods = df["top_mood"].astype(str).tolist()
+    correct = 0
+    for i, name in rows:
+        gold_moods = gold[name].get("moods", []) if isinstance(gold[name], dict) else []
+        if top_moods[i] in set(gold_moods):
+            correct += 1
+
+    return float(correct) / float(len(rows))
+
+
+def _paired_axis_values(
+    df: pd.DataFrame, gold: dict, rows: list[tuple[int, str]], axis: str
+) -> tuple[list[float], list[float]]:
+    """``(predicted, gold)`` for one axis, over the tracks where BOTH values are numeric.
+
+    Each track contributes a pair or nothing. Both values are coerced before either list is
+    touched: committing the gold value first would let a non-numeric prediction shift every later
+    prediction onto the previous track's gold, and then raise on the length mismatch — which this
+    module's contract forbids.
+    """
+    pred: list[float] = []
+    ref: list[float] = []
+    if axis not in df.columns:
+        return pred, ref
+
+    col = df[axis].tolist()
+    for i, name in rows:
+        gv = gold[name].get(axis) if isinstance(gold[name], dict) else None
+        if gv is None:
+            continue
+
+        try:
+            gold_value = float(gv)
+            pred_value = float(col[i])
+        except (TypeError, ValueError):
+            continue
+
+        ref.append(gold_value)
+        pred.append(pred_value)
+
+    return pred, ref
+
+
+def _axis_correlations(axis: str, pred: list[float], ref: list[float]) -> dict:
+    """Pearson, Spearman and CCC for one axis — all ``nan`` below two usable pairs.
+
+    ``nan`` rather than an omitted key or a 0.0: a correlation nobody could compute must not read
+    as a correlation of zero, and the caller's key set stays the same either way.
+    """
+    if len(pred) < 2:
+        return {
+            f"{axis}_pearson": float("nan"),
+            f"{axis}_spearman": float("nan"),
+            f"{axis}_ccc": float("nan"),
+        }
+
+    p_arr, r_arr = np.array(pred), np.array(ref)
+    return {
+        f"{axis}_pearson": _pearson(p_arr, r_arr),
+        f"{axis}_spearman": _spearman(p_arr, r_arr),
+        f"{axis}_ccc": concordance_correlation_coefficient(p_arr, r_arr)[0],
+    }
+
+
 def evaluate_against_gold(df: pd.DataFrame, gold: dict) -> dict:
     """Compare predicted labels/axes in ``df`` to a human gold set.
 
@@ -304,45 +374,12 @@ def evaluate_against_gold(df: pd.DataFrame, gold: dict) -> dict:
 
     summary: dict = {"n_overlap": len(rows)}
 
-    # Top-mood accuracy.
     if "top_mood" in df.columns:
-        top_moods = df["top_mood"].astype(str).tolist()
-        correct = 0
-        for i, name in rows:
-            gold_moods = gold[name].get("moods", []) if isinstance(gold[name], dict) else []
-            if top_moods[i] in set(gold_moods):
-                correct += 1
-        summary["top_mood_accuracy"] = float(correct) / float(len(rows))
+        summary["top_mood_accuracy"] = _top_mood_accuracy(df, gold, rows)
 
-    # Energy / valence correlations.
     for axis in ("energy", "valence"):
-        pred, ref = [], []
-        if axis in df.columns:
-            col = df[axis].tolist()
-            for i, name in rows:
-                gv = gold[name].get(axis) if isinstance(gold[name], dict) else None
-                if gv is not None:
-                    # Both values coerced BEFORE either list is touched, so a track contributes a
-                    # PAIR or nothing. Appending as we went let a non-numeric prediction leave
-                    # `ref` one element longer: every later prediction was then scored against the
-                    # previous track's gold, and `_pearson` raised on the length mismatch — which
-                    # this function's contract says it never does.
-                    try:
-                        gold_value = float(gv)
-                        pred_value = float(col[i])
-                    except (TypeError, ValueError):
-                        continue
-                    ref.append(gold_value)
-                    pred.append(pred_value)
-        if len(pred) >= 2:
-            p_arr, r_arr = np.array(pred), np.array(ref)
-            summary[f"{axis}_pearson"] = _pearson(p_arr, r_arr)
-            summary[f"{axis}_spearman"] = _spearman(p_arr, r_arr)
-            summary[f"{axis}_ccc"] = concordance_correlation_coefficient(p_arr, r_arr)[0]
-        else:
-            summary[f"{axis}_pearson"] = float("nan")
-            summary[f"{axis}_spearman"] = float("nan")
-            summary[f"{axis}_ccc"] = float("nan")
+        pred, ref = _paired_axis_values(df, gold, rows, axis)
+        summary.update(_axis_correlations(axis, pred, ref))
 
     return summary
 
