@@ -137,6 +137,7 @@ dev = [
     "soundfile>=0.12",            # tests write WAV fixtures directly (the package decodes via librosa)
     "pytest-benchmark>=4.0",      # opt-in hot-path benchmarks (tests/benchmarks, -m benchmark)
     "pytest-cov>=5.0",            # coverage gate (see [tool.coverage] + CI static job)
+    "hypothesis>=6.100",          # property-based tests for the numeric core (see tests/unit)
 ]
 
 # CI-only, and deliberately NOT an extra: extras are published metadata, groups are not,
