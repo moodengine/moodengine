@@ -519,8 +519,9 @@ def test_save_sequence_model_payload_has_exactly_the_documented_keys(tmp_path):
 def test_save_sequence_model_object_dtype_entry_raises_value_error(tmp_path):
     state = _stub_state()
     state["rogue"] = np.array([{"nested": "dict"}], dtype=object)
+    model = _StubSequenceModel(state, _stub_config())
 
     with pytest.raises(ValueError, match="object dtype"):
-        save_sequence_model(_StubSequenceModel(state, _stub_config()), tmp_path / "m.npz")
+        save_sequence_model(model, tmp_path / "m.npz")
 
     assert_that((tmp_path / "m.npz").exists()).is_false()

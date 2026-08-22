@@ -74,7 +74,7 @@ class _FakeEmbedder:
         return np.vstack(rows).astype(np.float32)
 
 
-@pytest.fixture()
+@pytest.fixture
 def tmp_config(tmp_path):
     """A Config pointing every directory at an isolated tmp tree, with tiny audio."""
     base = default_config()
@@ -112,8 +112,10 @@ def _patch_embedder(monkeypatch, tmp_config):
 def test_get_embedder_without_models_extra_raises_missing_dependency(name: str) -> None:
     # Building a real embedder without the models extra must surface the actionable
     # MissingDependencyError naming the extra, not a bare ModuleNotFoundError.
+    config = default_config()
+
     with pytest.raises(MissingDependencyError, match=r"moodengine\[models\]"):
-        _real_get_embedder(name, default_config())
+        _real_get_embedder(name, config)
 
 
 # --------------------------------------------------------------------------- #
@@ -318,8 +320,10 @@ def test_lazy_embedder_exposes_identity_without_loading() -> None:
 
 def test_lazy_embedder_rejects_an_unknown_name_before_loading() -> None:
     """A typo must fail here, not after a multi-second weight load."""
+    config = default_config()
+
     with pytest.raises(ValueError, match=r"unknown embedder name: 'nope'"):
-        pipeline.LazyEmbedder("nope", default_config())
+        pipeline.LazyEmbedder("nope", config)
 
 
 def test_track_embedding_from_waveform_falls_back_when_batching_is_absent(tmp_config) -> None:
@@ -348,9 +352,10 @@ def test_track_embedding_from_waveform_rejects_an_off_rate_waveform() -> None:
     embedder's own rate, so only this door needed the guard."""
     embedder = _FakeEmbedder("clap", 48_000)
     waveform = np.zeros(48_000, dtype=np.float32)
+    config = default_config()
 
     with pytest.raises(ValueError, match=r"decoded at 44100 Hz but the 'clap' embedder expects"):
-        pipeline.track_embedding_from_waveform(embedder, waveform, 44_100, default_config())
+        pipeline.track_embedding_from_waveform(embedder, waveform, 44_100, config)
 
 
 def test_cache_extra_distinguishes_fractional_segment_seconds() -> None:
