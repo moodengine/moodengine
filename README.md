@@ -44,29 +44,29 @@ repository or a release artifact.
 
 ```bash
 # uv — this project is uv-native
-uv add "moodengine @ git+https://github.com/moodengine/moodengine@v0.4.0"
-uv add "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.0"
+uv add "moodengine @ git+https://github.com/moodengine/moodengine@v0.4.1"
+uv add "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.1"
 
 # pip (or `uv pip`), into the environment you already have active
-pip install "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.0"
+pip install "moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.1"
 ```
 
 To declare it as a dependency, use the same PEP 508 direct reference — in
 `pyproject.toml`, `requirements.txt`, or anywhere a requirement string is accepted:
 
 ```
-moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.0
+moodengine[models] @ git+https://github.com/moodengine/moodengine@v0.4.1
 ```
 
 Every release also carries a prebuilt wheel and sdist, if you would rather not resolve
 from git:
 
 ```bash
-gh release download v0.4.0 --repo moodengine/moodengine --pattern '*.whl'
+gh release download v0.4.1 --repo moodengine/moodengine --pattern '*.whl'
 pip install ./moodengine-*.whl   # add [models] etc. separately
 ```
 
-**Pin deliberately.** `@v0.4.0` above is a git tag, and a tag can be moved; for a build
+**Pin deliberately.** `@v0.4.1` above is a git tag, and a tag can be moved; for a build
 you need to reproduce exactly, pin the commit instead — the full 40-character SHA.
 Omitting the `@…` entirely tracks the default branch, which is fine for a scratch
 environment and unwise anywhere else.
