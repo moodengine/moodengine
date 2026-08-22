@@ -24,6 +24,28 @@ from moodengine.viz import export_playlists
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
+def _echo_cluster_profiles(df) -> None:
+    """Print one line per cluster, ascending, with noise (``-1``) included when present.
+
+    The column checks are resolved once for the frame rather than per row, and a cluster with no
+    mood prints ``(none)`` instead of a blank, so an unlabelled cluster is visibly unlabelled.
+    """
+    typer.echo("Per-cluster mood profile:")
+    has_mood = "cluster_mood" in df.columns
+    has_profile = "cluster_profile" in df.columns
+
+    for _, row in df.drop_duplicates(subset="cluster").sort_values("cluster").iterrows():
+        cluster = int(row["cluster"])
+        name = "noise" if cluster == -1 else f"cluster {cluster}"
+        mood = row["cluster_mood"] if has_mood else ""
+        count = int((df["cluster"] == cluster).sum())
+        typer.echo(f"  {name}: {mood or '(none)'}  ({count} track(s))")
+
+        profile = row["cluster_profile"] if has_profile else ""
+        if profile:
+            typer.echo(f"    profile: {profile}")
+
+
 @app.command()
 def main(
     input_dir: pathlib.Path | None = typer.Option(
@@ -57,18 +79,7 @@ def main(
     if len(df) == 0:
         typer.echo("No audio files found; nothing to label.")
     else:
-        typer.echo("Per-cluster mood profile:")
-        # One row per cluster, ascending; noise (-1) included when present.
-        seen = df.drop_duplicates(subset="cluster").sort_values("cluster")
-        for _, row in seen.iterrows():
-            cluster = int(row["cluster"])
-            name = "noise" if cluster == -1 else f"cluster {cluster}"
-            mood = row["cluster_mood"] if "cluster_mood" in df.columns else ""
-            profile = row["cluster_profile"] if "cluster_profile" in df.columns else ""
-            count = int((df["cluster"] == cluster).sum())
-            typer.echo(f"  {name}: {mood or '(none)'}  ({count} track(s))")
-            if profile:
-                typer.echo(f"    profile: {profile}")
+        _echo_cluster_profiles(df)
 
     playlists = export_playlists(df, out_dir)
     typer.echo(f"Wrote {out_dir / 'clusters.html'}")
