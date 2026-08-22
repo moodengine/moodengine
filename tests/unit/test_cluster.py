@@ -1341,3 +1341,43 @@ def test_sub_cluster_survives_a_subset_with_no_separable_k() -> None:
     assert_that(sorted(set(result["sub_labels"].tolist()))).is_equal_to([0])  # one sub-mood
     assert_that(result["silhouette"]).is_none()  # undefined with a single cluster
     assert_that(result["sub_k"]).is_equal_to(1)
+
+
+def test_bootstrap_stability_scores_ari_and_ami_over_the_same_replicate_pairs(mocker) -> None:
+    """A replicate pair contributes to BOTH agreement metrics or to neither.
+
+    Appending the ARI before computing the AMI let an AMI-only failure leave the two lists at
+    different lengths, so ``mean_ari``/``std_ari`` and ``mean_ami`` were reported over different
+    samples of the same pairs — a discrepancy nothing in the output would reveal.
+
+    Both metrics are stubbed to return the SAME value for a given pair, so aligned lists give
+    identical means and any desync separates them.
+    """
+    rng = np.random.default_rng(4)
+    X = np.vstack([rng.normal(c, 1.6, (40, 4)) for c in (0.0, 1.0, 2.0)]).astype(np.float32)
+    config = dataclasses.replace(
+        default_config(), seed=11, kmeans_n_clusters=3, umap_n_neighbors=5, cluster_space="original"
+    )
+    counter = iter(range(1, 500))
+    last_ari = [0.0]
+    pair = [0]
+
+    def fake_ari(_a, _b):
+        # Squares, not consecutive integers: an arithmetic sequence has the SAME mean as its
+        # every-other-element subsequence, so a linear stub cannot see the desync at all.
+        last_ari[0] = float(next(counter)) ** 2
+        return last_ari[0]
+
+    def fake_ami(_a, _b):
+        pair[0] += 1
+        if pair[0] % 2 == 0:  # this metric fails on every other pair
+            raise RuntimeError("AMI failed on this pair")
+        return last_ari[0]
+
+    mocker.patch("sklearn.metrics.adjusted_rand_score", side_effect=fake_ari)
+    mocker.patch("sklearn.metrics.adjusted_mutual_info_score", side_effect=fake_ami)
+
+    metrics = bootstrap_stability(X, "kmeans", config, n_boot=6)
+
+    assert_that(pair[0]).is_greater_than(2)  # the failure arm was actually exercised
+    assert_that(metrics["mean_ari"]).is_close_to(metrics["mean_ami"], tolerance=1e-12)

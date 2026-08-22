@@ -1261,11 +1261,16 @@ def bootstrap_stability(
             if int(both.sum()) < 2:
                 continue
             la, lb = la_all[both], lb_all[both]
+            # Both scores computed BEFORE either list is touched. Appending as we go let an
+            # AMI-only failure leave `aris` one element longer, so `mean_ari`/`std_ari` and
+            # `mean_ami` were then averaged over different samples of the same replicate pairs.
             try:
-                aris.append(float(adjusted_rand_score(la, lb)))
-                amis.append(float(adjusted_mutual_info_score(la, lb)))
+                ari = float(adjusted_rand_score(la, lb))
+                ami = float(adjusted_mutual_info_score(la, lb))
             except Exception:
                 continue
+            aris.append(ari)
+            amis.append(ami)
 
     mean_noise = float(np.mean(noise_agrees)) if noise_agrees else 0.0
     if not aris:

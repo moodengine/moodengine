@@ -756,3 +756,31 @@ def test_load_gold_reads_utf8_regardless_of_the_platform_encoding(tmp_path) -> N
     )
 
     assert_that(result.returncode).described_as(result.stderr[-800:]).is_equal_to(0)
+
+
+def test_evaluate_against_gold_drops_a_track_whose_prediction_is_not_numeric() -> None:
+    """A track contributes a PAIR to the correlation or nothing — never half of one.
+
+    The gold value and the prediction are coerced together. Committing the gold value first let a
+    non-numeric prediction shift every later track's prediction onto the PREVIOUS track's gold,
+    and then made ``_pearson`` raise on the length mismatch — which this function's contract
+    ("Never raises") forbids.
+    """
+    df = pd.DataFrame(
+        {
+            "filename": ["a.wav", "b.wav", "c.wav", "d.wav"],
+            "top_mood": ["calm"] * 4,
+            "energy": pd.Series([0.10, "n/a", 0.90, 0.95], dtype=object),
+        }
+    )
+    gold = {
+        "a.wav": {"moods": ["calm"], "energy": 0.10},
+        "b.wav": {"moods": ["calm"], "energy": 0.20},
+        "c.wav": {"moods": ["calm"], "energy": 0.90},
+        "d.wav": {"moods": ["calm"], "energy": 0.95},
+    }
+
+    summary = evaluate_against_gold(df, gold)
+
+    # b.wav is dropped entirely, so the three survivors are each scored against their own gold.
+    assert_that(summary["energy_pearson"]).is_close_to(1.0, tolerance=1e-9)
