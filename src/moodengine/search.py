@@ -22,6 +22,8 @@ empty result rather than raising, so callers (scripts, UI) can stay simple.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 
 from moodengine._math import l2_normalize as _l2_normalize
@@ -197,12 +199,12 @@ def _camelot_harm(a: str | None, b: str | None) -> float:
 
     try:
         return 0.5 if a in camelot_neighbors(b) else 0.0
-    except Exception:  # noqa: BLE001 — a malformed code contributes no bonus, never an error
+    except Exception:  # noqa: BLE001 — a malformed code contributes no bonus and never an error
         return 0.0
 
 
 #: Playback-rate ratios the tempo term considers, so double- and half-time read as compatible.
-#: Shared by the scalar `_tempo_compat` and the vectorized per-step row in `_neighbours_greedy` —
+#: Shared by the scalar `_tempo_compat` and the vectorized per-step `_tempo_bonus_row` —
 #: one definition, so the two forms cannot drift apart.
 _TEMPO_RATIOS: tuple[float, ...] = (1.0, 2.0, 0.5)
 
@@ -216,131 +218,182 @@ def _tempo_compat(a: float, b: float, sigma: float) -> float:
     return float(np.exp(-((d / sigma) ** 2) / 2.0))
 
 
-def _neighbours_greedy(
-    query_idx: int,
-    X: np.ndarray,
-    filenames: list[str],
+# `eq=False`: the generated __eq__/__hash__ would walk the ndarray fields and raise
+# ("truth value of an array is ambiguous"). These records are only ever attribute-read, so
+# the comparison is not merely unused — it must not exist.
+@dataclass(frozen=True, eq=False)
+class _HarmonicBonus:
+    """Per-call Camelot tables for one candidate pool.
+
+    ``ids[p]`` is the position in ``distinct`` of pool member ``p``'s code, so a bonus computed once
+    per DISTINCT code expands to the whole pool by fancy indexing. ``memo`` caches that expanded row
+    per reference code and lives on this per-call record — a module-level memo would give this
+    stateless core a hidden per-process memory.
+    """
+
+    weight: float
+    codes: list[str | None]  # the caller's list, indexed by ROW (not by pool position)
+    distinct: list[str | None]
+    ids: np.ndarray  # (pool_size,) intp into `distinct`
+    memo: dict[str | None, np.ndarray] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, eq=False)
+class _TempoBonus:
+    """Per-call BPM tables for one candidate pool.
+
+    ``ok`` masks pool members whose BPM is unknown or non-positive; ``safe`` carries a 1.0
+    placeholder under that mask so ``log2`` never sees a value it would warn about and whose result
+    the mask discards anyway. ``memo`` caches the expanded row per reference BPM, per call.
+    """
+
+    weight: float
+    sigma: float
+    bpm: np.ndarray  # (n,) float64, indexed by ROW
+    ok: np.ndarray  # (pool_size,) bool
+    safe: np.ndarray  # (pool_size,) float64
+    memo: dict[float, np.ndarray] = field(default_factory=dict)
+
+
+def _build_harmonic_bonus(
+    camelot: list[str | None] | None, weight: float, pool_rows: list[int]
+) -> _HarmonicBonus | None:
+    """Camelot tables for ``pool_rows``, or ``None`` when the harmonic term is off (no codes, or a
+    zero weight) — the greedy then skips it entirely instead of adding a row of zeros."""
+    if not camelot or weight == 0.0:
+        return None
+
+    pool_cam = [camelot[r] if r < len(camelot) else None for r in pool_rows]
+    distinct = list(dict.fromkeys(pool_cam))
+    index = {c: i for i, c in enumerate(distinct)}
+
+    return _HarmonicBonus(
+        weight=weight,
+        codes=camelot,
+        distinct=distinct,
+        ids=np.array([index[c] for c in pool_cam], dtype=np.intp),
+    )
+
+
+def _build_tempo_bonus(
+    bpm_vec: np.ndarray, has_bpm: bool, weight: float, sigma: float, pool_rows: list[int]
+) -> _TempoBonus | None:
+    """BPM tables for ``pool_rows``, or ``None`` when the tempo term is off (no BPMs, or a zero
+    weight) — the greedy then skips it entirely instead of adding a row of zeros.
+
+    ``bpm_vec`` arrives already converted, so a caller that supplies an unconvertible ``bpm``
+    still fails at the same point it did before this was a separate function, whatever the weight.
+    """
+    if not has_bpm or weight == 0.0:
+        return None
+
+    pool_bpm = np.array(
+        [bpm_vec[r] if r < bpm_vec.shape[0] else np.nan for r in pool_rows], dtype=np.float64
+    )
+    ok = np.isfinite(pool_bpm) & (pool_bpm > 0.0)
+
+    # A placeholder under the mask keeps log2 off NaN and non-positive BPMs, which would
+    # otherwise warn and produce values the mask discards anyway.
+    return _TempoBonus(
+        weight=weight, sigma=sigma, bpm=bpm_vec, ok=ok, safe=np.where(ok, pool_bpm, 1.0)
+    )
+
+
+def _harmonic_bonus_row(tables: _HarmonicBonus, ref_row: int) -> np.ndarray:
+    """Weighted harmonic bonus of every pool member against ``ref_row``'s Camelot code.
+
+    ``_camelot_harm`` is called once per DISTINCT pool code, so the ``a == b`` rule that scores two
+    identical MALFORMED codes 1.0 is inherited rather than re-derived from a hand-written key map.
+    """
+    ref_cam = tables.codes[ref_row] if 0 <= ref_row < len(tables.codes) else None
+
+    row = tables.memo.get(ref_cam)
+    if row is None:
+        per_code = np.array([_camelot_harm(c, ref_cam) for c in tables.distinct], dtype=np.float32)
+        row = tables.memo[ref_cam] = per_code[tables.ids]
+
+    return tables.weight * row
+
+
+def _tempo_bonus_row(tables: _TempoBonus, ref_row: int) -> np.ndarray | None:
+    """Weighted octave-aware tempo bonus of every pool member against ``ref_row``'s BPM, or ``None``
+    when that reference BPM is unknown or non-positive — it then contributes nothing, exactly as the
+    scalar :func:`_tempo_compat` does."""
+    ref_bpm = float(tables.bpm[ref_row]) if ref_row < tables.bpm.shape[0] else float("nan")
+    if not np.isfinite(ref_bpm) or ref_bpm <= 0.0:
+        return None
+
+    row = tables.memo.get(ref_bpm)
+    if row is None:
+        d = np.min(np.abs(np.log2(np.outer(tables.safe, _TEMPO_RATIOS) / ref_bpm)), axis=1)
+        row = tables.memo[ref_bpm] = np.where(
+            tables.ok, np.exp(-((d / tables.sigma) ** 2) / 2.0), 0.0
+        ).astype(np.float32)
+
+    return tables.weight * row
+
+
+def _bonus_row(
+    harmonic: _HarmonicBonus | None, tempo: _TempoBonus | None, ref_row: int, pool_size: int
+) -> np.ndarray:
+    """Harmonic + tempo bonus of EVERY pool member against ``ref_row`` (the seed on the first pick,
+    then the previously-selected track → a continuous harmonic/tempo chain).
+
+    The bonus depends on the candidate AND on ``ref_row``, and ``ref_row`` changes once per greedy
+    STEP — so it is computed for the whole pool per step and indexed, instead of calling the scalar
+    helpers once per (step, candidate).
+    """
+    out = np.zeros(pool_size, dtype=np.float32)
+
+    if harmonic is not None:
+        out += _harmonic_bonus_row(harmonic, ref_row)
+
+    if tempo is not None:
+        row = _tempo_bonus_row(tempo, ref_row)
+        if row is not None:
+            out += row
+
+    return out
+
+
+def _greedy_select(
+    rel: np.ndarray,
+    G: np.ndarray,
+    pool: np.ndarray,
     *,
-    top_k: int = 20,
-    lambda_: float = 0.7,
-    pool_mult: int = 5,
-    camelot: list[str | None] | None = None,
-    bpm: np.ndarray | None = None,
-    harmonic_weight: float = 0.0,
-    tempo_weight: float = 0.0,
-    exclude: frozenset[int] = frozenset(),
-    tempo_sigma: float = 0.05,
-    assume_normalized: bool = False,
-) -> list[tuple[str, float]]:
-    """Shared greedy for MMR (:func:`find_neighbours_mmr`) and its harmonic/tempo generalization
-    (:func:`find_neighbours_harmonic`). Both are thin wrappers so there is a single greedy — with all
-    bonus weights 0 and no ``exclude`` this is exactly MMR. See those two for the public contracts."""
-    X = np.asarray(X, dtype=np.float32)
-    n = X.shape[0] if X.ndim == 2 else 0
-    if n == 0 or not (0 <= int(query_idx) < n) or int(top_k) <= 0:
-        return []
-    q = int(query_idx)
-    Xn = X if assume_normalized else _l2_normalize(X, axis=1)
-    rel_all = Xn @ Xn[q]  # (n,) cosine to the seed
+    k: int,
+    lam: float,
+    seed_row: int,
+    harmonic: _HarmonicBonus | None,
+    tempo: _TempoBonus | None,
+) -> list[int]:
+    """Greedy MMR over the candidate pool; returns the picks in order, as POSITIONS into ``pool``.
 
-    # Mask self + excluded (recent/queue) rows out of the pool — never selected. Out-of-range ids ignored.
-    masked = {q} | {int(e) for e in exclude if 0 <= int(e) < n}
-    rel_all[list(masked)] = -np.inf
-    valid = n - len(masked)
-    k = min(int(top_k), valid)
-    if k <= 0:
-        return []
-    lam = float(lambda_)
-
-    pool_size = min(max(k, k * max(1, int(pool_mult))), valid)
-    pool = np.argpartition(-rel_all, pool_size - 1)[:pool_size]
-    pool = pool[np.argsort(-rel_all[pool])]  # (pool_size,) original rows, rel descending
-    rel = rel_all[pool].astype(np.float32)
-    G = Xn[pool] @ Xn[pool].T  # (pool_size, pool_size) pairwise cosine
-    use_harm = bool(camelot) and harmonic_weight != 0.0
-    use_tempo = bpm is not None and tempo_weight != 0.0
-    # Non-optional stand-ins for the closure below (empty when the feature is off):
-    # every index guard stays simple and the Optional never leaks past this point.
-    cam_list: list[str | None] = camelot if camelot is not None else []
-    bpm_vec = np.asarray(bpm, dtype=np.float64).reshape(-1) if bpm is not None else np.empty(0)
-
-    # The bonus depends on the candidate and on ``ref_row``, and ``ref_row`` changes ONCE per greedy
-    # step — so it is computed for the whole pool per step and indexed, instead of calling the scalar
-    # helpers once per (step, candidate). Two things keep that exact rather than merely close:
-    # the harmonic side calls `_camelot_harm` itself, once per DISTINCT code, so the ``a == b`` rule
-    # that scores two identical MALFORMED codes 1.0 is inherited rather than re-derived from a
-    # hand-written key map; and both caches are function-local, because a module-level memo would
-    # give this stateless core a hidden per-process memory.
-    pool_rows = pool.tolist()
-    distinct_cam: list[str | None] = []
-    cam_ids = np.empty(0, dtype=np.intp)
-    harm_rows: dict[str | None, np.ndarray] = {}
-    pool_bpm = np.empty(0)
-    tempo_ok = np.empty(0, dtype=bool)
-    safe_bpm = np.empty(0)
-    tempo_rows: dict[float, np.ndarray] = {}
-    if use_harm:
-        pool_cam = [cam_list[r] if r < len(cam_list) else None for r in pool_rows]
-        distinct_cam = list(dict.fromkeys(pool_cam))
-        cam_index = {c: i for i, c in enumerate(distinct_cam)}
-        cam_ids = np.array([cam_index[c] for c in pool_cam], dtype=np.intp)
-    if use_tempo:
-        pool_bpm = np.array(
-            [bpm_vec[r] if r < bpm_vec.shape[0] else np.nan for r in pool_rows], dtype=np.float64
-        )
-        tempo_ok = np.isfinite(pool_bpm) & (pool_bpm > 0.0)
-        # A placeholder under the mask keeps log2 off NaN and non-positive BPMs, which would
-        # otherwise warn and produce values the mask discards anyway.
-        safe_bpm = np.where(tempo_ok, pool_bpm, 1.0)
-
-    def _bonus_row(ref_row: int) -> np.ndarray:
-        """Harmonic + tempo bonus of EVERY pool member against ``ref_row`` (the seed on the first
-        pick, then the previously-selected track → a continuous harmonic/tempo chain)."""
-        out = np.zeros(pool_size, dtype=np.float32)
-        if use_harm:
-            ref_cam = cam_list[ref_row] if 0 <= ref_row < len(cam_list) else None
-            row = harm_rows.get(ref_cam)
-            if row is None:
-                per_code = np.array(
-                    [_camelot_harm(c, ref_cam) for c in distinct_cam], dtype=np.float32
-                )
-                row = harm_rows[ref_cam] = per_code[cam_ids]
-            out += harmonic_weight * row
-        if use_tempo:
-            ref_bpm = float(bpm_vec[ref_row]) if ref_row < bpm_vec.shape[0] else float("nan")
-            if not np.isfinite(ref_bpm) or ref_bpm <= 0.0:
-                return out  # an unknown reference BPM contributes nothing, as it did per-scalar
-            row = tempo_rows.get(ref_bpm)
-            if row is None:
-                d = np.min(np.abs(np.log2(np.outer(safe_bpm, _TEMPO_RATIOS) / ref_bpm)), axis=1)
-                row = tempo_rows[ref_bpm] = np.where(
-                    tempo_ok, np.exp(-((d / tempo_sigma) ** 2) / 2.0), 0.0
-                ).astype(np.float32)
-            out += tempo_weight * row
-        return out
-
-    # Greedy. selected/remaining are POSITIONS into `pool`; `max_sim[p]` is p's TRUE max cosine to any
-    # chosen pick (may be negative). `max_sim is None` marks the empty chosen set → the first pick has no
-    # diversity penalty; thereafter it is the genuine running max (never floored at 0, so an
-    # anti-correlated candidate keeps its negative penalty, matching a from-scratch MMR). `ref_row`
-    # chains: the seed for the first pick, then the last-selected track (smoothed harmonic/tempo chain).
+    ``max_sim[p]`` is p's TRUE max cosine to any chosen pick (may be negative). ``max_sim is None``
+    marks the empty chosen set → the first pick has no diversity penalty; thereafter it is the
+    genuine running max (never floored at 0, so an anti-correlated candidate keeps its negative
+    penalty, matching a from-scratch MMR). ``ref_row`` chains: the seed for the first pick, then the
+    last-selected track (a smoothed harmonic/tempo chain, not a comparison to the frozen seed).
+    """
+    pool_size = rel.shape[0]
     selected: list[int] = []
     remaining = list(range(pool_size))
     max_sim: np.ndarray | None = None
-    ref_row = q
+    ref_row = seed_row
+
     while remaining and len(selected) < k:
         cand = np.asarray(remaining)
         div = np.zeros(len(remaining), dtype=np.float32) if max_sim is None else max_sim[cand]
         score = lam * rel[cand] - (1.0 - lam) * div
-        if use_harm or use_tempo:
-            score = score + _bonus_row(ref_row)[cand]
-        best = remaining.pop(
-            int(np.argmax(score))
-        )  # first max on ties → the more-relevant candidate
+        if harmonic is not None or tempo is not None:
+            score = score + _bonus_row(harmonic, tempo, ref_row, pool_size)[cand]
+
+        best = remaining.pop(int(np.argmax(score)))  # first max on ties → the more-relevant one
         selected.append(best)
         max_sim = G[best].copy() if max_sim is None else np.maximum(max_sim, G[best])
         ref_row = int(pool[best])
-    return [(filenames[int(pool[p])], float(rel[p])) for p in selected]
+
+    return selected
 
 
 def find_neighbours_mmr(
@@ -368,7 +421,7 @@ def find_neighbours_mmr(
     numpy; yields ``[]`` for an empty ``X``, an out-of-range ``query_idx``, or ``top_k <= 0``.
     ``assume_normalized`` skips the defensive row re-normalization (see the module docstring).
     """
-    return _neighbours_greedy(
+    return find_neighbours_harmonic(
         query_idx,
         X,
         filenames,
@@ -411,22 +464,49 @@ def find_neighbours_harmonic(
 
     Returns ``(filename, cosine_to_seed)`` — the real cosine, never the composite objective. Deterministic,
     pure numpy. With ``harmonic_weight == 0 ∧ tempo_weight == 0 ∧ exclude == ∅`` this is **exactly**
-    :func:`find_neighbours_mmr` (both delegate to the same greedy)."""
-    return _neighbours_greedy(
-        query_idx,
-        X,
-        filenames,
-        top_k=top_k,
-        lambda_=lambda_,
-        pool_mult=pool_mult,
-        camelot=camelot,
-        bpm=bpm,
-        harmonic_weight=harmonic_weight,
-        tempo_weight=tempo_weight,
-        exclude=exclude,
-        tempo_sigma=tempo_sigma,
-        assume_normalized=assume_normalized,
+    :func:`find_neighbours_mmr`, which IS this function with both weights at 0 and no ``exclude``
+    — one greedy, so the two can never drift apart."""
+    X = np.asarray(X, dtype=np.float32)
+    n = X.shape[0] if X.ndim == 2 else 0
+    if n == 0 or not (0 <= int(query_idx) < n) or int(top_k) <= 0:
+        return []
+    q = int(query_idx)
+    Xn = X if assume_normalized else _l2_normalize(X, axis=1)
+    rel_all = Xn @ Xn[q]  # (n,) cosine to the seed
+
+    # Mask self + excluded (recent/queue) rows out of the pool — never selected. Out-of-range ids ignored.
+    masked = {q} | {int(e) for e in exclude if 0 <= int(e) < n}
+    rel_all[list(masked)] = -np.inf
+    valid = n - len(masked)
+    k = min(int(top_k), valid)
+    if k <= 0:
+        return []
+
+    pool_size = min(max(k, k * max(1, int(pool_mult))), valid)
+    pool = np.argpartition(-rel_all, pool_size - 1)[:pool_size]
+    pool = pool[np.argsort(-rel_all[pool])]  # (pool_size,) original rows, rel descending
+    rel = rel_all[pool].astype(np.float32)
+    G = Xn[pool] @ Xn[pool].T  # (pool_size, pool_size) pairwise cosine
+
+    # Converted here, not inside `_build_tempo_bonus`: an unconvertible `bpm` must still fail on
+    # the zero-weight path, exactly as it did when this was one function.
+    bpm_vec = np.asarray(bpm, dtype=np.float64).reshape(-1) if bpm is not None else np.empty(0)
+    pool_rows = pool.tolist()
+
+    selected = _greedy_select(
+        rel,
+        G,
+        pool,
+        k=k,
+        lam=float(lambda_),
+        seed_row=q,
+        harmonic=_build_harmonic_bonus(camelot, float(harmonic_weight), pool_rows),
+        tempo=_build_tempo_bonus(
+            bpm_vec, bpm is not None, float(tempo_weight), float(tempo_sigma), pool_rows
+        ),
     )
+
+    return [(filenames[int(pool[p])], float(rel[p])) for p in selected]
 
 
 def search_by_text(

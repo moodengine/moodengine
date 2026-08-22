@@ -992,3 +992,86 @@ def test_near_duplicate_pairs_blockwise_equals_single_block(monkeypatch, thresho
     np.testing.assert_allclose(
         [c for _, _, c in chunked], [c for _, _, c in full], rtol=0.0, atol=2e-6
     )
+
+
+# --------------------------------------------------------------------------- #
+# The greedy's two bonus terms, pinned independently of each other
+# --------------------------------------------------------------------------- #
+
+
+def _bonus_fixture() -> tuple[np.ndarray, list[str], np.ndarray, list[str | None]]:
+    """8 tracks whose Camelot codes reorder the greedy's first picks, seed BPM UNKNOWN."""
+    X = np.random.default_rng(3).standard_normal((8, 4)).astype(np.float32)
+    names = [f"t{i}.wav" for i in range(8)]
+    bpm = np.full(8, 120.0)
+    bpm[0] = np.nan  # the seed's own tempo is unknown
+    camelot: list[str | None] = ["8A", "1A", "8A", "9A", "8B", "3A", "8A", "5A"]
+    return X, names, bpm, camelot
+
+
+def test_find_neighbours_harmonic_unknown_reference_bpm_keeps_the_harmonic_bonus() -> None:
+    """An unknown reference BPM cancels the TEMPO term only, never the harmonic one.
+
+    The two terms share one accumulator, and the tempo half bails out early when the reference
+    track has no usable BPM — so a bail-out that discarded the whole accumulator instead of just
+    its own contribution would silently drop harmonic mixing for every seed with no detected tempo.
+    """
+    X, names, bpm, camelot = _bonus_fixture()
+    common = dict(top_k=3, lambda_=0.7, bpm=bpm, tempo_weight=0.6, camelot=camelot)
+
+    with_harmonic = find_neighbours_harmonic(0, X, names, harmonic_weight=2.0, **common)
+    without_harmonic = find_neighbours_harmonic(0, X, names, harmonic_weight=0.0, **common)
+
+    assert_that([f for f, _ in with_harmonic]).is_equal_to(["t6.wav", "t3.wav", "t2.wav"])
+    assert_that([f for f, _ in without_harmonic]).is_equal_to(["t4.wav", "t3.wav", "t6.wav"])
+
+
+def test_find_neighbours_harmonic_empty_camelot_list_ranks_like_no_camelot_at_all(mocker) -> None:
+    """``camelot=[]`` is "no key information", and it costs nothing to say so.
+
+    The ranking comes out identical even WITHOUT the emptiness check — over an empty list every
+    lookup falls off the end to ``None``, and an unknown code scores 0.0 — so a value assertion
+    alone cannot tell the two apart, and would pass over a guard that had quietly stopped working.
+    The spy pins the contract that is actually observable: an empty list builds no Camelot table
+    for a pool it could never score.
+    """
+    X, names, bpm, _ = _bonus_fixture()
+    common = dict(top_k=3, lambda_=0.7, bpm=bpm, tempo_weight=0.6, harmonic_weight=2.0)
+    harm = mocker.spy(search, "_camelot_harm")
+
+    empty_list = find_neighbours_harmonic(0, X, names, camelot=[], **common)
+    no_list = find_neighbours_harmonic(0, X, names, camelot=None, **common)
+
+    assert_that([f for f, _ in empty_list]).is_equal_to([f for f, _ in no_list])
+    assert_that(harm.call_count).is_equal_to(0)
+
+
+@pytest.mark.parametrize("lambda_", [0.0, 0.7, 1.0])
+def test_find_neighbours_mmr_equals_the_harmonic_greedy_with_both_weights_at_zero(
+    lambda_: float, mocker
+) -> None:
+    """The documented identity, now structural: MMR delegates to the harmonic greedy.
+
+    Supplying the signals but weighting them 0 must build no bonus at all — not a bonus row of
+    zeros that happens to cancel — so the result has to match MMR exactly, at any lambda.
+    """
+    X, names, bpm, camelot = _bonus_fixture()
+    bonus = mocker.spy(search, "_bonus_row")
+
+    mmr = find_neighbours_mmr(0, X, names, 4, lambda_)
+    weighted_zero = find_neighbours_harmonic(
+        0,
+        X,
+        names,
+        top_k=4,
+        lambda_=lambda_,
+        camelot=camelot,
+        bpm=bpm,
+        harmonic_weight=0.0,
+        tempo_weight=0.0,
+    )
+
+    assert_that(weighted_zero).is_equal_to(mmr)
+    # Zeroed weights build no table at all, rather than a row of zeros added at every greedy
+    # step — a value assertion cannot see that difference, since 0.0 * anything cancels either way.
+    assert_that(bonus.call_count).is_equal_to(0)
