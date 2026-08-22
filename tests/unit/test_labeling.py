@@ -1141,3 +1141,25 @@ def test_mood_affect_consistency_drops_unknown_moods_and_non_finite_axes() -> No
     result = mood_affect_consistency(df)
 
     assert_that(result["n_scored"]).is_equal_to(1)  # only the all-known, all-finite row
+
+
+def test_mood_affect_consistency_reports_nan_when_an_axis_is_constant_to_float_noise() -> None:
+    """A measured axis with one ULP of spread has no correlation with the expected coordinate.
+
+    This is a health metric read to decide whether the discrete mood and the continuous axes
+    agree, so a fabricated 0.707 is worse than an honest nan: it says the two agree moderately
+    when in fact one of them never varied.
+    """
+    moods = list(MOOD_AFFECT)[:3]
+    label_df = pd.DataFrame(
+        {
+            "top_mood": moods,
+            "energy": [0.5, 0.5, 0.5 + 1e-16],  # constant to within one ULP
+            "valence": [MOOD_AFFECT[m][0] for m in moods],
+        }
+    )
+
+    out = mood_affect_consistency(label_df)
+
+    assert_that(out["arousal_pearson"]).is_nan()
+    assert_that(out["n_scored"]).is_equal_to(3)  # the rows were scored, the correlation was not

@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from moodengine._math import l2_normalize
+from moodengine._math import is_constant_series, l2_normalize
 from moodengine._typing import SupportsEmbedText
 from moodengine._validation import ensure_finite_2d
 
@@ -288,7 +288,7 @@ def mood_affect_consistency(
     got_a, got_v = measured_a[keep], measured_v[keep]
 
     def _r(x: np.ndarray, y: np.ndarray) -> float:
-        if x.size < 2 or float(x.std()) == 0.0 or float(y.std()) == 0.0:
+        if is_constant_series(x) or is_constant_series(y):
             return float("nan")
         return float(np.corrcoef(x, y)[0, 1])
 
