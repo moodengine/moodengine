@@ -11,6 +11,13 @@ from __future__ import annotations
 import pytest
 from assertpy import assert_that
 
+# `clap` is a pure torch wrapper, covered by the opt-in `-m model` suite by contract
+# (see .claude/rules/testing.md). Without this marker these tests run NOWHERE: no other
+# job installs the models extra, so they importorskip everywhere, while `test-models`
+# runs `-m model` and deselects them. The importorskip below stays as the local-dev
+# guard for someone running `-m model` on a light install.
+pytestmark = pytest.mark.model
+
 torch = pytest.importorskip("torch")
 # Import via the clap module (which clears sys.argv around the laion_clap import — importing laion_clap
 # directly runs its argparse at module load and SystemExits under pytest). Skips if models extra absent.

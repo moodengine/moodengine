@@ -26,7 +26,7 @@ ships the `pot` distribution, but it imports as `ot`), `leidenalg`, `pacmap`, `s
 
 **Economy.** `@pytest.mark.parametrize` over copy-pasted variants. Keep unit tests fast (<1 s each); anything slower gets a marker and a reason.
 
-**Coverage — a floor, not a target.** `uv run pytest --cov` enforces `fail_under` (`[tool.coverage.report]`) on the torch-free default suite; the pure-torch wrappers (`embeddings/clap.py`, `embeddings/mert.py`, `embeddings/mulan.py`) are `omit`-ted because they have no unit tests by contract. Write tests because a behavior needs pinning, never to move the number — and never lower the floor to make a change pass. Torch/POT-gated paths are covered by the extras/model CI jobs, not this measurement.
+**Coverage — a floor, not a target.** `uv run pytest --cov` enforces `fail_under` (`[tool.coverage.report]`) on the torch-free default suite; the pure-torch wrappers (`embeddings/clap.py`, `embeddings/mert.py`, `embeddings/mulan.py`) are `omit`-ted because they have no unit tests by contract. Write tests because a behavior needs pinning, never to move the number — and never lower the floor to make a change pass. Torch/POT-gated paths are covered by the extras+torch CI job, whose coverage data is merged with this one into the single report SonarQube imports — so the project-level number is the union of what CI actually runs, while this floor stays a floor on the torch-free suite alone.
 
 **Benchmarks — measured, never asserted.**
 - Hot-path benchmarks live in `tests/benchmarks/` (pytest-benchmark), carry the `benchmark` marker and are deselected by default (`uv run pytest -m benchmark` to run).
