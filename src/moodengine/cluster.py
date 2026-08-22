@@ -136,6 +136,11 @@ def fit_projection(X: np.ndarray, config: Config) -> tuple[np.ndarray, object]:
 
         reducer = pacmap.PaCMAP(n_components=2, n_neighbors=n_neighbors, random_state=config.seed)
     else:
+        # Unreachable through the public contract: `config` is a `Config`, and its
+        # `__post_init__` already pins `projection_method` to `ProjectionMethod`. It
+        # stays as an exhaustiveness guard, because the failure mode without it is far
+        # worse — a member added to the alias but not wired in above would fall through
+        # to `reducer.fit_transform` and die on an UnboundLocalError naming nothing.
         raise ValueError(
             f"unknown projection_method {method!r}; expected 'umap', 'densmap' or 'pacmap'"
         )
