@@ -21,6 +21,10 @@ action, and for an unknown version it skips validation **silently** rather than 
 `UV_VERSION` and the setup-uv SHA move together — raising one without the other leaves the pin
 unverified with nothing to say so.
 
+**And pin every `uvx` tool.** `uvx <tool>` resolves the newest release at run time, so a CI gate can
+change behaviour without a commit — the exact thing pinning actions by SHA exists to prevent. Write
+`uvx <tool>==<version>` and bump it deliberately.
+
 **Least-privilege tokens.**
 - Every workflow declares top-level `permissions: contents: read`. Elevate per-*job*, never
   globally, and only to what that job needs (e.g. the artifact-publish job gets
