@@ -18,6 +18,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 import soundfile as sf
+from hypothesis import HealthCheck, settings
+
+# Property-based tests run DERANDOMIZED. `testing.md` requires the suite to be deterministic —
+# seeded through `Config.seed` or an explicit rng, never the wall clock — and a randomized
+# Hypothesis run breaks that: a failure that only reproduces on one machine, or one Tuesday, is
+# worse than no test. `deadline=None` because the numeric paths here legitimately take longer
+# than Hypothesis's 200 ms default on a first, uncached call.
+settings.register_profile(
+    "moodengine",
+    derandomize=True,
+    deadline=None,
+    max_examples=75,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+settings.load_profile("moodengine")
 
 
 def hash_unit_vec(key: bytes, dim: int) -> np.ndarray:

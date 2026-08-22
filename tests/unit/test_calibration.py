@@ -7,9 +7,12 @@ synthetic set. ECE is imported from :mod:`moodengine.evaluation` — never redef
 
 from __future__ import annotations
 
+import hypothesis.extra.numpy as npst
+import hypothesis.strategies as st
 import numpy as np
 import pytest
 from assertpy import assert_that
+from hypothesis import given
 
 from moodengine.calibration import (
     _PROB_FLOOR,
@@ -541,3 +544,83 @@ def test_calibration_module_is_torch_free() -> None:
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert_that(r.returncode).is_equal_to(0)
+
+
+# --------------------------------------------------------------------------- #
+# Properties — aimed where mutation testing showed the suite was thinnest:
+# fit_temperature, aps_threshold and prediction_set together carried over a
+# hundred surviving mutants, almost all in guard conditions and defaults.
+# --------------------------------------------------------------------------- #
+
+_LOGITS = npst.arrays(
+    dtype=np.float64,
+    shape=npst.array_shapes(min_dims=2, max_dims=2, min_side=2, max_side=8),
+    elements=st.floats(-20.0, 20.0, allow_nan=False, allow_infinity=False),
+)
+
+
+@st.composite
+def _logits_and_labels(draw) -> tuple[np.ndarray, np.ndarray]:
+    """A logit matrix with one in-range label per row — the shape every entry point requires."""
+    logits = draw(_LOGITS)
+    n, k = logits.shape
+    labels = draw(npst.arrays(dtype=np.int64, shape=(n,), elements=st.integers(0, k - 1)))
+    return logits, labels
+
+
+@given(pair=_logits_and_labels())
+def test_fit_temperature_always_returns_a_temperature_inside_its_bounds(pair) -> None:
+    """A temperature outside the bounds is not a worse fit, it is an invalid one.
+
+    Everything downstream divides logits by it, so a zero or negative result would silently
+    produce infinities rather than a bad calibration.
+    """
+    logits, labels = pair
+
+    temperature = fit_temperature(logits, labels)
+
+    assert_that(temperature).is_greater_than(0.0)
+    assert_that(temperature).is_between(0.001, 100.0)
+
+
+@given(pair=_logits_and_labels())
+def test_negative_log_likelihood_is_non_negative_and_finite(pair) -> None:
+    """NLL is a loss: below zero is impossible, and non-finite means the probability floor failed."""
+    logits, labels = pair
+    probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+
+    value = negative_log_likelihood(probs, labels)
+
+    assert_that(value).is_greater_than_or_equal_to(0.0)
+    assert_that(bool(np.isfinite(value))).is_true()
+
+
+@given(pair=_logits_and_labels(), target=st.floats(0.5, 0.99))
+def test_aps_threshold_is_a_probability_mass(pair, target: float) -> None:
+    """The threshold is compared against a cumulative probability, so it has to live in [0, 1]."""
+    logits, labels = pair
+    probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+
+    q_hat = aps_threshold(probs, labels, target)
+
+    assert_that(float(q_hat)).is_between(0.0, 1.0)
+
+
+@given(pair=_logits_and_labels(), target=st.floats(0.5, 0.99))
+def test_prediction_set_is_never_empty_and_holds_only_real_classes(pair, target: float) -> None:
+    """A conformal set that is empty, or names a class that does not exist, is unusable.
+
+    Returning nothing is the failure mode that matters: a caller reads "no prediction" as a
+    confident abstention rather than as a broken threshold.
+    """
+    logits, labels = pair
+    probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+    q_hat = aps_threshold(probs, labels, target)
+
+    for row in probs:
+        chosen = prediction_set(row, float(q_hat))
+
+        assert_that(chosen.size).is_greater_than(0)
+        assert_that(chosen.size).is_less_than_or_equal_to(row.size)
+        assert_that(bool(np.all((chosen >= 0) & (chosen < row.size)))).is_true()
+        assert_that(len(set(chosen.tolist()))).is_equal_to(chosen.size)  # no duplicates
