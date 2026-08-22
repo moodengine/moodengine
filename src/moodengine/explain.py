@@ -239,7 +239,12 @@ def fit_signal_surrogate(
     if kind == "tree":
         from sklearn.tree import DecisionTreeClassifier
 
-        model = DecisionTreeClassifier(max_depth=int(max_depth), random_state=int(seed))
+        # ccp_alpha pinned to sklearn's default rather than left implicit: this surrogate exists
+        # to be READ, and `max_depth` is the single knob that trades fidelity for readability.
+        # Cost-complexity pruning would move the tree without appearing in the caller's arguments.
+        model = DecisionTreeClassifier(
+            max_depth=int(max_depth), random_state=int(seed), ccp_alpha=0.0
+        )
     elif kind == "linear":
         from sklearn.linear_model import LogisticRegression
 
