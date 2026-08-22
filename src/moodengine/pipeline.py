@@ -270,7 +270,7 @@ def track_embedding(embedder, path, config: Config, force: bool = False) -> np.n
         if cached is not None:
             return np.asarray(cached, dtype=np.float32)
 
-    waveform = _io.load_audio(path, embedder.sample_rate, config)
+    waveform = _io.load_audio(path, embedder.sample_rate)
     vector = track_embedding_from_waveform(embedder, waveform, embedder.sample_rate, config)
 
     save_cached(config.cache_dir, key, vector)

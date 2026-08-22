@@ -136,9 +136,8 @@ def test_ot_morph_shape_dedup_and_direction() -> None:
     X = (rng.standard_normal((60, 24))).astype(np.float32)
     X = X / np.linalg.norm(X, axis=1, keepdims=True)
     a, b = _unit(rng.standard_normal(24)), _unit(rng.standard_normal(24))
-    files = [f"t{i}" for i in range(60)]
 
-    idxs = ot_morph(a, b, X, files, n=8)
+    idxs = ot_morph(a, b, X, [], n=8)
     assert_that(len(idxs)).is_equal_to(len(set(idxs)))  # distinct row indices
     assert_that(len(set(idxs))).is_less_than_or_equal_to(8)  # capped at n
     assert_that(all(0 <= i < 60 for i in idxs)).is_true()
@@ -146,7 +145,7 @@ def test_ot_morph_shape_dedup_and_direction() -> None:
     sims_b = X @ b
     seq = [float(sims_b[i]) for i in idxs]
     assert_that(all(seq[k] <= seq[k + 1] + 1e-6 for k in range(len(seq) - 1))).is_true()
-    assert_that(ot_morph(a, b, X, files, n=8)).is_equal_to(idxs)  # deterministic
+    assert_that(ot_morph(a, b, X, [], n=8)).is_equal_to(idxs)  # deterministic
 
 
 def test_ot_morph_raises_importerror_without_pot(monkeypatch) -> None:
@@ -166,7 +165,7 @@ def test_ot_morph_raises_importerror_without_pot(monkeypatch) -> None:
     a = _unit(np.arange(8, dtype=np.float32))
     X = np.eye(8, dtype=np.float32)
     with pytest.raises(ImportError, match=r"ot_morph requires POT"):
-        ot_morph(a, a, X, [f"t{i}" for i in range(8)], n=4)
+        ot_morph(a, a, X, [], n=4)
 
 
 def _path_cost(X, order):
@@ -658,3 +657,42 @@ def test_smooth_order_degenerate_inputs_are_returned_as_is() -> None:
     # An empty input returns before `start` is validated: sizing a degenerate call never raises.
     assert_that(smooth_order(np.empty((0, 4), dtype=np.float32), start=0)).is_empty()
     assert_that(smooth_order(np.eye(2, dtype=np.float32))).is_equal_to([0, 1])
+
+
+def test_ot_morph_passing_filenames_is_deprecated() -> None:
+    """The unused ``filenames`` parameter warns when a caller actually supplies names.
+
+    Its docstring has promised removal for a while; the repo's rule is one minor version with a
+    DeprecationWarning first, and a promise nothing emits is not one a caller can act on.
+    """
+    pytest.importorskip("ot")
+    from moodengine.journey import ot_morph
+
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((20, 8)).astype(np.float32)
+    X = X / np.linalg.norm(X, axis=1, keepdims=True)
+    a, b = _unit(rng.standard_normal(8)), _unit(rng.standard_normal(8))
+
+    with pytest.deprecated_call(match="ot_morph"):
+        named = ot_morph(a, b, X, [f"t{i}" for i in range(20)], n=4)
+
+    assert_that(named).is_equal_to(ot_morph(a, b, X, [], n=4))  # the names change nothing
+
+
+def test_ot_morph_with_the_documented_empty_list_is_silent(recwarn) -> None:
+    """The form the docstring tells callers to use must not warn."""
+    pytest.importorskip("ot")
+    from moodengine.journey import ot_morph
+
+    rng = np.random.default_rng(3)
+    X = rng.standard_normal((20, 8)).astype(np.float32)
+    X = X / np.linalg.norm(X, axis=1, keepdims=True)
+    a, b = _unit(rng.standard_normal(8)), _unit(rng.standard_normal(8))
+
+    ot_morph(a, b, X, [], n=4)
+
+    # Filtered on OUR message: `recwarn` also records third-party DeprecationWarnings
+    # (audioread's aifc/sunau shims), which say nothing about this call.
+    ours = [w for w in recwarn if "ot_morph(" in str(w.message)]
+
+    assert_that(ours).is_empty()
