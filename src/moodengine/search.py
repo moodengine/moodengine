@@ -260,7 +260,10 @@ def _build_harmonic_bonus(
 ) -> _HarmonicBonus | None:
     """Camelot tables for ``pool_rows``, or ``None`` when the harmonic term is off (no codes, or a
     zero weight) — the greedy then skips it entirely instead of adding a row of zeros."""
-    if not camelot or weight == 0.0:
+    # `not weight`, not `weight == 0.0`: this is a sentinel test against the parameter's own
+    # documented default, not an equality test on a computed float. Same outcome for every input
+    # (including -0.0 and NaN), and it does not read as arithmetic the way `== 0.0` does.
+    if not camelot or not weight:
         return None
 
     pool_cam = [camelot[r] if r < len(camelot) else None for r in pool_rows]
@@ -284,7 +287,9 @@ def _build_tempo_bonus(
     ``bpm_vec`` arrives already converted, so a caller that supplies an unconvertible ``bpm``
     still fails at the same point it did before this was a separate function, whatever the weight.
     """
-    if not has_bpm or weight == 0.0:
+    # `not weight`: a sentinel test against the documented default, not float arithmetic — see
+    # `_build_harmonic_bonus`.
+    if not has_bpm or not weight:
         return None
 
     pool_bpm = np.array(
