@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1](https://github.com/moodengine/moodengine/compare/v0.4.0...v0.4.1) (2026-08-22)
+
+
+### Fixes
+
+* **cluster,evaluation:** keep paired metrics over the same samples ([2888c24](https://github.com/moodengine/moodengine/commit/2888c24b6c6b89996d1bdbfd03a7ca8cd585afb4))
+* **evaluation,labeling:** stop reporting a correlation built from float noise ([e7690f0](https://github.com/moodengine/moodengine/commit/e7690f02b57e72c23884bbe9c4389ea5de2da6b0))
+* **io_audio,journey:** make the two documented deprecations observable ([24b7ac3](https://github.com/moodengine/moodengine/commit/24b7ac3ea6a4641efc220f2a617f48ec897db4cb))
+* **viz:** a mood name could close the labeling page's script tag ([f8892eb](https://github.com/moodengine/moodengine/commit/f8892eb737f5f2e5698e9d8b9359af27c957558b))
+
 ## [0.4.0](https://github.com/moodengine/moodengine/compare/v0.3.1...v0.4.0) (2026-08-22)
 
 
