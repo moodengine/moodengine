@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -9,7 +11,9 @@ from assertpy import assert_that
 
 from moodengine.viz import (
     _cell_str,
+    _m3u_suffix,
     build_dashboard,
+    build_labeling_ui,
     export_m3u,
     export_playlists,
     plot_attributes,
@@ -352,3 +356,153 @@ def test_build_dashboard_keeps_its_row_guards(tmp_path) -> None:
     # One `<tr>` is the table header, so an empty frame has exactly that and no body rows.
     assert_that(empty_page.count("<tr>")).is_equal_to(1)
     assert_that(bare_page.count("<tr>")).is_equal_to(1 + 3)
+
+
+# --------------------------------------------------------------------------- #
+# build_labeling_ui — the gold-set labeling form
+# --------------------------------------------------------------------------- #
+
+
+def _read(path) -> str:
+    """Read a written page as UTF-8 explicitly — the default encoding is cp1252 on Windows."""
+    return path.read_text(encoding="utf-8")
+
+
+def test_build_labeling_ui_renders_one_card_per_track(tmp_path) -> None:
+    """Every filename gets its own card, carrying that filename as the record key."""
+    out = tmp_path / "nested" / "label.html"
+
+    written = build_labeling_ui(["a.wav", "b.wav", "c.wav"], [], ["calm", "dark"], out)
+
+    page = _read(written)
+    assert_that(written).is_equal_to(out)
+    assert_that(page.count('class="card"')).is_equal_to(3)
+    assert_that(page).contains('data-filename="a.wav"', 'data-filename="c.wav"')
+
+
+def test_build_labeling_ui_renders_every_mood_as_a_checkbox_on_every_card(tmp_path) -> None:
+    """The mood vocabulary is offered per track, not once for the page."""
+    out = tmp_path / "label.html"
+
+    written = build_labeling_ui(["a.wav", "b.wav"], [], ["calm", "dark", "warm"], out)
+
+    page = _read(written)
+    assert_that(page.count('type="checkbox"')).is_equal_to(6)  # 2 tracks x 3 moods
+    assert_that(page.count('value="calm"')).is_equal_to(2)
+
+
+def test_build_labeling_ui_turns_an_absolute_path_into_a_file_uri(tmp_path) -> None:
+    """An absolute path becomes ``file://`` so the browser can actually open it."""
+    track = tmp_path / "song one.wav"
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui(["song one.wav"], [str(track)], ["calm"], out))
+
+    assert_that(page).contains(f'src="{track.as_uri()}"')
+    assert_that(page).does_not_contain(f'src="{track}"')  # not the bare filesystem path
+
+
+def test_build_labeling_ui_leaves_a_relative_path_untouched(tmp_path) -> None:
+    """A relative path is emitted as given: resolving it here would guess the reader's cwd."""
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui(["a.wav"], ["audio/a.wav"], ["calm"], out))
+
+    assert_that(page).contains('src="audio/a.wav"')
+
+
+def test_build_labeling_ui_omits_the_player_for_a_track_with_no_path(tmp_path) -> None:
+    """``paths`` may be shorter than ``filenames``; the extra tracks are still labelable."""
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui(["a.wav", "b.wav"], ["/music/a.wav"], ["calm"], out))
+
+    assert_that(page.count("<audio")).is_equal_to(1)
+    assert_that(page.count('class="card"')).is_equal_to(2)
+
+
+def test_build_labeling_ui_escapes_filenames_and_moods(tmp_path) -> None:
+    """Track and mood names reach the page as text, never as markup.
+
+    A library is user-supplied data, so a filename containing markup would otherwise inject it
+    into a page the maintainer then opens locally.
+    """
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui(['<img src=x onerror="1">.wav'], [], ["<b>bold</b>"], out))
+
+    assert_that(page).does_not_contain("<img src=x")
+    assert_that(page).does_not_contain("<b>bold</b>")
+    assert_that(page).contains("&lt;img src=x", "&lt;b&gt;bold&lt;/b&gt;")
+
+
+def test_build_labeling_ui_empty_inputs_still_write_a_usable_page(tmp_path) -> None:
+    """No tracks is a state to report, not a crash or a blank file."""
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui([], [], [], out))
+
+    assert_that(page).contains("No tracks provided.")
+    assert_that(page).starts_with("<!doctype html>")
+
+
+def test_build_labeling_ui_page_is_self_contained(tmp_path) -> None:
+    """No network: the form has to work from a local disk, which is the point of one HTML file."""
+    out = tmp_path / "label.html"
+
+    page = _read(build_labeling_ui(["a.wav"], ["/music/a.wav"], ["calm"], out))
+
+    assert_that(page).does_not_contain("http://", "https://", "//cdn.")
+
+
+def test_build_labeling_ui_ignores_audio_dir(tmp_path) -> None:
+    """``audio_dir`` is accepted for symmetry with ``build_dashboard`` and never read.
+
+    Every ``<audio>`` src here comes from ``paths``, which the docstring states — so a page built
+    with an ``audio_dir`` must be identical to one built without.
+    """
+    with_dir = tmp_path / "with.html"
+    without_dir = tmp_path / "without.html"
+    args = (["a.wav"], ["/music/a.wav"], ["calm"])
+
+    build_labeling_ui(*args, with_dir, audio_dir=tmp_path / "elsewhere")
+    build_labeling_ui(*args, without_dir)
+
+    assert_that(_read(with_dir)).is_equal_to(_read(without_dir))
+
+
+# --------------------------------------------------------------------------- #
+# _m3u_suffix — the three-way precedence extracted out of a nested conditional
+# --------------------------------------------------------------------------- #
+
+
+def test_m3u_suffix_prefers_the_mood_even_for_the_noise_cluster() -> None:
+    """A labelled ``-1`` reads by its mood; only an UNLABELLED one falls back to ``_noise``."""
+    assert_that(_m3u_suffix("Nuit Noire", -1)).is_equal_to("_nuit_noire")
+    assert_that(_m3u_suffix("", -1)).is_equal_to("_noise")
+
+
+def test_m3u_suffix_is_empty_for_an_unlabelled_ordinary_cluster() -> None:
+    """No mood and not noise leaves the id to stand alone."""
+    assert_that(_m3u_suffix("", 3)).is_equal_to("")
+    assert_that(_m3u_suffix("Warm Night", 3)).is_equal_to("_warm_night")
+
+
+def test_build_labeling_ui_mood_vocabulary_cannot_close_its_script_tag(tmp_path) -> None:
+    """A mood carrying ``</script>`` must not end the script element that embeds the vocabulary.
+
+    ``json.dumps`` does not escape ``/``, so the raw sequence survives into the page and the HTML
+    parser closes the block early — everything after it is then parsed as markup, in a file the
+    maintainer opens locally from disk.
+    """
+    out = tmp_path / "label.html"
+    hostile = '</script><img src=x onerror="boom()">'
+
+    page = _read(build_labeling_ui(["a.wav"], [], [hostile], out))
+
+    line = page[page.index("var MOODS =") :].split("\n", 1)[0]
+    assert_that(line).does_not_contain("</script")
+    # Only `<` needs escaping: every way out of a script element (`</script`, `<!--`) starts with
+    # it, and JSON.parse turns `\u003c` straight back into the character the labeler sees.
+    assert_that(line).contains("\\u003c/script>")
+    assert_that(json.loads(line[len("var MOODS = ") : -1])).is_equal_to([hostile])
