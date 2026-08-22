@@ -32,6 +32,32 @@ from moodengine.search import find_similar, search_by_text
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
+def _echo_ranking(header: str, results: list[tuple[str, float]], empty_note: str) -> None:
+    """Print one ranked result list under ``header``, or ``empty_note`` when it came back empty.
+
+    Both search modes end in exactly this shape, so they print it the same way rather than each
+    spelling out its own loop.
+    """
+    typer.echo(header)
+    if not results:
+        typer.echo(empty_note)
+
+    for rank, (name, score) in enumerate(results, start=1):
+        typer.echo(f"  {rank:2d}. {name}  ({score:.3f})")
+
+
+def _echo_unknown_track(wanted: str, filenames: list[str]) -> None:
+    """Report that ``wanted`` is not in the embedded set, with a sample of what is.
+
+    A bare "not found" leaves the reader guessing whether the library is empty or the name is
+    just spelled differently, so the first few known names come with it.
+    """
+    typer.echo(f"\nNo embedded track named {wanted!r}.")
+    typer.echo(
+        "Known filenames: " + ", ".join(filenames[:10]) + (" ..." if len(filenames) > 10 else "")
+    )
+
+
 @app.command()
 def main(
     query: str | None = typer.Option(
@@ -66,30 +92,23 @@ def main(
 
     if query is not None:
         clap_embedder = get_embedder("clap", config)
-        results = search_by_text(query, X, clap_embedder, filenames, top_k=top_k)
-        typer.echo(f"\nText query: {query!r}")
-        if not results:
-            typer.echo("  (no matches)")
-        for rank, (name, score) in enumerate(results, start=1):
-            typer.echo(f"  {rank:2d}. {name}  ({score:.3f})")
+        _echo_ranking(
+            f"\nText query: {query!r}",
+            search_by_text(query, X, clap_embedder, filenames, top_k=top_k),
+            "  (no matches)",
+        )
 
     if similar_to is not None:
         try:
             query_idx = filenames.index(similar_to)
         except ValueError:
-            typer.echo(f"\nNo embedded track named {similar_to!r}.")
-            typer.echo(
-                "Known filenames: "
-                + ", ".join(filenames[:10])
-                + (" ..." if len(filenames) > 10 else "")
-            )
+            _echo_unknown_track(similar_to, filenames)
         else:
-            results = find_similar(query_idx, X, filenames, top_k=top_k)
-            typer.echo(f"\nMost similar to: {similar_to}")
-            if not results:
-                typer.echo("  (no other tracks)")
-            for rank, (name, score) in enumerate(results, start=1):
-                typer.echo(f"  {rank:2d}. {name}  ({score:.3f})")
+            _echo_ranking(
+                f"\nMost similar to: {similar_to}",
+                find_similar(query_idx, X, filenames, top_k=top_k),
+                "  (no other tracks)",
+            )
 
 
 if __name__ == "__main__":

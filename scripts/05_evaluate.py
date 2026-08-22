@@ -55,7 +55,7 @@ def _axis_auc(
     if axis_col not in df.columns:
         return None
     results = search_by_text(query, X, clap_embedder, filenames, top_k=len(filenames))
-    sim_by_name = {name: score for name, score in results}
+    sim_by_name = dict(results)
     scores: list[float] = []
     axis_values: list[float] = []
     for _, row in df.iterrows():

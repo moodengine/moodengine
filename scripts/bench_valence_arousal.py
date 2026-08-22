@@ -313,6 +313,48 @@ def _print(title: str, metrics: dict) -> None:
         )
 
 
+def _pairable_baseline(baseline_path: pathlib.Path, current: dict) -> dict | None:
+    """The baseline run at ``baseline_path``, or ``None`` after saying why it cannot be paired.
+
+    Refuses a baseline that did not score the same song set, because the pairing is the whole
+    point: comparing two different song sets is a MARGINAL comparison wearing a paired label.
+    """
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        typer.echo(f"\nCannot read --compare baseline {baseline_path}: {exc}")
+        return None
+
+    if baseline.get("songs") != current.get("songs"):
+        typer.echo(
+            f"\nRefusing to pair: {baseline_path.name} scored a different song set "
+            f"({len(baseline.get('songs') or [])} vs {len(current.get('songs') or [])}). "
+            "Re-run both arms with the same --limit/--seed/--max-disagreement."
+        )
+        return None
+
+    return baseline
+
+
+def _echo_paired_delta(block: str, axis: str, current_pred, baseline_pred, gold) -> None:
+    """One comparison row: the paired Pearson delta CURRENT minus BASELINE, and its 95% CI.
+
+    Argument order is the direction of the comparison and is not interchangeable — transposing
+    the two prediction arrays flips the sign of every delta reported, turning a regression into
+    an improvement without changing the interval, which reads as perfectly plausible output.
+    """
+    delta, lo, hi = _paired_delta_ci(
+        np.asarray(current_pred, dtype=np.float64),
+        np.asarray(baseline_pred, dtype=np.float64),
+        gold,
+        _pearson_stat,
+    )
+    verdict = "significant" if (lo > 0 or hi < 0) else "within noise"
+    typer.echo(
+        f"  {block:<20} {axis:8s} pearson delta={delta:+.3f} [{lo:+.3f}, {hi:+.3f}]  {verdict}"
+    )
+
+
 def _report_paired(baseline_path: pathlib.Path, current: dict, energy_gold, valence_gold) -> None:
     """Compare this run against an earlier ``--out`` JSON with a PAIRED bootstrap.
 
@@ -325,39 +367,20 @@ def _report_paired(baseline_path: pathlib.Path, current: dict, energy_gold, vale
     Refuses to compare runs that did not score the same song set, since the pairing is the whole
     point: a mismatched comparison is a marginal one wearing a paired label.
     """
-    try:
-        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        typer.echo(f"\nCannot read --compare baseline {baseline_path}: {exc}")
-        return
-
-    if baseline.get("songs") != current.get("songs"):
-        typer.echo(
-            f"\nRefusing to pair: {baseline_path.name} scored a different song set "
-            f"({len(baseline.get('songs') or [])} vs {len(current.get('songs') or [])}). "
-            "Re-run both arms with the same --limit/--seed/--max-disagreement."
-        )
+    baseline = _pairable_baseline(baseline_path, current)
+    if baseline is None:
         return
 
     typer.echo(f"\nPaired vs {baseline_path.name}  (95% CI on the difference; excludes 0 = real)")
     for block in ("zeroshot", "zeroshot_calibrated", "probe"):
         if block not in baseline or block not in current:
             continue
+
         for axis, gold in (("energy", energy_gold), ("valence", valence_gold)):
             key = f"{axis}_pred"
             if key not in baseline[block] or key not in current[block]:
                 continue
-            delta, lo, hi = _paired_delta_ci(
-                np.asarray(current[block][key], dtype=np.float64),
-                np.asarray(baseline[block][key], dtype=np.float64),
-                gold,
-                _pearson_stat,
-            )
-            verdict = "significant" if (lo > 0 or hi < 0) else "within noise"
-            typer.echo(
-                f"  {block:<20} {axis:8s} pearson delta={delta:+.3f} "
-                f"[{lo:+.3f}, {hi:+.3f}]  {verdict}"
-            )
+            _echo_paired_delta(block, axis, current[block][key], baseline[block][key], gold)
 
 
 @app.command()
