@@ -704,15 +704,12 @@ def probe_state(head: ProbeHead) -> dict[str, np.ndarray]:
     return state
 
 
-def probe_from_state(state: Mapping[str, np.ndarray]) -> ProbeHead:
-    """Rebuild a :class:`ProbeHead` from a :func:`probe_state` mapping (key inventory there).
+def _check_probe_header(state: Mapping[str, np.ndarray]) -> None:
+    """Refuse a state whose required keys or schema tag are wrong, before reading any array.
 
-    Validates before trusting: missing required keys, a schema tag other than
-    ``"moodengine.probe/1"``, a ``method`` outside ``'linear' | 'mlp'``, ``W``/``b`` shapes misaligned
-    with ``mood_names``, a ``linear`` ``W`` whose width differs from ``dim``, or an ``mlp`` state
-    lacking ``hidden0..hidden3`` or carrying mis-shaped ones — all raise ``ValueError`` stating what was received and
-    what was expected — a stale or hand-built state fails loudly here, not as a silent
-    misprediction downstream. Arrays are decoded as float32; the mapping is never mutated."""
+    Checked first so a state from a different writer fails on the tag rather than three shape
+    errors deeper, where the message would describe the symptom instead of the cause.
+    """
     missing = [key for key in _PROBE_REQUIRED_KEYS if key not in state]
     if missing:
         raise ValueError(
@@ -723,80 +720,118 @@ def probe_from_state(state: Mapping[str, np.ndarray]) -> ProbeHead:
     if schema != _PROBE_SCHEMA:
         raise ValueError(f"unknown probe state schema {schema!r} (expected {_PROBE_SCHEMA!r})")
 
-    mood_names = [str(name) for name in np.asarray(state["mood_names"]).reshape(-1)]
-    W = np.asarray(state["W"], dtype=np.float32)
-    b = np.asarray(state["b"], dtype=np.float32)
-    method = str(np.asarray(state["method"]))
-    dim = int(np.asarray(state["dim"]))
-    has_hidden = bool(np.asarray(state["has_hidden"]))
 
+def _check_probe_shapes(W: np.ndarray, b: np.ndarray, method: str, n_moods: int) -> None:
+    """Refuse a head whose weight/bias shapes disagree with ``mood_names``, or an unknown method."""
     if W.ndim != 2:
         raise ValueError(f"W must be 2-D, got shape {W.shape}")
-    if W.shape[0] != len(mood_names):
+    if W.shape[0] != n_moods:
         raise ValueError(
-            f"W has {W.shape[0]} rows but mood_names lists {len(mood_names)} moods "
+            f"W has {W.shape[0]} rows but mood_names lists {n_moods} moods "
             "(expected one weight row per mood)"
         )
-    if b.shape != (len(mood_names),):
+    if b.shape != (n_moods,):
         raise ValueError(
-            f"b has shape {b.shape} but mood_names lists {len(mood_names)} moods "
+            f"b has shape {b.shape} but mood_names lists {n_moods} moods "
             "(expected one bias per mood)"
         )
     if method not in ("linear", "mlp"):
         raise ValueError(f"unknown method {method!r} (expected 'linear' | 'mlp')")
 
+
+def _decode_probe_hidden(
+    state: Mapping[str, np.ndarray], *, has_hidden: bool, dim: int, n_moods: int
+) -> tuple[np.ndarray, ...]:
+    """The four MLP hidden arrays, refusing any that is absent or mis-shaped."""
+    if not has_hidden:
+        raise ValueError(
+            "method is 'mlp' but has_hidden is False (expected hidden0..hidden3 present)"
+        )
+
+    missing_hidden = [key for key in _PROBE_HIDDEN_KEYS if key not in state]
+    if missing_hidden:
+        raise ValueError(
+            f"mlp probe state is missing keys {missing_hidden} "
+            "(expected hidden0..hidden3 = W1, b1, W2, b2)"
+        )
+
+    hidden = tuple(np.asarray(state[key], dtype=np.float32) for key in _PROBE_HIDDEN_KEYS)
+    if hidden[0].ndim != 2:
+        raise ValueError(f"hidden0 (W1) must be 2-D, got shape {hidden[0].shape}")
+    if hidden[0].shape[0] != dim:
+        raise ValueError(
+            f"hidden0 (W1) has {hidden[0].shape[0]} input rows but dim is {dim} "
+            "(expected W1 of shape (dim, hidden_width))"
+        )
+
+    h_width = hidden[0].shape[1]
+    if hidden[1].shape != (h_width,):
+        raise ValueError(
+            f"hidden1 (b1) has shape {hidden[1].shape} "
+            f"(expected ({h_width},), one bias per hidden unit of W1)"
+        )
+    if hidden[2].shape != (h_width, n_moods):
+        raise ValueError(
+            f"hidden2 (W2) has shape {hidden[2].shape} (expected ({h_width}, {n_moods}))"
+        )
+    if hidden[3].shape != (n_moods,):
+        raise ValueError(
+            f"hidden3 (b2) has shape {hidden[3].shape} (expected ({n_moods},), one bias per mood)"
+        )
+
+    return hidden
+
+
+def _decode_probe_cv_score(state: Mapping[str, np.ndarray], n_moods: int) -> np.ndarray:
+    """The per-mood held-out scores, or all-NaN when the state predates them.
+
+    Optional by design (see :func:`probe_state`): a pre-cv_score state is not corrupt, it simply
+    never measured one, and all-NaN says that faithfully. A present-but-mis-sized array IS corrupt.
+    """
+    if "cv_score" not in state:
+        return np.full((n_moods,), np.nan, dtype=np.float32)
+
+    cv_score = np.asarray(state["cv_score"], dtype=np.float32).reshape(-1)
+    if cv_score.shape != (n_moods,):
+        raise ValueError(
+            f"cv_score has shape {cv_score.shape} but mood_names lists {n_moods} moods "
+            "(expected one held-out score per mood)"
+        )
+    return cv_score
+
+
+def probe_from_state(state: Mapping[str, np.ndarray]) -> ProbeHead:
+    """Rebuild a :class:`ProbeHead` from a :func:`probe_state` mapping (key inventory there).
+
+    Validates before trusting: missing required keys, a schema tag other than
+    ``"moodengine.probe/1"``, a ``method`` outside ``'linear' | 'mlp'``, ``W``/``b`` shapes misaligned
+    with ``mood_names``, a ``linear`` ``W`` whose width differs from ``dim``, or an ``mlp`` state
+    lacking ``hidden0..hidden3`` or carrying mis-shaped ones — all raise ``ValueError`` stating what was received and
+    what was expected — a stale or hand-built state fails loudly here, not as a silent
+    misprediction downstream. Arrays are decoded as float32; the mapping is never mutated."""
+    _check_probe_header(state)
+
+    mood_names = [str(name) for name in np.asarray(state["mood_names"]).reshape(-1)]
+    W = np.asarray(state["W"], dtype=np.float32)
+    b = np.asarray(state["b"], dtype=np.float32)
+    method = str(np.asarray(state["method"]))
+    dim = int(np.asarray(state["dim"]))
+    n_moods = len(mood_names)
+
+    _check_probe_shapes(W, b, method, n_moods)
+
     hidden: tuple[np.ndarray, ...] | None = None
     if method == "mlp":
-        if not has_hidden:
-            raise ValueError(
-                "method is 'mlp' but has_hidden is False (expected hidden0..hidden3 present)"
-            )
-        missing_hidden = [key for key in _PROBE_HIDDEN_KEYS if key not in state]
-        if missing_hidden:
-            raise ValueError(
-                f"mlp probe state is missing keys {missing_hidden} "
-                "(expected hidden0..hidden3 = W1, b1, W2, b2)"
-            )
-        hidden = tuple(np.asarray(state[key], dtype=np.float32) for key in _PROBE_HIDDEN_KEYS)
-        if hidden[0].ndim != 2:
-            raise ValueError(f"hidden0 (W1) must be 2-D, got shape {hidden[0].shape}")
-        if hidden[0].shape[0] != dim:
-            raise ValueError(
-                f"hidden0 (W1) has {hidden[0].shape[0]} input rows but dim is {dim} "
-                "(expected W1 of shape (dim, hidden_width))"
-            )
-        h_width = hidden[0].shape[1]
-        n_moods = len(mood_names)
-        if hidden[1].shape != (h_width,):
-            raise ValueError(
-                f"hidden1 (b1) has shape {hidden[1].shape} "
-                f"(expected ({h_width},), one bias per hidden unit of W1)"
-            )
-        if hidden[2].shape != (h_width, n_moods):
-            raise ValueError(
-                f"hidden2 (W2) has shape {hidden[2].shape} (expected ({h_width}, {n_moods}))"
-            )
-        if hidden[3].shape != (n_moods,):
-            raise ValueError(
-                f"hidden3 (b2) has shape {hidden[3].shape} "
-                f"(expected ({n_moods},), one bias per mood)"
-            )
+        hidden = _decode_probe_hidden(
+            state, has_hidden=bool(np.asarray(state["has_hidden"])), dim=dim, n_moods=n_moods
+        )
     elif W.shape[1] != dim:
         raise ValueError(
             f"W has {W.shape[1]} columns but dim is {dim} (expected one column per input feature)"
         )
 
-    # Optional by design (see probe_state): a pre-cv_score state is not corrupt, it simply never
-    # measured one, and all-nan says that faithfully. A present-but-mis-sized array IS corrupt.
-    if "cv_score" in state:
-        cv_score = np.asarray(state["cv_score"], dtype=np.float32).reshape(-1)
-        if cv_score.shape != (len(mood_names),):
-            raise ValueError(
-                f"cv_score has shape {cv_score.shape} but mood_names lists {len(mood_names)} moods "
-                "(expected one held-out score per mood)"
-            )
-    else:
-        cv_score = np.full((len(mood_names),), np.nan, dtype=np.float32)
+    # Decoded last, so a multiply-corrupt state still fails on the same check it failed on before.
+    cv_score = _decode_probe_cv_score(state, n_moods)
 
     return ProbeHead(
         mood_names=mood_names,

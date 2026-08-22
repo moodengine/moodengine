@@ -585,7 +585,13 @@ def cluster_hierarchy(
     into ``n_super_groups`` (default ``max(2, round(sqrt(K)))`` clamped to ``[2, K]``). Returns a
     JSON-serializable dict (native Python types) — the whole payload is persisted in ``runs.metrics_json``
     (no new table). ``cophenetic`` is the cophenetic correlation (defensively ``None`` for ``K < 3``).
-    ``K <= 1`` → an honest empty structure (``linkage=[]``, ``cophenetic=None``) without raising."""
+    ``K <= 1`` → an honest empty structure (``linkage=[]``, ``cophenetic=None``) without raising.
+
+    ``config`` is accepted and never read. It mirrors :func:`graph_modularity`, the
+    partition-quality reader directly above this one, so a caller holding ``(X, labels, config)``
+    reaches either without remembering which of the two happens to need it. Dropping it would move
+    ``n_super_groups`` into the third positional slot and silently change what every existing
+    three-argument call means."""
     from scipy.cluster.hierarchy import cophenet, fcluster, linkage
     from scipy.spatial.distance import pdist
 
@@ -1132,6 +1138,80 @@ def outlier_scores(X: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return scores
 
 
+def _log_inert_refit(tiny: bool, n: int) -> None:
+    """Say that ``refit_reduction`` had nothing to re-fit, rather than quietly ignoring it.
+
+    Silently falling back to the frozen mode would be worse than ignoring the flag: the documented
+    reading is the GAP between the two modes, and a gap of zero against a frozen run reads as
+    "the structure is real" precisely when nothing was re-fit.
+    """
+    reason = f"n={n} is below the UMAP floor" if tiny else "config.cluster_space='original'"
+    logger.info(
+        "refit_reduction=True is inert here: clustering runs on the original embeddings "
+        "(%s), so there is no reduction to re-fit and both modes return the same number.",
+        reason,
+    )
+
+
+def _bootstrap_replicate_labels(
+    space: np.ndarray,
+    method: ClusterMethod,
+    config: Config,
+    *,
+    n: int,
+    n_boot: int,
+    size: int,
+    reduce_per_replicate: bool,
+) -> list[np.ndarray]:
+    """One full-length label array per replicate, ``-2`` marking the rows that were not sampled."""
+    runs: list[np.ndarray] = []
+    for i in range(int(n_boot)):
+        rng = np.random.default_rng(config.seed + i)
+        idx = rng.choice(n, size=size, replace=False)
+
+        if reduce_per_replicate:
+            # A per-replicate seed, or every fit would land on the same layout and the extra cost
+            # would buy nothing.
+            sub_space, _ = reduce_umap(
+                space[idx],
+                config.umap_n_components_cluster,
+                replace(config, seed=config.seed + i),
+            )
+        else:
+            sub_space = space[idx]
+
+        # leiden clamps its kNN degree to the subsample size internally, so every bootstrap graph
+        # stays valid.
+        full = np.full(n, -2, dtype=int)
+        full[idx] = _cluster_with(method, sub_space, config)
+        runs.append(full)
+
+    return runs
+
+
+def _co_clustered_pair(
+    run_a: np.ndarray, run_b: np.ndarray
+) -> tuple[float, tuple[np.ndarray, np.ndarray] | None]:
+    """``(noise agreement, the co-clustered non-noise labels)`` for one pair of replicates.
+
+    Returns ``(nan, None)`` when the two share fewer than two sampled rows, and a real agreement
+    with ``None`` labels when they share rows but fewer than two are non-noise in BOTH — the shape
+    scores then have nothing to compare while the noise split still does.
+    """
+    shared = (run_a != -2) & (run_b != -2)
+    if int(shared.sum()) < 2:
+        return float("nan"), None
+
+    la_all, lb_all = run_a[shared], run_b[shared]
+    noise_agreement = float(np.mean((la_all == -1) == (lb_all == -1)))
+
+    both = (la_all != -1) & (lb_all != -1)
+    if int(both.sum()) < 2:
+        return noise_agreement, None
+
+    return noise_agreement, (la_all[both], lb_all[both])
+
+
 def bootstrap_stability(
     X: np.ndarray,
     method: ClusterMethod,
@@ -1212,15 +1292,7 @@ def bootstrap_stability(
     # Under `refit_reduction` there is no shared layout at all: each replicate builds its own.
     reduce_per_replicate = refit_reduction and not clusters_original
     if refit_reduction and not reduce_per_replicate:
-        # Silently falling back to the frozen mode would be worse than ignoring the flag: the
-        # documented reading is the GAP between the two modes, and a gap of zero against a frozen
-        # run reads as "the structure is real" precisely when nothing was re-fit.
-        reason = f"n={n} is below the UMAP floor" if tiny else "config.cluster_space='original'"
-        logger.info(
-            "refit_reduction=True is inert here: clustering runs on the original embeddings "
-            "(%s), so there is no reduction to re-fit and both modes return the same number.",
-            reason,
-        )
+        _log_inert_refit(tiny, n)
     space = (
         X
         if (clusters_original or reduce_per_replicate)
@@ -1230,48 +1302,34 @@ def bootstrap_stability(
     size = max(2, int(round(subsample * n)))
     size = min(size, n)
 
-    runs: list[np.ndarray] = []  # full-length label arrays, -2 = not sampled
-    for i in range(int(n_boot)):
-        rng = np.random.default_rng(config.seed + i)
-        idx = rng.choice(n, size=size, replace=False)
-        if reduce_per_replicate:
-            # A per-replicate seed, or every fit would land on the same layout and the extra cost
-            # would buy nothing.
-            sub_space, _ = reduce_umap(
-                space[idx],
-                config.umap_n_components_cluster,
-                replace(config, seed=config.seed + i),
-            )
-        else:
-            sub_space = space[idx]
-        # leiden clamps its kNN degree to the subsample size internally, so
-        # every bootstrap graph stays valid.
-        sub_labels = _cluster_with(method, sub_space, config)
-        full = np.full(n, -2, dtype=int)
-        full[idx] = sub_labels
-        runs.append(full)
+    runs = _bootstrap_replicate_labels(
+        space,
+        method,
+        config,
+        n=n,
+        n_boot=int(n_boot),
+        size=size,
+        reduce_per_replicate=reduce_per_replicate,
+    )
 
     aris: list[float] = []
     amis: list[float] = []
     noise_agrees: list[float] = []
     for a in range(len(runs)):
         for b in range(a + 1, len(runs)):
-            shared = (runs[a] != -2) & (runs[b] != -2)
-            if int(shared.sum()) < 2:
+            noise_agreement, labels = _co_clustered_pair(runs[a], runs[b])
+            if np.isnan(noise_agreement):
                 continue
-            la_all, lb_all = runs[a][shared], runs[b][shared]
-            noise_agrees.append(float(np.mean((la_all == -1) == (lb_all == -1))))
+            noise_agrees.append(noise_agreement)
+            if labels is None:
+                continue
 
-            both = (la_all != -1) & (lb_all != -1)
-            if int(both.sum()) < 2:
-                continue
-            la, lb = la_all[both], lb_all[both]
             # Both scores computed BEFORE either list is touched. Appending as we go let an
             # AMI-only failure leave `aris` one element longer, so `mean_ari`/`std_ari` and
             # `mean_ami` were then averaged over different samples of the same replicate pairs.
             try:
-                ari = float(adjusted_rand_score(la, lb))
-                ami = float(adjusted_mutual_info_score(la, lb))
+                ari = float(adjusted_rand_score(*labels))
+                ami = float(adjusted_mutual_info_score(*labels))
             except Exception:
                 continue
             aris.append(ari)
