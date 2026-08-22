@@ -322,11 +322,18 @@ def evaluate_against_gold(df: pd.DataFrame, gold: dict) -> dict:
             for i, name in rows:
                 gv = gold[name].get(axis) if isinstance(gold[name], dict) else None
                 if gv is not None:
+                    # Both values coerced BEFORE either list is touched, so a track contributes a
+                    # PAIR or nothing. Appending as we went let a non-numeric prediction leave
+                    # `ref` one element longer: every later prediction was then scored against the
+                    # previous track's gold, and `_pearson` raised on the length mismatch — which
+                    # this function's contract says it never does.
                     try:
-                        ref.append(float(gv))
-                        pred.append(float(col[i]))
+                        gold_value = float(gv)
+                        pred_value = float(col[i])
                     except (TypeError, ValueError):
                         continue
+                    ref.append(gold_value)
+                    pred.append(pred_value)
         if len(pred) >= 2:
             p_arr, r_arr = np.array(pred), np.array(ref)
             summary[f"{axis}_pearson"] = _pearson(p_arr, r_arr)
