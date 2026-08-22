@@ -39,7 +39,7 @@ _LOGIT_CLAMP: float = 6.0  # finite saturated logit for a degenerate (single-cla
 # 0.005 and logits inside ±0.005: the ranking was still perfect, but these logits are added to the
 # zero-shot prior before the softmax, so a column that small contributes nothing and the
 # personalization silently does not happen. Ties must therefore break toward the LARGEST C.
-_PROBE_C_GRID: tuple[float, ...] = tuple(float(c) for c in np.logspace(4, -4, 17))
+_PROBE_C_GRID: tuple[float, ...] = tuple(np.logspace(4, -4, 17).tolist())
 _PROBE_MAX_FOLDS: int = 5
 # Fraction of the MLP's training rows held out to early-stop on. Small heads on a few dozen rows
 # reach zero training loss long before the epoch budget runs out; without a held-out signal the
@@ -219,7 +219,7 @@ def fit_linear_probe(
     if np.asarray(X).ndim != 2 or Y.ndim != 2:
         raise ValueError("X and Y must be 2-D arrays")
     X = ensure_finite_2d(X, name="X")  # a NaN row would silently corrupt every mood's fit
-    n, d = X.shape
+    n = X.shape[0]
     if Y.shape[0] != n:
         raise ValueError("X and Y must have the same number of rows")
     n_moods = Y.shape[1]
@@ -564,7 +564,10 @@ def fit_supcon_projection(
     Xt = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
     yt = torch.from_numpy(np.ascontiguousarray(y.astype(np.int64)))
     proj = torch.nn.Linear(d, d_out, bias=False)
-    opt = torch.optim.Adam(proj.parameters(), lr=float(lr))
+    # weight_decay pinned to torch's default rather than left implicit: this head is trained to
+    # be a faithful projection of the embedding space, and decay would shrink it toward zero
+    # without appearing in the caller's arguments.
+    opt = torch.optim.Adam(proj.parameters(), lr=float(lr), weight_decay=0.0)
 
     # Same-class mask (n, n), self excluded — the positive set P(i) for every anchor.
     eye = torch.eye(n)

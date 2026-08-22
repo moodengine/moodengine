@@ -445,9 +445,9 @@ def segment_structure(
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=_HOP_LENGTH)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=_HOP_LENGTH, n_mfcc=_STRUCT_N_MFCC)
     feat = np.vstack([chroma, mfcc])
-    sync = librosa.util.sync(
-        feat, beat_frames.tolist(), aggregate=np.mean
-    )  # (d, n_cols), n_cols = len(bf)+1
+    # One column per inter-beat span: librosa.util.sync returns d rows by one more column than
+    # there are beat frames, since the audio before the first beat is a span of its own.
+    sync = librosa.util.sync(feat, beat_frames.tolist(), aggregate=np.mean)
     sync = sync / np.maximum(np.linalg.norm(sync, axis=0, keepdims=True), 1e-8)
     n_cols = sync.shape[1]
 

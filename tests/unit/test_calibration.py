@@ -14,7 +14,7 @@ from assertpy import assert_that
 from moodengine.calibration import (
     _PROB_FLOOR,
     _aps_scores,
-    _softmax_T,
+    _softmax_at_temperature,
     _temperature_objective,
     aps_threshold,
     entropy,
@@ -401,7 +401,7 @@ def test_aps_threshold_rejects_non_finite_probabilities() -> None:
 @pytest.mark.parametrize("temperature", [1e-3, 0.01, 0.5, 1.0, 3.0, 100.0])
 @pytest.mark.parametrize("scale", [0.3, 30.0], ids=["flat-logits", "peaked-logits"])
 def test_temperature_objective_equals_the_readable_definition(temperature, scale) -> None:
-    """The fast objective must equal ``negative_log_likelihood(_softmax_T(L, T), y)`` at every T.
+    """The fast objective must equal ``negative_log_likelihood(_softmax_at_temperature(L, T), y)`` at every T.
 
     `fit_temperature` no longer builds a softmax per evaluation; it uses the logsumexp identity. The
     risk that buys is silent: `negative_log_likelihood` floors the probability at ``_PROB_FLOOR``
@@ -419,7 +419,7 @@ def test_temperature_objective_equals_the_readable_definition(temperature, scale
 
     objective = _temperature_objective(logits, labels)
 
-    reference = negative_log_likelihood(_softmax_T(logits, temperature), labels)
+    reference = negative_log_likelihood(_softmax_at_temperature(logits, temperature), labels)
     assert_that(objective(temperature)).is_close_to(reference, tolerance=1e-9)
 
 

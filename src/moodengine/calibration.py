@@ -33,7 +33,7 @@ import numpy as np
 _PROB_FLOOR: float = 1e-12
 
 
-def _softmax_T(logits: np.ndarray, temperature: float) -> np.ndarray:
+def _softmax_at_temperature(logits: np.ndarray, temperature: float) -> np.ndarray:
     """Row-wise softmax of ``logits / temperature`` (numerically stable).
 
     The readable reference for the temperature objective. :func:`fit_temperature` no longer calls it
@@ -70,7 +70,7 @@ def negative_log_likelihood(probs: np.ndarray, labels: np.ndarray) -> float:
 def _temperature_objective(L: np.ndarray, y: np.ndarray) -> Callable[[float], float]:
     """Build ``T -> NLL(softmax(L / T))`` at the true class, with everything T-independent hoisted.
 
-    Equivalent to ``negative_log_likelihood(_softmax_T(L, T), y)`` — that is the readable definition
+    Equivalent to ``negative_log_likelihood(_softmax_at_temperature(L, T), y)`` — that is the readable definition
     and what this is tested against — but evaluated as
     ``-log p_i == log Σ_j exp(gap_ij / T) - gap_iy / T``, so the row maxima, the stable shift and the
     true-class gather are computed ONCE rather than on every call. The minimizer evaluates this ~30
