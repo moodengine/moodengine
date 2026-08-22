@@ -1049,3 +1049,54 @@ def test_build_hover_text_without_the_optional_columns() -> None:
     df = pd.DataFrame({"filename": ["only.wav", "two.wav"]})
 
     assert_that(pipeline._build_hover_text(df)).is_equal_to(["only.wav", "two.wav"])
+
+
+# --------------------------------------------------------------------------- #
+# The "no CLAP embedding survived" path — sentinels, not a crash and not a guess
+# --------------------------------------------------------------------------- #
+
+
+def test_attach_blank_labels_writes_the_same_sentinels_a_failed_row_gets() -> None:
+    """A run where NOTHING could be scored must be indistinguishable from one failed row.
+
+    Both mean "no label". The alternative — a zero vector scored against the mood prompts —
+    would fabricate a confident-looking label out of nothing.
+    """
+    df = pd.DataFrame({"filename": ["a.wav", "b.wav"]})
+
+    pipeline._attach_blank_labels(df, 2)
+
+    assert_that(df["top_mood"].tolist()).is_equal_to(["", ""])
+    assert_that(df["cluster_mood"].tolist()).is_equal_to(["", ""])
+    assert_that(df["mood_top3"].tolist()).is_equal_to([[], []])
+    assert_that(df["mood_top3_scores"].tolist()).is_equal_to([[], []])
+    np.testing.assert_array_equal(df["top_score"].to_numpy(), [np.nan, np.nan])
+    np.testing.assert_array_equal(df["energy"].to_numpy(), [np.nan, np.nan])
+    np.testing.assert_array_equal(df["valence"].to_numpy(), [np.nan, np.nan])
+
+
+def test_run_pipeline_core_without_any_clap_embedding_still_returns_a_labelled_frame(
+    tmp_config, make_audio_library, make_fake_embedder, monkeypatch, caplog
+) -> None:
+    """Losing every CLAP vector degrades to blank labels, and says so, instead of raising.
+
+    Scoring a ``(n, 0)`` matrix against the mood prompts is a shape mismatch, so this branch is
+    the difference between a usable clustering with no moods and a crashed run.
+    """
+    make_audio_library(tmp_config.raw_dir, 4, seconds=0.5)
+    embedder = make_fake_embedder("clap", tmp_config.clap_sample_rate)
+    monkeypatch.setattr(pipeline, "get_embedder", lambda name, cfg: embedder)
+    monkeypatch.setattr(
+        pipeline,
+        "_clap_embeddings_for",
+        lambda *a, **k: (np.zeros((4, 0), dtype=np.float32), embedder, [True] * 4),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="moodengine.pipeline"):
+        result = pipeline.run_pipeline_core(
+            tmp_config, "clap", "kmeans", with_labels=True, force=True, auto_k=False
+        )
+
+    assert_that(result.assignments["top_mood"].tolist()).is_equal_to([""] * 4)
+    assert_that(result.profiles).is_empty()
+    assert_that(caplog.text).contains("No CLAP audio embeddings available")
