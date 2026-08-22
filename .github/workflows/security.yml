@@ -33,9 +33,19 @@ jobs:
       # emits only the default group, which is well under half of the locked tree —
       # every [models] dependency (torch, and the wandb -> gitpython chain under
       # laion-clap) resolved out of scope, so advisories against them passed unseen.
+      #
+      # --no-group torch-cpu: that group is declared to CONFLICT with [models] (see
+      # pyproject), because the two resolve the same torch release from different
+      # indexes — so uv refuses to export them together at all. Excluding it leaves no
+      # blind spot: every one of its packages is already in the [models] closure at the
+      # identical version, and its torch differs only by the `+cpu` local segment of the
+      # same 2.13.0 release, which IS audited here. Including it would also break the
+      # audit outright, since pip-audit resolves names against PyPI and there is no
+      # listing there for a `+cpu` local build.
       - name: Export locked dependencies
         run: >
           uv export --locked --no-emit-project --all-extras --all-groups
+          --no-group torch-cpu
           --format requirements-txt -o requirements-audit.txt
 
       - name: Audit against known vulnerabilities

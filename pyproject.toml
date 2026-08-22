@@ -106,6 +106,23 @@ constraint-dependencies = [
     "setuptools>=83.0.0",
 ]
 
+# `models` and `torch-cpu` resolve the SAME torch release from different indexes, so they
+# are declared incompatible and uv forks the resolution. The published extra keeps coming
+# from PyPI exactly as before (the CUDA build on linux); the CI-only group takes the CPU
+# build. Without the fork one source would win for both, and `uv sync --extra models`
+# would silently stop installing a CUDA torch for every linux consumer.
+conflicts = [[{ extra = "models" }, { group = "torch-cpu" }]]
+
+# `explicit = true`: consulted ONLY for packages that name it in [tool.uv.sources], so
+# nothing else in the tree can be resolved from it by accident.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", group = "torch-cpu" }]
+
 # Dev-only tooling (PEP 735): installed by `uv sync` (uv includes the "dev"
 # group by default), never published as an extra, never in consumers' trees.
 [dependency-groups]
@@ -120,6 +137,15 @@ dev = [
     "soundfile>=0.12",            # tests write WAV fixtures directly (the package decodes via librosa)
     "pytest-benchmark>=4.0",      # opt-in hot-path benchmarks (tests/benchmarks, -m benchmark)
     "pytest-cov>=5.0",            # coverage gate (see [tool.coverage] + CI static job)
+]
+
+# CI-only, and deliberately NOT an extra: extras are published metadata, groups are not,
+# so this never reaches a consumer's tree. It exists so the `test-extras` job can run the
+# torch-guarded tests in test_sequence/test_adapt_* — which no CI job executed before —
+# without paying for the [models] backbones (on linux, ~2.3 GB of nvidia-* wheels).
+# Floor kept in step with [models] `torch`, same GHSA-rrmf-rvhw-rf47 rationale: bump both.
+torch-cpu = [
+    "torch>=2.13.0",
 ]
 
 [build-system]
@@ -224,12 +250,23 @@ source = ["moodengine"]
 # in the default-suite denominator would make the floor dishonest, not stricter.
 omit = ["*/embeddings/clap.py", "*/embeddings/mert.py", "*/embeddings/mulan.py"]
 
+# The `sonarqube` job merges the light and extras+torch data files. Each job records the
+# checkout-absolute path of the editable install, and both `coverage combine` and the
+# reporting step re-map through this table — so the merge lines up by construction rather
+# than by both jobs happening to run under the same $GITHUB_WORKSPACE. Getting this wrong
+# is silent: `coverage xml` then emits absolute filenames Sonar cannot map to
+# `sonar.sources`, and the project reports 0% over a green build.
+[tool.coverage.paths]
+source = ["src/moodengine", "*/src/moodengine"]
+
 [tool.coverage.report]
 show_missing = true
 # Regression floor for the torch-free default suite, set below the value it actually
 # reaches so it catches real drops without tripping on normal churn — NOT an aspiration.
-# The torch/POT-gated paths in adapt/sequence/journey are covered by the extras/model
-# CI jobs, not measured here. Raise it only when a measured, sustained gain backs it.
+# The torch/POT-gated paths in adapt/sequence/journey are covered by the extras+torch
+# CI job, whose data is merged with this one into the report Sonar imports — so the
+# project number is the union, while this floor stays a floor on the torch-free suite
+# alone. Raise it only when a measured, sustained gain backs it.
 fail_under = 80
 exclude_also = [
     "if TYPE_CHECKING:",
