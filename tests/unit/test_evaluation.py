@@ -15,6 +15,7 @@ import pandas as pd
 from assertpy import assert_that
 
 from moodengine.evaluation import (
+    _pearson,
     average_precision,
     axis_ranking_auc,
     ccc_components,
@@ -784,3 +785,74 @@ def test_evaluate_against_gold_drops_a_track_whose_prediction_is_not_numeric() -
 
     # b.wav is dropped entirely, so the three survivors are each scored against their own gold.
     assert_that(summary["energy_pearson"]).is_close_to(1.0, tolerance=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# Correlations over a series that is constant only to within float rounding
+# --------------------------------------------------------------------------- #
+
+
+def test_pearson_reports_nan_for_a_series_constant_to_float_noise() -> None:
+    """A prediction column with one ULP of spread has no correlation, only rounding error.
+
+    ``np.corrcoef`` divides by the standard deviation, so a series differing in its last bit
+    yields a perfectly confident-looking number assembled from that bit alone — here 0.707.
+    """
+    gold = np.array([0.1, 0.5, 0.9])
+    one_ulp = np.array([0.5, 0.5, 0.5 + 1e-16])
+
+    assert_that(_pearson(one_ulp, gold)).is_nan()
+    assert_that(_pearson(np.array([0.1, 0.2, 0.3]), gold)).is_not_nan()  # real signal survives
+
+
+def test_ccc_components_reports_nan_for_a_series_constant_to_float_noise() -> None:
+    """Same guard, same reason: ``rho`` divides by ``sd_p * sd_g``."""
+    gold = np.array([0.1, 0.5, 0.9])
+    one_ulp = np.array([0.5, 0.5, 0.5 + 1e-16])
+
+    rho, c_b, support = ccc_components(one_ulp, gold)
+
+    assert_that(rho).is_nan()
+    assert_that(c_b).is_nan()
+    assert_that(support).is_equal_to(3)
+
+
+def test_concordance_correlation_coefficient_degrades_to_zero_not_to_noise() -> None:
+    """CCC needs no extra guard, and this pins why rather than leaving it to look inconsistent.
+
+    Its denominator is ``var_p + var_g + (mean gap)²`` — a sum of non-negative terms, so it is
+    exactly 0 only in the genuinely undefined case, and AM-GM bounds the ratio inside [-1, 1].
+    A near-constant series therefore reports ~0 agreement, which is true, instead of a fabricated
+    correlation.
+    """
+    gold = np.array([0.1, 0.5, 0.9])
+    one_ulp = np.array([0.5, 0.5, 0.5 + 1e-16])
+
+    value, support = concordance_correlation_coefficient(one_ulp, gold)
+
+    assert_that(abs(value)).is_less_than(1e-9)
+    assert_that(support).is_equal_to(3)
+
+
+def test_evaluate_against_gold_does_not_report_a_correlation_it_cannot_have() -> None:
+    """End to end: a model whose predictions are constant to float noise scores nan, not 0.707.
+
+    This is the metric a reader uses to decide whether a change helped, so a fabricated moderate
+    correlation is worse here than a missing one.
+    """
+    df = pd.DataFrame(
+        {
+            "filename": ["a.wav", "b.wav", "c.wav"],
+            "top_mood": ["calm"] * 3,
+            "energy": [0.5, 0.5, 0.5 + 1e-16],
+        }
+    )
+    gold = {
+        "a.wav": {"moods": ["calm"], "energy": 0.1},
+        "b.wav": {"moods": ["calm"], "energy": 0.5},
+        "c.wav": {"moods": ["calm"], "energy": 0.9},
+    }
+
+    summary = evaluate_against_gold(df, gold)
+
+    assert_that(summary["energy_pearson"]).is_nan()

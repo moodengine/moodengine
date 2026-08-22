@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from moodengine._math import is_constant_series
 from moodengine._typing import SupportsEmbedText
 
 
@@ -179,7 +180,7 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     """Pearson correlation; ``nan`` if undefined (constant input / <2 points)."""
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    if a.shape[0] < 2 or np.std(a) == 0 or np.std(b) == 0:
+    if a.shape[0] < 2 or is_constant_series(a) or is_constant_series(b):
         return float("nan")
     return float(np.corrcoef(a, b)[0, 1])
 
@@ -270,7 +271,7 @@ def ccc_components(pred: np.ndarray, gold: np.ndarray) -> tuple[float, float, in
     mp, mg = float(p.mean()), float(g.mean())
     sd_p = float(np.sqrt(((p - mp) ** 2).mean()))
     sd_g = float(np.sqrt(((g - mg) ** 2).mean()))
-    if sd_p == 0.0 or sd_g == 0.0:  # a constant series has no correlation to decompose
+    if is_constant_series(p) or is_constant_series(g):  # nothing to decompose
         return float("nan"), float("nan"), n
 
     rho = float(((p - mp) * (g - mg)).mean() / (sd_p * sd_g))
