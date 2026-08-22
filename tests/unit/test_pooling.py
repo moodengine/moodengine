@@ -231,8 +231,10 @@ def test_pool_mert_concatenates_frames_across_segments() -> None:
 
 def test_pool_mert_empty_raises() -> None:
     """Pooling with no segments is an error, not a silent empty vector."""
+    cfg = default_config()
+
     with pytest.raises(ValueError, match=r"pool_mert received no segments"):
-        pool_mert([], default_config())
+        pool_mert([], cfg)
 
 
 def test_pool_clap_mean_then_normalize() -> None:
@@ -250,8 +252,10 @@ def test_pool_clap_mean_then_normalize() -> None:
 
 def test_pool_clap_empty_raises() -> None:
     """CLAP pooling with no segments raises ``ValueError``."""
+    cfg = default_config()
+
     with pytest.raises(ValueError, match=r"pool_clap received no segments"):
-        pool_clap([], default_config())
+        pool_clap([], cfg)
 
 
 def test_poolers_registry_maps_names() -> None:

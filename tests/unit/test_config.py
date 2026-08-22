@@ -122,15 +122,19 @@ def test_ensure_dirs_creates_directories(tmp_path) -> None:
 )
 def test_config_rejects_invalid_value(field, value, match) -> None:
     """Each invalid value raises at construction, naming the offending field."""
+    base = default_config()
+
     with pytest.raises(ValueError, match=match):
-        dataclasses.replace(default_config(), **{field: value})
+        dataclasses.replace(base, **{field: value})
 
 
 def test_config_rejects_overlap_at_or_above_segment_length() -> None:
     """``overlap_seconds >= segment_seconds`` would stall the window; it is an
     argument error at construction, no longer a silent clamp downstream."""
+    base = default_config()
+
     with pytest.raises(ValueError, match="overlap_seconds"):
-        dataclasses.replace(default_config(), segment_seconds=10.0, overlap_seconds=10.0)
+        dataclasses.replace(base, segment_seconds=10.0, overlap_seconds=10.0)
 
 
 def test_config_replace_revalidates_derived_configs() -> None:
@@ -143,8 +147,10 @@ def test_config_replace_revalidates_derived_configs() -> None:
 
 def test_config_error_message_reports_received_value_and_options() -> None:
     """The message carries the received value AND the valid vocabulary."""
+    base = default_config()
+
     with pytest.raises(ValueError, match=r"'mean-std'") as excinfo:
-        dataclasses.replace(default_config(), pooling_mode="mean-std")
+        dataclasses.replace(base, pooling_mode="mean-std")
 
     assert_that(str(excinfo.value)).contains("mean_std")  # the valid options are listed
 

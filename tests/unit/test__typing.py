@@ -49,9 +49,10 @@ from moodengine.cluster import (
 
 def test_cluster_method_alias_matches_run_clustering_vocabulary() -> None:
     X = np.eye(4, dtype=np.float32)
+    config = default_config()
 
     with pytest.raises(ValueError, match="method must be") as err:
-        run_clustering(X, "bogus", default_config())  # type: ignore[arg-type]
+        run_clustering(X, "bogus", config)  # type: ignore[arg-type]
 
     for member in get_args(ClusterMethod):
         assert_that(str(err.value)).contains(f"'{member}'")
@@ -71,13 +72,15 @@ def test_cluster_method_alias_matches_run_clustering_vocabulary() -> None:
 def test_config_literal_fields_match_their_runtime_checks(field: str, alias: object) -> None:
     members = get_args(alias)
 
+    base = default_config()
+
     # Every alias member is accepted...
     for value in members:
-        replace(default_config(), **{field: value})
+        replace(base, **{field: value})
 
     # ...and the rejection message lists the alias vocabulary exactly.
     with pytest.raises(ValueError, match=field) as err:
-        replace(default_config(), **{field: "bogus"})
+        replace(base, **{field: "bogus"})
     for member in members:
         assert_that(str(err.value)).contains(f"'{member}'")
 

@@ -92,9 +92,10 @@ def test_real_mulan_rejects_off_rate_audio(synth_clip):
     mulan = pytest.importorskip("moodengine.embeddings.mulan", reason="needs the muq extra")
     cfg = default_config()
     embedder = mulan.MuLanEmbedder(cfg)
+    off_rate = synth_clip("tone", seconds=1.0, sr=48_000)
 
     with pytest.raises(ValueError, match=r"received audio at 48000 Hz .* declares 24000 Hz"):
-        embedder.extract(synth_clip("tone", seconds=1.0, sr=48_000), 48_000)
+        embedder.extract(off_rate, 48_000)
 
 
 def test_real_clap_batched_extract_matches_the_per_segment_path(synth_clip):
@@ -122,9 +123,10 @@ def test_real_clap_batched_extract_rejects_off_rate_audio(synth_clip):
     whenever present, that made the guard unreachable on the only path that embeds a library."""
     cfg = default_config()
     clap = get_embedder("clap", cfg)
+    off_rate = [synth_clip("tone", seconds=1.0, sr=16_000)]
 
     with pytest.raises(ValueError, match="declares"):
-        clap.extract_batch([synth_clip("tone", seconds=1.0, sr=16_000)], 16_000)
+        clap.extract_batch(off_rate, 16_000)
 
 
 def test_real_clap_batched_extract_pads_a_sub_floor_segment_like_extract(synth_clip):
