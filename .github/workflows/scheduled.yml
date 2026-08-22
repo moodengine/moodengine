@@ -1,0 +1,86 @@
+# Suites that are too slow or too heavy to gate a pull request, and would otherwise run
+# NOWHERE. That failure mode is not hypothetical here: roughly twenty torch-guarded unit
+# tests sat behind `importorskip` with no job installing torch, so they never executed on
+# any event until the extras job was given a CPU torch. These two are the same shape —
+# `-m model` was workflow_dispatch-only, and nothing at all ran `-m benchmark`.
+#
+# Deliberately a separate workflow rather than more jobs in ci.yml: neither belongs to the
+# `CI success` gate (see .claude/rules/ci-workflows.md), and keeping them out of that file
+# makes the exclusion structural instead of an `if:` a reader has to notice.
+name: Scheduled
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # weekly, Monday 05:00 UTC — an hour before Security, so they do not contend
+  workflow_dispatch:
+
+# Pinned uv, same value and same reasons as ci.yml — see the note there.
+env:
+  UV_VERSION: "0.11.27"
+
+permissions:
+  contents: read
+
+jobs:
+  # Real MERT / CLAP / MuQ-MuLan weights: multi-GB torch download plus a model fetch, far too
+  # slow for a PR. Weekly is what makes it catch upstream drift — a transformers or
+  # huggingface_hub release, or a checkpoint moving — while it is still cheap to bisect,
+  # rather than at the moment someone tries to tag a release.
+  models:
+    name: test · real models
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # `muq` too, or the three real MuQ-MuLan tests importorskip on every run and the
+      # only job that could catch a MuLan regression silently reports green.
+      - name: Install with model backbones
+        run: uv sync --locked --extra models --extra muq
+
+      - name: Tests (real models)
+        run: uv run pytest -m model
+
+  # Hot-path benchmarks. This job does NOT assert on timings and must not start: the
+  # convention in .claude/rules/testing.md is "measured, never asserted", and a shared runner's
+  # variance would make any threshold a coin flip. What it buys is that the benchmarks stay
+  # EXECUTABLE — they are the only tests that call these hot paths at realistic shapes, and
+  # since nothing ran them they were free to rot against an API change without anyone
+  # noticing. The JSON is kept so a human comparing two runs has real numbers to compare.
+  benchmarks:
+    name: benchmarks · hot paths (measured, not asserted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Light install: every benchmarked path (search, novelty, labeling, journey.smooth_order,
+      # cluster.outlier_scores) is torch-free and needs no optional backend.
+      - name: Install (light + dev group, locked)
+        run: uv sync --locked
+
+      - name: Benchmarks
+        run: uv run pytest -m benchmark --benchmark-json=benchmark.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-json
+          path: benchmark.json
+          if-no-files-found: error

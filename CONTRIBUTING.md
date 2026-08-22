@@ -22,8 +22,10 @@ GB), `--extra ot`, `--extra cluster-graph`, `--extra pacmap`, `--extra explain`.
 `test-extras` job installs the last four plus `--group torch-cpu`, a CI-only dependency
 group holding a CPU-only torch: several tests in `test_sequence` / `test_adapt_*` are
 guarded by `importorskip("torch")` and need a torch present to run at all, but not the
-`models` backbones. `models` itself stays manual-only. Real-model tests:
-`uv run pytest -m model`.
+`models` backbones. `models` itself is never installed by the PR pipeline. Real-model tests:
+`uv run pytest -m model` locally, and weekly in CI via the `Scheduled` workflow, which also
+runs the hot-path benchmarks (`uv run pytest -m benchmark`) so neither suite can rot unnoticed.
+Both are `workflow_dispatch`-able if you want them before a release rather than on Monday.
 
 Note that this is the *development* setup, cloning the repository. moodengine is
 published to no package index; consuming it from another project goes through a git

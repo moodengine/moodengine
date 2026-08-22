@@ -290,11 +290,12 @@ jobs:
 
       # `--group torch-cpu` is a CPU-only torch, NOT `--extra models`, which would also
       # drag in transformers/laion-clap and, on linux, ~2.3 GB of nvidia-* wheels — the
-      # very cost that keeps `test-models` on workflow_dispatch. adapt.py and sequence.py
-      # import nothing beyond torch.nn/optim/functional, so plain torch un-skips all of
-      # it. Without this the torch-guarded tests in test_sequence and test_adapt_*
-      # importorskip on every event and NO job ever executes them: `test-models` is the
-      # only one that installs torch and it runs `-m model`, which deselects them.
+      # very cost that keeps the real-model suite out of this workflow. adapt.py and
+      # sequence.py import nothing beyond torch.nn/optim/functional, so plain torch un-skips
+      # all of it. Without this the torch-guarded tests in test_sequence and test_adapt_*
+      # importorskip on every event and NO job ever executes them: the only other job that
+      # installs torch is the weekly one in scheduled.yml, and it runs `-m model`, which
+      # deselects them.
       - name: Install with optional backends + CPU torch
         run: >
           uv sync --locked --extra ot --extra cluster-graph --extra pacmap
@@ -376,37 +377,12 @@ jobs:
             exit 1
           fi
 
-  # Real MERT/CLAP models: multi-GB torch download + model fetch, so manual
-  # trigger only (workflow_dispatch). Keep it green before tagging a release.
-  test-models:
-    name: test · real models (manual)
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
-        with:
-          version: ${{ env.UV_VERSION }}
-          python-version: "3.13"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      # `muq` too, or the three real MuQ-MuLan tests importorskip on every run and the
-      # only job that could catch a MuLan regression silently reports green.
-      - name: Install with model backbones
-        run: uv sync --locked --extra models --extra muq
-
-      - name: Tests (real models)
-        run: uv run pytest -m model
-
   # Single required status check for branch protection: collapses the whole
   # matrix + every gate into one context, so protection never has to enumerate
   # individual job names (which change with the matrix). Fails if any required
   # job failed or was cancelled; PR-only jobs (commits, dco) report "skipped" on
-  # push-to-main and are tolerated. test-models is manual-only, deliberately excluded.
+  # push-to-main and are tolerated. The real-model and benchmark suites live in
+  # scheduled.yml — too slow to gate a PR, and deliberately not part of this gate.
   ci-success:
     name: CI success
     if: always()
@@ -422,8 +398,9 @@ jobs:
       # instead means an unrecognised or missing result fails the gate rather than
       # slipping through it. `skipped` is accepted on purpose: the PR-only gates
       # (commits, dco) legitimately skip on push-to-main, sonarqube skips on fork
-      # PRs, and test-models is not in `needs` at all. Dumping the whole context makes the next anomaly diagnosable
-      # from the log instead of by re-deriving it from check-run timestamps.
+      # PRs, and the slow suites live in scheduled.yml, outside this workflow entirely.
+      # Dumping the whole context makes the next anomaly diagnosable from the log instead of
+      # by re-deriving it from check-run timestamps.
       - name: Verify every required job succeeded
         shell: bash
         env:
