@@ -46,8 +46,17 @@ SHA-pinnable action is clearly better.
 a single status context, so branch protection never has to enumerate individual job names.
 When you add a real job, add it to that `needs:` list. PR-only gates (`commits`, `dco`) are
 gated on `github.event_name == 'pull_request'` and are tolerated as "skipped" on
-push-to-`main`. The manual `test-models` job (multi-GB torch download) is
-`workflow_dispatch`-only and is intentionally excluded from `ci-success`.
+push-to-`main`.
+
+**Suites too slow to gate a PR live in `scheduled.yml`, not behind an `if:` in `ci.yml`.**
+The real-model suite (multi-GB torch download) and the hot-path benchmarks run weekly there,
+plus `workflow_dispatch`. Keeping them in their own workflow makes their exclusion from
+`CI success` structural rather than something a reader has to infer from a condition. A
+suite that runs on no trigger at all is the failure this repo has already hit once — about
+twenty torch-guarded unit tests executed nowhere until the extras job was given a CPU torch,
+so a new opt-in marker needs a job that actually selects it. The benchmark job deliberately
+does not assert on timings (`testing.md`: measured, never asserted); it exists so the
+benchmarks stay executable and so there is a durable record to compare by hand.
 
 **Tooling & structure.** Install with `uv sync --locked`; run tools via `uv run` / `uvx`.
 Concurrency groups cancel superseded runs on CI (`cancel-in-progress: true`) but never on a
