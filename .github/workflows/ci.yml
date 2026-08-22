@@ -211,7 +211,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
       - name: Check commit messages
         run: >
-          uvx --from commitizen cz check
+          uvx --from commitizen==4.18.0 cz check
           --rev-range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
   # Developer Certificate of Origin: every commit in a PR must carry a

@@ -39,7 +39,7 @@ jobs:
           --format requirements-txt -o requirements-audit.txt
 
       - name: Audit against known vulnerabilities
-        run: uvx pip-audit --strict --disable-pip -r requirements-audit.txt
+        run: uvx pip-audit==2.10.1 --strict --disable-pip -r requirements-audit.txt
 
   actions-lint:
     name: workflow security lint (zizmor)
@@ -53,4 +53,4 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       - name: Lint workflows
-        run: uvx zizmor .github/workflows/
+        run: uvx zizmor==1.29.0 .github/workflows/
