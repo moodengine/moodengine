@@ -126,17 +126,23 @@ jobs:
         run: uv sync --locked
 
       # fail_under lives in pyproject ([tool.coverage.report]); --cov with no path
-      # uses [tool.coverage.run] source/omit.
+      # uses [tool.coverage.run] source/omit. This job is the ONLY place the floor is
+      # enforced, and deliberately so: it is a floor on the TORCH-FREE contract, which
+      # the merged number the `sonarqube` job reports would dilute into meaninglessness.
       - name: Tests with coverage floor
-        run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+        env:
+          COVERAGE_FILE: coverage-data-light
+        run: uv run pytest --cov --cov-report=term-missing
 
-      # Handed to the `sonarqube` job below, which needs a coverage report and has
-      # no reason to pay for a second run of the same suite to get one.
-      - name: Upload coverage report
+      # Raw coverage DATA, not a report: `sonarqube` merges it with the extras+torch
+      # job's data before writing the single XML Sonar imports. No leading dot on the
+      # filename on purpose — upload-artifact skips hidden files unless told otherwise,
+      # and the reported number is exactly the thing that must not shrink silently.
+      - name: Upload coverage data (light suite)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-xml
-          path: coverage.xml
+          name: coverage-data-light
+          path: coverage-data-light
           if-no-files-found: error
 
   # SonarQube Cloud. Automatic Analysis is switched OFF for this project: the two
@@ -145,7 +151,7 @@ jobs:
   # in `sonar-project.properties` at the repo root, not in the web UI.
   sonarqube:
     name: SonarQube Cloud
-    needs: [coverage]
+    needs: [coverage, test-extras]
     # SONAR_TOKEN is not exposed to pull requests from forks, so analysis is
     # skipped there instead of failing on a missing secret. `CI success` tolerates
     # a skipped job, and the push-to-main analysis covers the code once merged.
@@ -162,10 +168,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download coverage report
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The light install carries pytest-cov -> coverage at the LOCKED version, i.e. the
+      # exact version that wrote both data files. Coverage data files are schema-
+      # versioned, so pinning a second copy by hand here would drift out of step with
+      # the lock the moment coverage is bumped.
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Download coverage data
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: coverage-xml
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      # Sonar must see what CI genuinely exercises. The light job alone leaves every
+      # torch- and extra-gated path reading 0%, which is a measurement artefact and not
+      # a coverage hole. The merge runs in both directions: a handful of statements in
+      # pipeline/config/cluster are reachable ONLY when a backend is absent, so the
+      # light job is not redundant either. Inputs are named rather than auto-discovered
+      # from a directory, so a broken upload fails this step instead of quietly lowering
+      # the reported number. --fail-under=0: the floor gates the light suite in the
+      # `coverage` job, and applying it to the merged number would assert nothing.
+      - name: Merge coverage data into one report
+        run: |
+          uv run coverage combine coverage-data-light coverage-data-extras
+          uv run coverage xml -o coverage.xml --fail-under=0
 
       # The new-code period is "previous version", so an analysis that reports no
       # version has no baseline to diff against and the gate silently grades
@@ -239,8 +273,9 @@ jobs:
         run: uv run --frozen --no-sync pytest
 
   test-extras:
-    # Python 3.13, not 3.14: POT publishes wheels up to cp313 only.
-    name: test · extras [ot, cluster-graph, pacmap, explain]
+    # Python 3.13, not 3.14: POT publishes wheels up to cp313 only. torch ships cp313
+    # CPU wheels, so the same pin costs nothing for the torch half of this job.
+    name: test · extras [ot, cluster-graph, pacmap, explain] + torch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -253,13 +288,33 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Install with optional backends
-        run: uv sync --locked --extra ot --extra cluster-graph --extra pacmap --extra explain
+      # `--group torch-cpu` is a CPU-only torch, NOT `--extra models`, which would also
+      # drag in transformers/laion-clap and, on linux, ~2.3 GB of nvidia-* wheels — the
+      # very cost that keeps `test-models` on workflow_dispatch. adapt.py and sequence.py
+      # import nothing beyond torch.nn/optim/functional, so plain torch un-skips all of
+      # it. Without this the torch-guarded tests in test_sequence and test_adapt_*
+      # importorskip on every event and NO job ever executes them: `test-models` is the
+      # only one that installs torch and it runs `-m model`, which deselects them.
+      - name: Install with optional backends + CPU torch
+        run: >
+          uv sync --locked --extra ot --extra cluster-graph --extra pacmap
+          --extra explain --group torch-cpu
 
-      # Same suite: the ot/leiden tests un-skip themselves when the backend is
-      # importable, so this job covers the optional code paths.
-      - name: Tests (optional backends)
-        run: uv run pytest
+      # Same suite: the ot/leiden/pacmap/shap and torch tests un-skip themselves when the
+      # backend is importable, so this job covers the optional code paths.
+      # --cov-fail-under=0: the floor is the torch-free contract, enforced in the
+      # `coverage` job only; here we collect data, we do not gate.
+      - name: Tests (optional backends + torch)
+        env:
+          COVERAGE_FILE: coverage-data-extras
+        run: uv run pytest --cov --cov-report= --cov-fail-under=0
+
+      - name: Upload coverage data (extras + torch)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-data-extras
+          path: coverage-data-extras
+          if-no-files-found: error
 
   # Conventional-commit gate: every commit in a PR must parse.
   commits:

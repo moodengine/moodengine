@@ -9,6 +9,10 @@ dist/
 .coverage
 .coverage.*
 coverage.xml
+# Written by the CI coverage jobs (COVERAGE_FILE=coverage-data-*). Deliberately not
+# dot-prefixed, because upload-artifact skips hidden files — so the patterns above
+# do not cover them and a local reproduction of those jobs would leave them untracked.
+coverage-data-*
 htmlcov/
 .benchmarks/
 
