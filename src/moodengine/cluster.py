@@ -1212,6 +1212,57 @@ def _co_clustered_pair(
     return noise_agreement, (la_all[both], lb_all[both])
 
 
+def _stability_agreement(runs: list[np.ndarray]) -> tuple[list[float], list[float], list[float]]:
+    """``(aris, amis, noise_agreements)`` over every ordered pair of replicates.
+
+    Both shape scores are computed BEFORE either list is touched. Appending as we go let an
+    AMI-only failure leave ``aris`` one element longer, so ``mean_ari``/``std_ari`` and
+    ``mean_ami`` were then averaged over different samples of the same replicate pairs.
+    ``noise_agrees`` fills on its own schedule, because a pair can share rows — a real noise
+    agreement — while fewer than two of them are non-noise in both, which leaves the shape scores
+    nothing to compare.
+    """
+    from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
+
+    aris: list[float] = []
+    amis: list[float] = []
+    noise_agrees: list[float] = []
+
+    for a in range(len(runs)):
+        for b in range(a + 1, len(runs)):
+            noise_agreement, labels = _co_clustered_pair(runs[a], runs[b])
+            if np.isnan(noise_agreement):
+                continue
+
+            noise_agrees.append(noise_agreement)
+            if labels is None:
+                continue
+
+            try:
+                ari = float(adjusted_rand_score(*labels))
+                ami = float(adjusted_mutual_info_score(*labels))
+            except Exception:
+                continue
+            aris.append(ari)
+            amis.append(ami)
+
+    return aris, amis, noise_agrees
+
+
+def _stability_space(
+    X: np.ndarray, config: Config, *, clusters_original: bool, reduce_per_replicate: bool
+) -> np.ndarray:
+    """The matrix the replicates cluster: the raw embeddings, or one frozen shared UMAP layout.
+
+    Reducing here when the pipeline does not would score a partition that never ships, which is
+    the one thing a stability number must not do. Under ``refit_reduction`` there is no shared
+    layout at all — each replicate builds its own — so the raw matrix is handed through.
+    """
+    if clusters_original or reduce_per_replicate:
+        return X
+    return reduce_umap(X, config.umap_n_components_cluster, config)[0]
+
+
 def bootstrap_stability(
     X: np.ndarray,
     method: ClusterMethod,
@@ -1263,8 +1314,6 @@ def bootstrap_stability(
     'mean_ami', 'mean_noise_agreement', 'n_boot', 'space'}``; degenerate inputs yield zeros.
     Deterministic given ``config.seed``.
     """
-    from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
-
     X = np.asarray(X, dtype=np.float32)
     n = X.shape[0]
     if n_boot is None:
@@ -1293,10 +1342,11 @@ def bootstrap_stability(
     reduce_per_replicate = refit_reduction and not clusters_original
     if refit_reduction and not reduce_per_replicate:
         _log_inert_refit(tiny, n)
-    space = (
-        X
-        if (clusters_original or reduce_per_replicate)
-        else reduce_umap(X, config.umap_n_components_cluster, config)[0]
+    space = _stability_space(
+        X,
+        config,
+        clusters_original=clusters_original,
+        reduce_per_replicate=reduce_per_replicate,
     )
 
     size = max(2, int(round(subsample * n)))
@@ -1312,28 +1362,7 @@ def bootstrap_stability(
         reduce_per_replicate=reduce_per_replicate,
     )
 
-    aris: list[float] = []
-    amis: list[float] = []
-    noise_agrees: list[float] = []
-    for a in range(len(runs)):
-        for b in range(a + 1, len(runs)):
-            noise_agreement, labels = _co_clustered_pair(runs[a], runs[b])
-            if np.isnan(noise_agreement):
-                continue
-            noise_agrees.append(noise_agreement)
-            if labels is None:
-                continue
-
-            # Both scores computed BEFORE either list is touched. Appending as we go let an
-            # AMI-only failure leave `aris` one element longer, so `mean_ari`/`std_ari` and
-            # `mean_ami` were then averaged over different samples of the same replicate pairs.
-            try:
-                ari = float(adjusted_rand_score(*labels))
-                ami = float(adjusted_mutual_info_score(*labels))
-            except Exception:
-                continue
-            aris.append(ari)
-            amis.append(ami)
+    aris, amis, noise_agrees = _stability_agreement(runs)
 
     mean_noise = float(np.mean(noise_agrees)) if noise_agrees else 0.0
     if not aris:
