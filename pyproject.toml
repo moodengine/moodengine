@@ -231,6 +231,28 @@ disallow_untyped_calls = false
 warn_return_any = false
 no_implicit_reexport = false
 
+# Two of `strict`'s checks are INSTALL-DEPENDENT, and get their own block because they are not
+# debt the list above can ever pay off — they flip with which extras happen to be installed.
+#
+# `disallow_subclassing_any`: `sequence` defines `class _SeqNet(nn.Module)` inside a function
+# that imports torch lazily. With torch present that is a real base class; on the torch-free
+# install the `static` CI job uses, `Module` resolves to `Any` through `ignore_missing_imports`
+# and the check fires. `warn_unused_ignores`: the two `type: ignore[method-assign]` in the CLAP
+# wrapper are REQUIRED when laion_clap is installed and redundant when it is not — one comment,
+# both verdicts, depending on the environment.
+#
+# Neither is fixable by typing our own code better while the dependency stays optional. Leaving
+# them on gives a config that passes on a developer's full venv and fails in CI, which is exactly
+# how this was found: `uv run mypy` was green locally with `--extra models` synced, and red on
+# the `uv sync --locked` install the job actually runs. Verify mypy on BOTH profiles.
+[[tool.mypy.overrides]]
+module = ["moodengine.sequence"]
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = ["moodengine.embeddings.*"]
+warn_unused_ignores = false
+
 [[tool.mypy.overrides]]
 module = [
     "sklearn.*",
