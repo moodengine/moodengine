@@ -105,14 +105,18 @@ def fit_temperature(
     ``logits`` ``(n, n_moods)`` are the pre-softmax **rec** (recentered) vectors; ``labels`` ``(n,)``
     the gold class index in the same mood order. Minimizes over ``T ∈ bounds`` with
     ``scipy.optimize.minimize_scalar`` (bounded method); a deterministic numpy golden-section search
-    is the fallback when ``scipy`` is absent (lazy import, like ``_spearman``). Returns ``1.0`` for
-    ``n < 1`` (nothing to fit). Deterministic (no RNG). Because ``T`` is a positive scalar divisor,
+    is the fallback when ``scipy`` is absent (lazy import, like ``_spearman``). Returns ``1.0`` when
+    there is nothing to fit — no rows, no labels, or no class axis. Deterministic (no RNG). Because ``T`` is a positive scalar divisor,
     the ranking of every row is preserved — ``argmax(logits) == argmax(logits / T)`` — so this only
     rescales confidence, never the prediction.
     """
     L = np.asarray(logits, dtype=np.float64)
     y = np.asarray(labels).astype(int).ravel()
-    if L.ndim != 2 or L.shape[0] < 1 or y.shape[0] < 1:
+    # `L.shape[1] < 1` covers a block with no CLASS axis. It is a degenerate size, not bad data, so
+    # the module's contract is a neutral return rather than a raise — and without it this fell
+    # through to `L.max(axis=1)`, which rejects a zero-length reduction with a bare numpy
+    # ValueError naming neither the argument nor the caller.
+    if L.ndim != 2 or L.shape[0] < 1 or L.shape[1] < 1 or y.shape[0] < 1:
         return 1.0
     n = min(L.shape[0], y.shape[0])
     L, y = L[:n], y[:n]

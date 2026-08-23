@@ -624,3 +624,267 @@ def test_prediction_set_is_never_empty_and_holds_only_real_classes(pair, target:
         assert_that(chosen.size).is_less_than_or_equal_to(row.size)
         assert_that(bool(np.all((chosen >= 0) & (chosen < row.size)))).is_true()
         assert_that(len(set(chosen.tolist()))).is_equal_to(chosen.size)  # no duplicates
+
+
+# --------------------------------------------------------------------------- #
+# Boundaries mutation testing found unguarded. Each of these was a surviving
+# mutant: the suite executed the line and could not tell the mutated value from
+# the real one, which is what a chosen fixture misses and a boundary pins.
+# --------------------------------------------------------------------------- #
+
+
+def test_fit_temperature_fits_a_single_row_rather_than_giving_up() -> None:
+    """One calibration row is enough to fit; the guard is ``< 1``, not ``< 2``.
+
+    Returning the neutral 1.0 here would look like a successful fit that happened to need no
+    scaling, so the difference is invisible at the call site.
+    """
+    logits = np.array([[2.0, 0.0, -1.0]])
+
+    temperature = fit_temperature(logits, np.array([0]))
+
+    assert_that(temperature).is_not_close_to(1.0, tolerance=1e-6)
+    assert_that(temperature).is_greater_than(0.0)
+
+
+def test_fit_temperature_returns_the_neutral_value_for_non_2d_logits() -> None:
+    """A 1-D input is "nothing to fit", and each clause of the guard stands alone.
+
+    Written as ``or``: a single failing condition is enough. Under ``and`` this input would fall
+    through into the optimizer and die on a shape error instead.
+    """
+    assert_that(fit_temperature(np.array([1.0, 2.0]), np.array([0]))).is_equal_to(1.0)
+
+
+def test_fit_temperature_truncates_to_the_shorter_of_logits_and_labels() -> None:
+    """More labels than rows is truncation, not an error — the pairing is positional.
+
+    Dropping the ``min`` leaves the label array longer than the logit block and the true-class
+    gather indexes past the end.
+    """
+    logits = np.array([[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 3.0]])
+
+    temperature = fit_temperature(logits, np.array([0, 1, 2, 0, 1]))
+
+    assert_that(temperature).is_greater_than(0.0)
+    assert_that(temperature).is_equal_to(fit_temperature(logits, np.array([0, 1, 2])))
+
+
+def test_fit_temperature_returns_the_neutral_value_when_there_are_no_classes() -> None:
+    """An ``(n, 0)`` block has no class to score, which is a degenerate SIZE, not bad data.
+
+    The module's contract is that degenerate sizes return a neutral result rather than raising,
+    and this shape used to fall through the guard into a `ValueError` from the reduction.
+    """
+    assert_that(fit_temperature(np.zeros((3, 0)), np.array([0, 0, 0]))).is_equal_to(1.0)
+
+
+def test_negative_log_likelihood_clamps_a_probability_above_one_to_zero_loss() -> None:
+    """The clip is two-sided. An out-of-range probability must not buy NEGATIVE loss.
+
+    A loss below zero is not a worse fit, it is an impossible one, and it would drag any mean
+    computed over it downwards without ever looking wrong.
+    """
+    value = negative_log_likelihood(np.array([[2.0, 0.0]]), np.array([0]))
+
+    assert_that(value).is_close_to(0.0, tolerance=1e-12)
+    assert_that(value).is_greater_than_or_equal_to(0.0)
+
+
+def test_negative_log_likelihood_clamps_an_out_of_range_label_into_the_class_axis() -> None:
+    """A label past the last class is clipped INTO the row, never past its end.
+
+    The upper bound is ``n_classes - 1``: one more and the gather indexes off the block.
+    """
+    value = negative_log_likelihood(np.array([[0.9, 0.1]]), np.array([7]))
+
+    assert_that(value).is_close_to(-float(np.log(0.1)), tolerance=1e-12)
+
+
+def test_negative_log_likelihood_returns_zero_for_non_2d_probabilities() -> None:
+    """A 1-D input has no class axis to gather along, so there is nothing to score."""
+    assert_that(negative_log_likelihood(np.array([0.9, 0.1]), np.array([0]))).is_equal_to(0.0)
+
+
+def test_margin_of_a_two_class_row_is_the_gap_not_the_top_probability() -> None:
+    """Two classes is the smallest case where a gap exists, and the guard is ``< 2``.
+
+    At ``m == 2`` the mutant boundary returns the top-1 probability itself — a plausible-looking
+    number that reports high confidence exactly where the row is most ambiguous.
+    """
+    np.testing.assert_allclose(margin(np.array([[0.7, 0.3]])), [0.4], rtol=0, atol=1e-12)
+
+
+def test_margin_uses_the_second_largest_probability_not_the_third() -> None:
+    """Three classes distinguish top-2 from top-3; ``0.3`` is the gap, ``0.5`` would be to third."""
+    np.testing.assert_allclose(margin(np.array([[0.6, 0.3, 0.1]])), [0.3], rtol=0, atol=1e-12)
+
+
+def test_platt_scale_fits_at_exactly_two_samples() -> None:
+    """Two points with two distinct outcomes are fittable; the guard is ``< 2``.
+
+    Returning the flat ``(0.0, 0.0)`` map here is indistinguishable at the call site from a model
+    whose confidence genuinely carries no signal.
+    """
+    a, b = platt_scale(np.array([0.2, 0.9]), np.array([0, 1]))
+
+    assert_that(a).is_not_equal_to(0.0)
+    assert_that(b).is_not_equal_to(0.0)
+
+
+def test_isotonic_calibrate_fits_a_single_point_rather_than_the_identity() -> None:
+    """One observation is data; the fallback is for NO data.
+
+    A single correct call at 0.4 makes the map constant at 1.0, where the identity anchors would
+    hand back 0.9 — a calibrated probability invented from a curve that was never fitted.
+    """
+    fitted = isotonic_calibrate(np.array([0.4]), np.array([1.0]))
+
+    assert_that(float(fitted.predict([0.9])[0])).is_close_to(1.0, tolerance=1e-12)
+
+
+def test_isotonic_calibrate_falls_back_to_a_pass_through_on_empty_input() -> None:
+    """With nothing to fit the regressor must still be usable, and neutral.
+
+    The anchors are (0,0) and (1,1) precisely so ``.predict`` is the identity rather than a
+    landmine that raises the first time a caller uses it.
+    """
+    fitted = isotonic_calibrate(np.array([]), np.array([]))
+
+    np.testing.assert_allclose(fitted.predict([0.0, 0.5, 1.0]), [0.0, 0.5, 1.0], atol=1e-12)
+
+
+def test_reliability_diagram_bins_a_single_observation() -> None:
+    """One row is one occupied bin; the empty guard is ``n == 0``."""
+    bins = reliability_diagram(np.array([0.75]), np.array([1.0]))
+
+    assert_that(bins).is_length(1)
+    assert_that(bins[0]["count"]).is_equal_to(1)
+
+
+def test_reliability_diagram_spans_exactly_the_unit_interval_in_ten_bins() -> None:
+    """The edges are the confidence range itself, and the default is ten equal-width bins.
+
+    A wider span silently rescales every bin, so a confidence of 0.75 would be reported in the
+    bin labelled [0.6, 0.8) rather than the one it belongs to.
+    """
+    conf = np.linspace(0.05, 0.95, 10)
+
+    bins = reliability_diagram(conf, np.ones(10))
+
+    assert_that(bins).is_length(10)
+    assert_that(bins[0]["bin_lo"]).is_close_to(0.0, tolerance=1e-12)
+    assert_that(bins[-1]["bin_hi"]).is_close_to(1.0, tolerance=1e-12)
+    assert_that(bins[1]["bin_lo"] - bins[0]["bin_lo"]).is_close_to(0.1, tolerance=1e-12)
+
+
+def test_prediction_set_keeps_the_stable_tie_order() -> None:
+    """Tied probabilities resolve by mood INDEX, so the same row always yields the same set.
+
+    ``kind="stable"`` is the whole of that guarantee. numpy's default introsort reorders ties
+    unpredictably once the tied block is large enough — 30 here — and the docstring promises
+    determinism, which is what makes a prediction set reproducible across runs and machines.
+    """
+    tied = np.concatenate([[0.2], np.full(30, 0.8 / 30)])
+
+    chosen = prediction_set(tied, 0.5)
+
+    np.testing.assert_array_equal(chosen, np.sort(chosen))  # ascending index order among ties
+    np.testing.assert_array_equal(chosen, prediction_set(tied, 0.5))  # and reproducible
+
+
+def test_prediction_set_raps_regularizer_shrinks_the_set() -> None:
+    """A positive ``lam_reg`` ADDS a rank penalty, which reaches the threshold sooner.
+
+    Sign matters and is not observable from the set size alone unless it is compared against pure
+    APS: subtracting would make the set larger, which reads as a more cautious model rather than
+    as a broken regularizer.
+    """
+    row = np.array([0.4, 0.3, 0.2, 0.1])
+
+    regularized = prediction_set(row, 0.9, lam_reg=0.5)
+    pure_aps = prediction_set(row, 0.9, lam_reg=0.0)
+
+    assert_that(regularized.size).is_less_than(pure_aps.size)
+    assert_that(pure_aps.size).is_equal_to(4)
+    assert_that(regularized.tolist()).is_equal_to([0])
+
+
+def test_prediction_set_k_reg_defaults_to_penalising_from_the_first_rank() -> None:
+    """``k_reg`` is the rank at which the penalty starts, and its default is 0, not 1.
+
+    With ``k_reg=1`` the first mood is exempt, so the set grows by one — a silent widening of
+    every RAPS set for callers who never pass the parameter.
+    """
+    row = np.array([0.4, 0.3, 0.2, 0.1])
+
+    assert_that(prediction_set(row, 0.9, lam_reg=0.5).tolist()).is_equal_to([0])
+    assert_that(prediction_set(row, 0.9, k_reg=1, lam_reg=0.5).tolist()).is_equal_to([0, 1])
+
+
+def test_aps_threshold_k_reg_defaults_to_zero() -> None:
+    """Same default, on the calibration side — the two must agree or coverage is miscalibrated."""
+    probs = np.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5], [0.6, 0.2, 0.2]])
+    labels = np.array([0, 1, 2, 0])
+
+    assert_that(aps_threshold(probs, labels, 0.8, lam_reg=0.5)).is_equal_to(
+        aps_threshold(probs, labels, 0.8, k_reg=0, lam_reg=0.5)
+    )
+    assert_that(aps_threshold(probs, labels, 0.8, lam_reg=0.5)).is_not_equal_to(
+        aps_threshold(probs, labels, 0.8, k_reg=1, lam_reg=0.5)
+    )
+
+
+def test_aps_scores_reject_a_label_equal_to_the_class_count() -> None:
+    """The valid range is ``[0, m)``, so ``m`` itself is out — an off-by-one here is silent.
+
+    A label of exactly ``m`` makes the rank lookup match nothing, and argmax on an all-False row
+    returns 0: the row scores as if its true mood had been ranked FIRST, pulling the threshold
+    down and tightening every set while the coverage guarantee is still claimed intact.
+    """
+    probs = np.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3]])
+
+    with pytest.raises(ValueError, match=r"outside \[0, 3\)"):
+        aps_threshold(probs, np.array([0, 3]), 0.9)
+
+
+def test_aps_scores_error_names_at_most_ten_rows_and_says_it_truncated() -> None:
+    """The message lists the first ten offenders and marks the truncation.
+
+    A caller fixing a gold set works from this list, so a message that silently showed fewer rows
+    than it truncated at would send them looking for offenders it never named.
+    """
+    probs = np.tile(np.array([0.5, 0.3, 0.2]), (12, 1))
+
+    with pytest.raises(ValueError) as excinfo:
+        aps_threshold(probs, np.full(12, 3), 0.9)
+
+    message = str(excinfo.value)
+    assert_that(message).contains("12 entry/entries", "...")
+    assert_that(message.split("at row(s) ")[1].split("]")[0].count(",")).is_equal_to(9)
+
+
+def test_aps_scores_error_omits_the_ellipsis_when_it_named_every_offender() -> None:
+    """Exactly ten offenders are all shown, so there is nothing to mark as truncated.
+
+    The boundary is strict: ``> 10``. At ``>= 10`` the message claims it withheld rows it had in
+    fact listed in full, sending a reader looking for offenders that do not exist.
+    """
+    probs = np.tile(np.array([0.5, 0.3, 0.2]), (10, 1))
+
+    with pytest.raises(ValueError) as excinfo:
+        aps_threshold(probs, np.full(10, 3), 0.9)
+
+    assert_that(str(excinfo.value)).does_not_contain("...")
+
+
+def test_aps_threshold_rng_jitter_warns_that_it_was_never_implemented() -> None:
+    """The parameter is inert, and says so rather than quietly returning the deterministic value.
+
+    A caller who passed it believed they were getting the randomized variant and its tighter
+    coverage; silence would have let that belief stand.
+    """
+    probs = np.array([[0.5, 0.3, 0.2], [0.2, 0.5, 0.3]])
+
+    with pytest.deprecated_call(match="never been implemented"):
+        aps_threshold(probs, np.array([0, 1]), 0.9, rng_jitter=True)
