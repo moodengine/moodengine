@@ -7,6 +7,7 @@ synthetic set. ECE is imported from :mod:`moodengine.evaluation` — never redef
 
 from __future__ import annotations
 
+import builtins
 import hypothesis.extra.numpy as npst
 import hypothesis.strategies as st
 import numpy as np
@@ -888,3 +889,73 @@ def test_aps_threshold_rng_jitter_warns_that_it_was_never_implemented() -> None:
 
     with pytest.deprecated_call(match="never been implemented"):
         aps_threshold(probs, np.array([0, 1]), 0.9, rng_jitter=True)
+
+
+def _overconfident_logits() -> tuple[np.ndarray, np.ndarray]:
+    """An over-confident model with real label noise: the NLL has an INTERIOR minimum near T=4.1.
+
+    A separable fixture will not do here. With every true class winning by a wide margin the loss
+    saturates against the probability ceiling and the objective is exactly flat below T~0.15, so
+    two optimizers land on different points of a plateau that are equally optimal — which says
+    nothing about either one.
+    """
+    rng = np.random.default_rng(11)
+    n, m = 400, 5
+    true = rng.integers(0, m, n)
+    logits = rng.normal(0.0, 1.0, (n, m))
+    logits[np.arange(n), true] += 2.5
+    logits *= 3.0
+
+    labels = true.copy()
+    flip = rng.random(n) < 0.35
+    labels[flip] = rng.integers(0, m, flip.sum())
+    return logits, labels
+
+
+def test_fit_temperature_golden_section_fallback_matches_the_scipy_fit(monkeypatch) -> None:
+    """Without scipy the search is a numpy golden section, and it finds the SAME temperature.
+
+    The whole branch is unreachable while scipy is installed, so nothing exercised it: its
+    contraction factor, its bracket update, its tolerance and its final midpoint were all free to
+    be wrong. A caller on a scipy-free install would have got a silently different calibration.
+    """
+    logits, labels = _overconfident_logits()
+    with_scipy = fit_temperature(logits, labels)
+
+    real_import = builtins.__import__
+
+    def no_scipy(name, *args, **kwargs):
+        if name.startswith("scipy"):
+            raise ImportError("scipy is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_scipy)
+    fallback = fit_temperature(logits, labels)
+
+    assert_that(with_scipy).is_between(1.0, 99.0)  # a genuine interior optimum, not a clamp
+    assert_that(fallback).is_close_to(with_scipy, tolerance=1e-4)
+
+
+def test_fit_temperature_respects_a_narrowed_bounds_range(monkeypatch) -> None:
+    """``bounds`` is the search interval AND the final clamp, on both code paths.
+
+    The unconstrained optimum is around 4.1; asked for at most 2.0, both the scipy path and the
+    golden-section fallback must return the boundary rather than the value they would have
+    preferred. The tolerance is the optimizers' own: both converge TO the bound (1.999994 and
+    1.9999996) without landing exactly on it, and 1e-4 still separates 2.0 from 4.1 by four
+    orders of magnitude.
+    """
+    logits, labels = _overconfident_logits()
+
+    assert_that(fit_temperature(logits, labels, bounds=(0.5, 2.0))).is_close_to(2.0, tolerance=1e-4)
+
+    real_import = builtins.__import__
+
+    def no_scipy(name, *args, **kwargs):
+        if name.startswith("scipy"):
+            raise ImportError("scipy is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_scipy)
+
+    assert_that(fit_temperature(logits, labels, bounds=(0.5, 2.0))).is_close_to(2.0, tolerance=1e-4)
