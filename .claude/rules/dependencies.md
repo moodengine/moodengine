@@ -32,6 +32,17 @@ backends, and never a bare `ImportError` (see the error taxonomy in `code-style.
 
 **Never** `import` a package that isn't declared (scripts included). Declared-but-unused and used-but-undeclared are both defects; `uv run deptry .` is the wired guard (CI `static` job). Intentional exceptions live in `[tool.deptry.per_rule_ignores]` with a comment stating why — extend them only that way.
 
+**Type-check against the LIGHT install, not your venv.** The `static` CI job runs
+`uv sync --locked`, so every optional backend resolves to `Any` through
+`ignore_missing_imports`. Two of mypy's `strict` checks flip with that:
+`disallow_subclassing_any` (a class based on `torch.nn.Module` is a real subclass with torch
+installed and an `Any` subclass without) and `warn_unused_ignores` (a `type: ignore` that the
+real stubs require is redundant when they are absent). Both are scoped off in pyproject for the
+modules that touch optional imports, with the reasoning inline. A developer who has synced
+`--extra models` will see `uv run mypy` pass on code that fails in CI — bitten exactly that way.
+Re-check with `UV_PROJECT_ENVIRONMENT=<scratch> uv sync --locked && uv run --no-sync mypy`
+before trusting a green local run on anything typing-related.
+
 **uv pitfalls (all bitten in practice).**
 - `uv lock` **preserves** already-locked versions; upgrading requires `uv lock --upgrade-package <name>` (or `--upgrade`).
 - Testing lowest bounds: `rm uv.lock && uv lock --resolution lowest-direct`, then **`--frozen` on every subsequent sync/run** — a plain `uv sync` ignores a lowest lock and silently re-locks at highest, un-testing the minimums.
