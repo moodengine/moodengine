@@ -11,7 +11,7 @@ the embedders import torch lazily inside :func:`get_embedder`.
 
 from __future__ import annotations
 
-__version__ = "0.4.0"  # x-release-please-version
+__version__ = "0.4.1"  # x-release-please-version
 
 # --- typing vocabulary (Literal aliases, protocols, result shapes) ---
 from moodengine._typing import (
